@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NoOneTheOne/dht/pkg/config"
+	"github.com/NoOneTheOne/dht/internal/config"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"

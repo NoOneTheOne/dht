@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NoOneTheOne/dht/pkg/basic"
+	"github.com/NoOneTheOne/dht/internal/basic"
 )
 
 // randomString generates a size-length string randomly.

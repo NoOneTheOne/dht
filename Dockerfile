@@ -16,7 +16,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-spider ./cmd/spider
 RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-getpeers ./cmd/getpeers
-RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-search ./api/search
+RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-search ./cmd/search
 
 FROM alpine:3.21 AS spider
 

@@ -11,8 +11,8 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
-	"github.com/NoOneTheOne/dht/pkg/basic"
-	"github.com/NoOneTheOne/dht/pkg/config"
+	"github.com/NoOneTheOne/dht/internal/basic"
+	"github.com/NoOneTheOne/dht/internal/config"
 )
 
 var (

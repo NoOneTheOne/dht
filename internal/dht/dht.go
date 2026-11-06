@@ -5,7 +5,7 @@ package dht
 import (
 	"encoding/hex"
 	"errors"
-	"github.com/NoOneTheOne/dht/pkg/config"
+	"github.com/NoOneTheOne/dht/internal/config"
 	"log"
 	"math"
 	"net"

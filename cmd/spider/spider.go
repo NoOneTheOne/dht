@@ -7,13 +7,13 @@ import (
 	"os"
 	"time"
 
-	"github.com/NoOneTheOne/dht/pkg/basic"
-	"github.com/NoOneTheOne/dht/pkg/config"
-	"github.com/NoOneTheOne/dht/pkg/dht"
-	"github.com/NoOneTheOne/dht/pkg/es"
-	"github.com/NoOneTheOne/dht/pkg/metrics"
-	"github.com/NoOneTheOne/dht/pkg/mysql"
-	"github.com/NoOneTheOne/dht/pkg/nat"
+	"github.com/NoOneTheOne/dht/internal/basic"
+	"github.com/NoOneTheOne/dht/internal/config"
+	"github.com/NoOneTheOne/dht/internal/dht"
+	"github.com/NoOneTheOne/dht/internal/storage/es"
+	"github.com/NoOneTheOne/dht/internal/metrics"
+	"github.com/NoOneTheOne/dht/internal/storage/mysql"
+	"github.com/NoOneTheOne/dht/internal/nat"
 )
 
 type file struct {

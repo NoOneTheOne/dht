@@ -1,23 +1,64 @@
-name: Deploy to Self-Hosted Runner
+name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
-  deploy:
-    runs-on: self-hosted
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Run tests
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    strategy:
+      matrix:
+        binary: [spider, search, getpeers]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Build
+        run: go build -ldflags "-s -w" -o build/dht-${{ matrix.binary }} ./cmd/${{ matrix.binary }}
+
+  deploy:
+    name: Deploy
+    runs-on: self-hosted
+    needs: [build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up .env file
-        run: |
-          if [ ! -f .env ]; then
-            cp .env.example .env
-          fi
 
       - name: Set up config.yml from runner-local path
         run: |
@@ -27,7 +68,6 @@ jobs:
             echo "config.yml copied from /volume/dht/"
           else
             echo "ERROR: /volume/dht/config.yml not found on runner."
-            echo "Please place your config.yml at /volume/dht/config.yml"
             exit 1
           fi
 
@@ -57,12 +97,6 @@ jobs:
           done
           echo "=== Docker Compose Status ==="
           docker compose ps
-          echo ""
-          echo "=== Spider Container Logs (last 20 lines) ==="
-          docker compose logs --tail=20 dht-spider || true
-          echo ""
-          echo "=== Search Container Logs (last 20 lines) ==="
-          docker compose logs --tail=20 dht-search || true
 
       - name: Cleanup unused images
         if: always()

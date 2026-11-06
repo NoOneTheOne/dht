@@ -1,14 +1,16 @@
+# Binaries
+/spider
+/dht-spider
+/dht-search
+/dht-getpeers
+/build/
+*.exe
+
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# Build artifacts
-dht-spider
-dht-search
-dht-getpeers
-*.exe
 
 # Environment
 .env
@@ -24,3 +26,6 @@ Thumbs.db
 # Web
 web/node_modules
 web/dist
+
+# Go
+vendor/

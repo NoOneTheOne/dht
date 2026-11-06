@@ -12,9 +12,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/NoOneTheOne/dht/pkg/config"
-	"github.com/NoOneTheOne/dht/pkg/metrics"
-	"github.com/NoOneTheOne/dht/pkg/mysql"
+	"github.com/NoOneTheOne/dht/internal/config"
+	"github.com/NoOneTheOne/dht/internal/metrics"
+	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
 
 const maxQueryLen = 200
