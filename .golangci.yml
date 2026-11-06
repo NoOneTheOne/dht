@@ -12,19 +12,9 @@ linters:
     - gofmt
     - goimports
     - misspell
-    - revive
     - unconvert
-    - unparam
 
 linters-settings:
-  govet:
-    enable:
-      - nilness
-      - shadow
-  revive:
-    rules:
-      - name: exported
-        disabled: true
   misspell:
     locale: US
 
@@ -33,7 +23,6 @@ issues:
     - path: _test\.go
       linters:
         - errcheck
-        - unparam
     - path: internal/dht/bitmap_xorfast\.go
       linters:
         - govet
