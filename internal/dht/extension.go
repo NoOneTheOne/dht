@@ -1,7 +1,6 @@
 package dht
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"log"
@@ -443,18 +442,4 @@ func (en *ExtensionNegotiator) ProcessNegotiation(data []byte) error {
 // IsNegotiated returns whether negotiation is complete
 func (en *ExtensionNegotiator) IsNegotiated() bool {
 	return en.negotiated
-}
-
-// Helper function to build extension message with proper framing
-func buildFramedMessage(msgID byte, extID byte, payload []byte) []byte {
-	// Length prefix (4 bytes) + message ID + extension ID + payload
-	length := 1 + 1 + len(payload)
-
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, int32(length))
-	buf.WriteByte(msgID)
-	buf.WriteByte(extID)
-	buf.Write(payload)
-
-	return buf.Bytes()
 }

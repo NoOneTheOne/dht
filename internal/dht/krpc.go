@@ -307,13 +307,8 @@ loop:
 
 // run starts to listen and consume the query chan.
 func (tm *transactionManager) run() {
-	var q *query
-
-	for {
-		select {
-		case q = <-tm.queryChan:
-			go tm.query(q, tm.dht.Try)
-		}
+	for q := range tm.queryChan {
+		go tm.query(q, tm.dht.Try)
 	}
 }
 
@@ -361,19 +356,6 @@ func (tm *transactionManager) getPeers(no *node, infoHash string) {
 	tm.sendQuery(no, getPeersType, map[string]interface{}{
 		"id":        tm.dht.id(infoHash),
 		"info_hash": infoHash,
-	})
-}
-
-// announcePeer sends announce_peer query to the chan.
-func (tm *transactionManager) announcePeer(
-	no *node, infoHash string, impliedPort, port int, token string) {
-
-	tm.sendQuery(no, announcePeerType, map[string]interface{}{
-		"id":           tm.dht.id(no.id.RawString()),
-		"info_hash":    infoHash,
-		"implied_port": impliedPort,
-		"port":         port,
-		"token":        token,
 	})
 }
 

@@ -16,7 +16,6 @@ type IPv6Manager struct {
 	ipv6Conn    *net.UDPConn
 	ipv6Address string
 	ipv6Node    *node
-	ipv6Routing *routingTable
 	dualStack   bool // Whether to run both IPv4 and IPv6
 
 	// Statistics

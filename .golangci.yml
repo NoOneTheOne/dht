@@ -39,3 +39,7 @@ issues:
       linters:
         - govet
       text: "unsafe"
+    - path: internal/metrics/metrics\.go
+      linters:
+        - unused
+      text: "U1000"

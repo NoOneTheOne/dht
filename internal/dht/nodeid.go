@@ -76,14 +76,3 @@ func generateIPv6Mask(ip net.IP) byte {
 
 	return result[0]
 }
-
-// validateNodeID checks if a node ID is valid according to BEP-42
-func validateNodeID(id string, ip net.IP) bool {
-	if len(id) != 20 {
-		return false
-	}
-
-	// For now, we're lenient and accept any 20-byte ID
-	// Strict BEP-42 validation would check the first byte mask
-	return true
-}

@@ -539,38 +539,7 @@ func (rt *routingTable) Len() int {
 	return rt.cachedNodes.Len()
 }
 
-// Implementation of heap with heap.Interface.
-type heapItem struct {
-	distance *bitmap
-	value    interface{}
-}
-
-type topKHeap []*heapItem
-
-func (kHeap topKHeap) Len() int {
-	return len(kHeap)
-}
-
-func (kHeap topKHeap) Less(i, j int) bool {
-	return kHeap[i].distance.Compare(kHeap[j].distance, maxPrefixLength) == 1
-}
-
-func (kHeap topKHeap) Swap(i, j int) {
-	kHeap[i], kHeap[j] = kHeap[j], kHeap[i]
-}
-
-func (kHeap *topKHeap) Push(x interface{}) {
-	*kHeap = append(*kHeap, x.(*heapItem))
-}
-
-func (kHeap *topKHeap) Pop() interface{} {
-	n := len(*kHeap)
-	x := (*kHeap)[n-1]
-	*kHeap = (*kHeap)[:n-1]
-	return x
-}
-
-// nodeHeapItem is a typed version of heapItem to avoid interface{} boxing.
+// nodeHeapItem is a typed version to avoid interface{} boxing.
 type nodeHeapItem struct {
 	distance *bitmap
 	node     *node
@@ -618,40 +587,4 @@ func getTopKNodes(nodes []*node, id *bitmap, k int) []*node {
 		result[i] = heap.Pop(&h).(*nodeHeapItem).node
 	}
 	return result
-}
-
-// getTopK solves the top-k problem with heap. It's time complexity is
-// O(n*log(k)). When n is large, time complexity will be too high, need to be
-// optimized.
-func getTopK(queue []interface{}, id *bitmap, k int) []interface{} {
-	topkHeap := make(topKHeap, 0, k+1)
-
-	for _, value := range queue {
-		node := value.(*node)
-		distance := id.Xor(node.id)
-		if topkHeap.Len() == k {
-			var last = topkHeap[topkHeap.Len()-1]
-			if last.distance.Compare(distance, maxPrefixLength) == 1 {
-				item := &heapItem{
-					distance,
-					value,
-				}
-				heap.Push(&topkHeap, item)
-				heap.Pop(&topkHeap)
-			}
-		} else {
-			item := &heapItem{
-				distance,
-				value,
-			}
-			heap.Push(&topkHeap, item)
-		}
-	}
-
-	tops := make([]interface{}, topkHeap.Len())
-	for i := len(tops) - 1; i >= 0; i-- {
-		tops[i] = heap.Pop(&topkHeap).(*heapItem).value
-	}
-
-	return tops
 }

@@ -21,7 +21,6 @@ const (
 
 // SecurityManager manages security features
 type SecurityManager struct {
-	mu                sync.RWMutex
 	level             SecurityLevel
 	blacklist         *AdvancedBlacklist
 	rateLimiter       *RateLimiter
@@ -245,12 +244,11 @@ func (bl *AdvancedBlacklist) Stats() (ips int, subnets int, patterns int) {
 
 // RateLimiter implements token bucket rate limiting
 type RateLimiter struct {
-	mu            sync.Mutex
-	rate          int           // tokens per interval
-	interval      time.Duration // refill interval
-	tokens        map[string]*TokenBucket
-	cleanupTicker *time.Ticker
-	stopChan      chan struct{}
+	mu       sync.Mutex
+	rate     int           // tokens per interval
+	interval time.Duration // refill interval
+	tokens   map[string]*TokenBucket
+	stopChan chan struct{}
 }
 
 // TokenBucket represents a token bucket for an IP
