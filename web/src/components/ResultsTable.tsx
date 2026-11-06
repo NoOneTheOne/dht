@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { TorrentItem } from '../types';
 
 interface ResultsTableProps {
@@ -5,6 +6,9 @@ interface ResultsTableProps {
   total: number;
   query: string;
 }
+
+type SortField = 'name' | 'length' | 'time' | 'count';
+type SortOrder = 'asc' | 'desc';
 
 function formatSize(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -25,15 +29,68 @@ function formatTime(timeStr: string): string {
   });
 }
 
-function truncateHash(hash: string): string {
-  return hash.slice(0, 8) + '...' + hash.slice(-8);
-}
-
-function copyToClipboard(text: string) {
-  navigator.clipboard.writeText(text);
+function SortIcon({ field, sortField, sortOrder }: { field: SortField; sortField: SortField; sortOrder: SortOrder }) {
+  if (field !== sortField) {
+    return (
+      <svg className="w-3 h-3 ml-1 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+      </svg>
+    );
+  }
+  return sortOrder === 'asc' ? (
+    <svg className="w-3 h-3 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+    </svg>
+  ) : (
+    <svg className="w-3 h-3 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+    </svg>
+  );
 }
 
 export default function ResultsTable({ items, total, query }: ResultsTableProps) {
+  const [sortField, setSortField] = useState<SortField>('count');
+  const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
+  const [copiedHash, setCopiedHash] = useState<string | null>(null);
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortOrder('desc');
+    }
+  };
+
+  const sortedItems = [...items].sort((a, b) => {
+    let comparison = 0;
+    switch (sortField) {
+      case 'name':
+        comparison = a.name.localeCompare(b.name);
+        break;
+      case 'length':
+        comparison = a.length - b.length;
+        break;
+      case 'time':
+        comparison = new Date(a.time).getTime() - new Date(b.time).getTime();
+        break;
+      case 'count':
+        comparison = a.count - b.count;
+        break;
+    }
+    return sortOrder === 'asc' ? comparison : -comparison;
+  });
+
+  const copyToClipboard = async (text: string, hash: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedHash(hash);
+      setTimeout(() => setCopiedHash(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
+
   if (!query) {
     return (
       <div className="text-center text-gray-400 mt-20 animate-fade-in">
@@ -55,27 +112,59 @@ export default function ResultsTable({ items, total, query }: ResultsTableProps)
   }
 
   return (
-    <div className="w-full max-w-5xl mx-auto mt-8 animate-fade-in">
+    <div className="w-full max-w-6xl mx-auto mt-8 animate-fade-in">
       <div className="mb-4 text-gray-300 text-sm">
         找到 <span className="text-purple-400 font-bold">{total}</span> 条结果
       </div>
-      <div className="glass rounded-2xl overflow-hidden">
+      <div className="glass rounded-2xl overflow-hidden overflow-x-auto">
         <table className="w-full">
           <thead>
             <tr className="border-b border-white/10 text-left text-gray-400 text-sm">
-              <th className="px-6 py-4 font-medium">名称</th>
-              <th className="px-6 py-4 font-medium">大小</th>
-              <th className="px-6 py-4 font-medium">时间</th>
-              <th className="px-6 py-4 font-medium">热度</th>
+              <th 
+                className="px-6 py-4 font-medium cursor-pointer hover:text-white transition-colors select-none"
+                onClick={() => handleSort('name')}
+              >
+                <div className="flex items-center">
+                  名称
+                  <SortIcon field="name" sortField={sortField} sortOrder={sortOrder} />
+                </div>
+              </th>
+              <th 
+                className="px-6 py-4 font-medium cursor-pointer hover:text-white transition-colors select-none"
+                onClick={() => handleSort('length')}
+              >
+                <div className="flex items-center">
+                  大小
+                  <SortIcon field="length" sortField={sortField} sortOrder={sortOrder} />
+                </div>
+              </th>
+              <th 
+                className="px-6 py-4 font-medium cursor-pointer hover:text-white transition-colors select-none"
+                onClick={() => handleSort('time')}
+              >
+                <div className="flex items-center">
+                  时间
+                  <SortIcon field="time" sortField={sortField} sortOrder={sortOrder} />
+                </div>
+              </th>
+              <th 
+                className="px-6 py-4 font-medium cursor-pointer hover:text-white transition-colors select-none"
+                onClick={() => handleSort('count')}
+              >
+                <div className="flex items-center">
+                  热度
+                  <SortIcon field="count" sortField={sortField} sortOrder={sortOrder} />
+                </div>
+              </th>
               <th className="px-6 py-4 font-medium">InfoHash</th>
             </tr>
           </thead>
           <tbody>
-            {items.map((item, index) => (
+            {sortedItems.map((item, index) => (
               <tr
                 key={item.infohash}
                 className="result-row border-b border-white/5 animate-slide-up"
-                style={{ animationDelay: `${index * 50}ms` }}
+                style={{ animationDelay: `${index * 30}ms` }}
               >
                 <td className="px-6 py-4 text-white max-w-md">
                   <div className="truncate font-medium" title={item.name}>
@@ -97,13 +186,26 @@ export default function ResultsTable({ items, total, query }: ResultsTableProps)
                   </span>
                 </td>
                 <td className="px-6 py-4">
-                  <button
-                    onClick={() => copyToClipboard(item.infohash)}
-                    className="hash-text text-xs text-purple-400 hover:text-purple-300 transition-colors cursor-pointer"
-                    title={item.infohash}
-                  >
-                    {truncateHash(item.infohash)}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <span className="hash-text text-xs text-purple-400 font-mono" title={item.infohash}>
+                      {item.infohash}
+                    </span>
+                    <button
+                      onClick={() => copyToClipboard(item.infohash, item.infohash)}
+                      className="p-1 rounded hover:bg-white/10 transition-colors"
+                      title="复制 InfoHash"
+                    >
+                      {copiedHash === item.infohash ? (
+                        <svg className="w-4 h-4 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4 text-gray-400 hover:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
