@@ -178,9 +178,9 @@ func getRemoteIP() (ip string, err error) {
 	}
 
 	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			basic.CheckError(err)
+		closeErr := Body.Close()
+		if closeErr != nil {
+			basic.CheckError(closeErr)
 		}
 	}(res.Body)
 
