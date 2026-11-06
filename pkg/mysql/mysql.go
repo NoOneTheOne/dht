@@ -48,6 +48,10 @@ func getDB() *gorm.DB {
 		sqlDB.SetMaxIdleConns(10)
 		sqlDB.SetMaxOpenConns(100)
 		sqlDB.SetConnMaxLifetime(time.Hour)
+
+		if err := db.AutoMigrate(&Data{}); err != nil {
+			log.Fatalf("failed to auto-migrate table: %v", err)
+		}
 	})
 	return db
 }
