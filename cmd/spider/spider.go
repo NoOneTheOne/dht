@@ -130,12 +130,11 @@ func main() {
 
 	InitConfig := dht.NewCrawlConfig()
 	InitConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
-		hashBytes, err := hex.DecodeString(infoHash)
-		if err != nil {
-			log.Printf("invalid infohash %s: %v", infoHash, err)
+		if len(infoHash) != 20 {
+			log.Printf("invalid infohash length: %d", len(infoHash))
 			return
 		}
-		w.Request(hashBytes, ip, port)
+		w.Request([]byte(infoHash), ip, port)
 	}
 	d := dht.New(InitConfig)
 
