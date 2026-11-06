@@ -18,6 +18,7 @@ type Data struct {
 	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey" json:"infohash"`
 	Time     time.Time `gorm:"column:time;not null" json:"time"`
 	Length   int64     `gorm:"column:length;default:0" json:"length"`
+	Count    int64     `gorm:"column:count;default:1" json:"count"`
 }
 
 func (Data) TableName() string {
@@ -60,7 +61,10 @@ func getDB() *gorm.DB {
 
 func Write(d *Data) error {
 	d.Name = strings.ToValidUTF8(d.Name, "")
-	return getDB().Clauses(clause.OnConflict{DoNothing: true}).Create(d).Error
+	return getDB().Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "infohash"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("`count` + 1")}),
+	}).Create(d).Error
 }
 
 func Search(name string) ([]Data, int64, error) {
