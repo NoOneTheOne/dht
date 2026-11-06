@@ -290,6 +290,31 @@ var (
 			return 0
 		},
 	)
+
+	// Blank identifiers to prevent staticcheck from flagging these as unused.
+	// These metrics are registered with Prometheus via promauto for their side effects.
+	_ = memStatsCache
+	_ = getCachedMemStats
+	_ = mysqlConnectionsOpen
+	_ = mysqlConnectionsInUse
+	_ = mysqlConnectionsIdle
+	_ = goroutinesGauge
+	_ = memoryAllocGauge
+	_ = memorySysGauge
+	_ = gcCountGauge
+	_ = gcPauseGauge
+	_ = startTime
+	_ = uptimeGauge
+	_ = dhtRoutingTableNodes
+	_ = dhtBootstrapCount
+	_ = dhtPacketsReceived
+	_ = dhtPacketsSent
+	_ = dhtActiveTransactions
+	_ = dhtBlacklistedNodes
+	_ = dhtTorrentsDiscovered
+	_ = getMySQLOpenConnections
+	_ = getMySQLInUseConnections
+	_ = getMySQLIdleConnections
 )
 
 // MySQL stats getters (will be set by mysql package)
