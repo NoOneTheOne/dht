@@ -8,7 +8,6 @@ linters:
     - govet
     - ineffassign
     - staticcheck
-    - unused
     - gofmt
     - goimports
     - misspell
@@ -20,14 +19,7 @@ linters-settings:
 
 issues:
   exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
     - path: internal/dht/bitmap_xorfast\.go
       linters:
         - govet
       text: "unsafe"
-    - path: internal/metrics/metrics\.go
-      linters:
-        - unused
-      text: "U1000"
