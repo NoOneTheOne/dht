@@ -14,10 +14,10 @@ import (
 const (
 	// Extension message IDs
 	ExtHandshakeID = 0 // Extension handshake
-	
+
 	// Standard extension names
-	ExtUTMetadata = "ut_metadata" // BEP-9 metadata exchange
-	ExtUTPex      = "ut_pex"      // BEP-11 peer exchange
+	ExtUTMetadata = "ut_metadata"  // BEP-9 metadata exchange
+	ExtUTPex      = "ut_pex"       // BEP-11 peer exchange
 	ExtUT_HaveAll = "ut_holepunch" // BEP-46 hole punching
 )
 
@@ -31,31 +31,31 @@ type Extension struct {
 type ExtensionHandshake struct {
 	// M maps extension names to their message IDs
 	M map[string]byte
-	
+
 	// P is the local TCP listen port (optional)
 	P int
-	
+
 	// V is the client name and version (optional)
 	V string
-	
+
 	// YourIP is the client's external IP as seen by the remote (optional)
 	YourIP []byte
-	
+
 	// IPv4 is the client's IPv4 address (optional)
 	IPv4 []byte
-	
+
 	// IPv6 is the client's IPv6 address (optional)
 	IPv6 []byte
-	
+
 	// ReqQ is the maximum number of outstanding request messages (optional)
 	ReqQ int
-	
+
 	// Req is the number of outstanding request messages (optional)
 	Req int
-	
+
 	// MetadataSize is the total size of the metadata in bytes (BEP-9)
 	MetadataSize int
-	
+
 	// UploadOnly indicates this is a seed that doesn't accept downloads
 	UploadOnly bool
 }
@@ -80,10 +80,10 @@ func NewExtensionManager() *ExtensionManager {
 			V: "GoDHT/1.0",
 		},
 	}
-	
+
 	// Register default extensions
 	em.RegisterExtension(ExtUTMetadata, 1)
-	
+
 	return em
 }
 
@@ -91,7 +91,7 @@ func NewExtensionManager() *ExtensionManager {
 func (em *ExtensionManager) RegisterExtension(name string, id byte) {
 	em.mu.Lock()
 	defer em.mu.Unlock()
-	
+
 	em.supportedExts[name] = id
 	em.localHandshake.M[name] = id
 }
@@ -100,7 +100,7 @@ func (em *ExtensionManager) RegisterExtension(name string, id byte) {
 func (em *ExtensionManager) GetLocalExtensionID(name string) (byte, bool) {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
-	
+
 	id, ok := em.supportedExts[name]
 	return id, ok
 }
@@ -109,7 +109,7 @@ func (em *ExtensionManager) GetLocalExtensionID(name string) (byte, bool) {
 func (em *ExtensionManager) GetRemoteExtensionID(name string) (byte, bool) {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
-	
+
 	id, ok := em.remoteExts[name]
 	return id, ok
 }
@@ -118,7 +118,7 @@ func (em *ExtensionManager) GetRemoteExtensionID(name string) (byte, bool) {
 func (em *ExtensionManager) SupportsExtension(name string) bool {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
-	
+
 	_, ok := em.remoteExts[name]
 	return ok
 }
@@ -129,15 +129,15 @@ func (em *ExtensionManager) ProcessRemoteHandshake(data []byte) error {
 	if err != nil {
 		return err
 	}
-	
+
 	dict, ok := decoded.(map[string]interface{})
 	if !ok {
 		return errors.New("invalid handshake dict")
 	}
-	
+
 	em.mu.Lock()
 	defer em.mu.Unlock()
-	
+
 	// Parse extension mapping
 	if m, ok := dict["m"].(map[string]interface{}); ok {
 		for name, id := range m {
@@ -146,7 +146,7 @@ func (em *ExtensionManager) ProcessRemoteHandshake(data []byte) error {
 			}
 		}
 	}
-	
+
 	// Parse optional fields
 	if p, ok := dict["p"].(int); ok {
 		em.remoteHandshake.P = p
@@ -163,10 +163,10 @@ func (em *ExtensionManager) ProcessRemoteHandshake(data []byte) error {
 	if uploadOnly, ok := dict["upload_only"].(bool); ok {
 		em.remoteHandshake.UploadOnly = uploadOnly
 	}
-	
+
 	em.handshakeDone = true
 	log.Printf("[BEP-10] Remote peer supports extensions: %v", em.remoteExts)
-	
+
 	return nil
 }
 
@@ -174,13 +174,13 @@ func (em *ExtensionManager) ProcessRemoteHandshake(data []byte) error {
 func (em *ExtensionManager) CreateHandshakeMessage() []byte {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
-	
+
 	// Build the handshake dict
 	handshakeDict := map[string]interface{}{
 		"m": em.localHandshake.M,
 		"v": em.localHandshake.V,
 	}
-	
+
 	if em.localHandshake.P > 0 {
 		handshakeDict["p"] = em.localHandshake.P
 	}
@@ -190,17 +190,17 @@ func (em *ExtensionManager) CreateHandshakeMessage() []byte {
 	if em.localHandshake.MetadataSize > 0 {
 		handshakeDict["metadata_size"] = em.localHandshake.MetadataSize
 	}
-	
+
 	// Encode the message
 	// Format: <message length><message id=20><extended id=0><payload>
 	payload := Encode(handshakeDict)
-	
+
 	// Message: extended ID (20) + handshake ID (0) + payload
 	msg := make([]byte, 2+len(payload))
 	msg[0] = EXTENDED
 	msg[1] = HANDSHAKE
 	copy(msg[2:], payload)
-	
+
 	return msg
 }
 
@@ -229,11 +229,11 @@ func ParseExtensionMessage(data []byte) (*ExtensionMessage, error) {
 	if len(data) < 2 {
 		return nil, errors.New("message too short")
 	}
-	
+
 	if data[0] != EXTENDED {
 		return nil, errors.New("not an extension message")
 	}
-	
+
 	return &ExtensionMessage{
 		ExtensionID: data[1],
 		Payload:     data[2:],
@@ -243,12 +243,12 @@ func ParseExtensionMessage(data []byte) (*ExtensionMessage, error) {
 // CreateExtensionMessage creates an extension message
 func CreateExtensionMessage(extID byte, payload map[string]interface{}) []byte {
 	encoded := Encode(payload)
-	
+
 	msg := make([]byte, 2+len(encoded))
 	msg[0] = EXTENDED
 	msg[1] = extID
 	copy(msg[2:], encoded)
-	
+
 	return msg
 }
 
@@ -270,19 +270,19 @@ func CreateUTMetadataRequest(extID byte, piece int) []byte {
 // CreateUTMetadataData creates a ut_metadata data message
 func CreateUTMetadataData(extID byte, piece int, totalSize int, data []byte) []byte {
 	payload := map[string]interface{}{
-		"msg_type":  UTMetadataData,
-		"piece":     piece,
+		"msg_type":   UTMetadataData,
+		"piece":      piece,
 		"total_size": totalSize,
 	}
-	
+
 	encoded := Encode(payload)
-	
+
 	msg := make([]byte, 2+len(encoded)+len(data))
 	msg[0] = EXTENDED
 	msg[1] = extID
 	copy(msg[2:], encoded)
 	copy(msg[2+len(encoded):], data)
-	
+
 	return msg
 }
 
@@ -401,15 +401,15 @@ func ValidateExtensionMessage(data []byte) error {
 
 // ExtensionNegotiator handles extension negotiation between peers
 type ExtensionNegotiator struct {
-	manager      *ExtensionManager
-	negotiated   bool
+	manager       *ExtensionManager
+	negotiated    bool
 	preferredExts []string
 }
 
 // NewExtensionNegotiator creates a new extension negotiator
 func NewExtensionNegotiator(manager *ExtensionManager) *ExtensionNegotiator {
 	return &ExtensionNegotiator{
-		manager:      manager,
+		manager:       manager,
 		preferredExts: []string{ExtUTMetadata, ExtUTPex},
 	}
 }
@@ -429,14 +429,14 @@ func (en *ExtensionNegotiator) ProcessNegotiation(data []byte) error {
 	}
 	RecordHandshakeReceived()
 	en.negotiated = true
-	
+
 	// Log supported extensions
 	for _, ext := range en.preferredExts {
 		if en.manager.SupportsExtension(ext) {
 			log.Printf("[BEP-10] Remote peer supports %s", ext)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -449,12 +449,12 @@ func (en *ExtensionNegotiator) IsNegotiated() bool {
 func buildFramedMessage(msgID byte, extID byte, payload []byte) []byte {
 	// Length prefix (4 bytes) + message ID + extension ID + payload
 	length := 1 + 1 + len(payload)
-	
+
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, int32(length))
 	buf.WriteByte(msgID)
 	buf.WriteByte(extID)
 	buf.Write(payload)
-	
+
 	return buf.Bytes()
 }

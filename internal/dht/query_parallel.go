@@ -21,12 +21,12 @@ const (
 
 // QueryRequest represents a single query request
 type QueryRequest struct {
-	Type      QueryType
-	Target    string // target node ID or infohash
-	Node      *node
-	InfoHash  []byte // for get_peers/announce_peer
-	PeerIP    string // for announce_peer
-	PeerPort  int    // for announce_peer
+	Type     QueryType
+	Target   string // target node ID or infohash
+	Node     *node
+	InfoHash []byte // for get_peers/announce_peer
+	PeerIP   string // for announce_peer
+	PeerPort int    // for announce_peer
 }
 
 // QueryResponse represents a query response
@@ -42,12 +42,12 @@ type QueryResponse struct {
 
 // QueryOptions configures parallel query behavior
 type QueryOptions struct {
-	MaxConcurrency  int           // Maximum concurrent queries
-	Timeout         time.Duration // Per-query timeout
-	TotalTimeout    time.Duration // Overall timeout
-	RetryCount      int           // Number of retries
-	Alpha           int           // Number of parallel queries per round (typically 3)
-	CollectResults  bool          // Whether to collect all results
+	MaxConcurrency int           // Maximum concurrent queries
+	Timeout        time.Duration // Per-query timeout
+	TotalTimeout   time.Duration // Overall timeout
+	RetryCount     int           // Number of retries
+	Alpha          int           // Number of parallel queries per round (typically 3)
+	CollectResults bool          // Whether to collect all results
 }
 
 // DefaultQueryOptions returns default query options
@@ -64,18 +64,18 @@ func DefaultQueryOptions() *QueryOptions {
 
 // ParallelQueryEngine manages parallel DHT queries
 type ParallelQueryEngine struct {
-	dht         *DHT
-	options     *QueryOptions
-	queryChan   chan *QueryRequest
-	resultChan  chan *QueryResponse
-	workerWg    sync.WaitGroup
-	mu          sync.RWMutex
-	running     bool
-	stopChan    chan struct{}
-	
+	dht        *DHT
+	options    *QueryOptions
+	queryChan  chan *QueryRequest
+	resultChan chan *QueryResponse
+	workerWg   sync.WaitGroup
+	mu         sync.RWMutex
+	running    bool
+	stopChan   chan struct{}
+
 	// Statistics
-	stats       QueryStats
-	statsMu     sync.Mutex
+	stats   QueryStats
+	statsMu sync.Mutex
 }
 
 // QueryStats holds query engine statistics
@@ -95,7 +95,7 @@ func NewParallelQueryEngine(dht *DHT, options *QueryOptions) *ParallelQueryEngin
 	if options == nil {
 		options = DefaultQueryOptions()
 	}
-	
+
 	return &ParallelQueryEngine{
 		dht:        dht,
 		options:    options,
@@ -117,16 +117,16 @@ func (pqe *ParallelQueryEngine) Start() {
 	}
 	pqe.running = true
 	pqe.mu.Unlock()
-	
+
 	// Start worker goroutines
 	for i := 0; i < pqe.options.MaxConcurrency; i++ {
 		pqe.workerWg.Add(1)
 		go pqe.worker()
 	}
-	
+
 	// Start result collector
 	go pqe.collectResults()
-	
+
 	log.Printf("[QueryEngine] Started with %d workers", pqe.options.MaxConcurrency)
 }
 
@@ -140,7 +140,7 @@ func (pqe *ParallelQueryEngine) Stop() {
 	pqe.running = false
 	close(pqe.stopChan)
 	pqe.mu.Unlock()
-	
+
 	pqe.workerWg.Wait()
 	log.Printf("[QueryEngine] Stopped")
 }
@@ -148,7 +148,7 @@ func (pqe *ParallelQueryEngine) Stop() {
 // worker processes query requests
 func (pqe *ParallelQueryEngine) worker() {
 	defer pqe.workerWg.Done()
-	
+
 	for {
 		select {
 		case <-pqe.stopChan:
@@ -167,11 +167,11 @@ func (pqe *ParallelQueryEngine) executeQuery(req *QueryRequest) *QueryResponse {
 		Request:   req,
 		Timestamp: start,
 	}
-	
+
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), pqe.options.Timeout)
 	defer cancel()
-	
+
 	// Execute query based on type
 	var err error
 	switch req.Type {
@@ -184,14 +184,14 @@ func (pqe *ParallelQueryEngine) executeQuery(req *QueryRequest) *QueryResponse {
 	default:
 		err = ErrUnsupportedQueryType
 	}
-	
+
 	response.Latency = time.Since(start)
 	response.Error = err
 	response.Success = err == nil
-	
+
 	// Update statistics
 	pqe.updateStats(response)
-	
+
 	return response
 }
 
@@ -199,12 +199,12 @@ func (pqe *ParallelQueryEngine) executeQuery(req *QueryRequest) *QueryResponse {
 func (pqe *ParallelQueryEngine) executeFindNode(ctx context.Context, req *QueryRequest, resp *QueryResponse) error {
 	// Use transaction manager to send find_node
 	done := make(chan struct{})
-	
+
 	go func() {
 		defer close(done)
 		pqe.dht.transactionManager.findNode(req.Node, req.Target)
 	}()
-	
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -219,12 +219,12 @@ func (pqe *ParallelQueryEngine) executeFindNode(ctx context.Context, req *QueryR
 // executeGetPeers executes a get_peers query
 func (pqe *ParallelQueryEngine) executeGetPeers(ctx context.Context, req *QueryRequest, resp *QueryResponse) error {
 	done := make(chan struct{})
-	
+
 	go func() {
 		defer close(done)
 		pqe.dht.transactionManager.getPeers(req.Node, string(req.InfoHash))
 	}()
-	
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -239,12 +239,12 @@ func (pqe *ParallelQueryEngine) executeGetPeers(ctx context.Context, req *QueryR
 // executePing executes a ping query
 func (pqe *ParallelQueryEngine) executePing(ctx context.Context, req *QueryRequest, resp *QueryResponse) error {
 	done := make(chan struct{})
-	
+
 	go func() {
 		defer close(done)
 		pqe.dht.transactionManager.ping(req.Node)
 	}()
-	
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -283,9 +283,9 @@ func (pqe *ParallelQueryEngine) collectResults() {
 func (pqe *ParallelQueryEngine) updateStats(resp *QueryResponse) {
 	pqe.statsMu.Lock()
 	defer pqe.statsMu.Unlock()
-	
+
 	pqe.stats.TotalQueries++
-	
+
 	// Update latency stats
 	if resp.Latency > pqe.stats.MaxLatency {
 		pqe.stats.MaxLatency = resp.Latency
@@ -293,7 +293,7 @@ func (pqe *ParallelQueryEngine) updateStats(resp *QueryResponse) {
 	if resp.Latency < pqe.stats.MinLatency {
 		pqe.stats.MinLatency = resp.Latency
 	}
-	
+
 	// Update average latency
 	if pqe.stats.TotalQueries == 1 {
 		pqe.stats.AvgLatency = resp.Latency
@@ -323,18 +323,18 @@ func (pqe *ParallelQueryEngine) GetStats() QueryStats {
 func (pqe *ParallelQueryEngine) IterativeFindNode(target string) []*node {
 	ctx, cancel := context.WithTimeout(context.Background(), pqe.options.TotalTimeout)
 	defer cancel()
-	
+
 	// Get initial closest nodes from routing table
 	closest := pqe.dht.routingTable.GetNeighbors(newBitmapFromString(target), pqe.options.Alpha)
 	if len(closest) == 0 {
 		return nil
 	}
-	
+
 	// Track visited nodes
 	visited := make(map[string]bool)
 	var result []*node
 	var mu sync.Mutex
-	
+
 	// Iterative lookup
 	for round := 0; round < 10; round++ { // Max 10 rounds
 		select {
@@ -342,17 +342,17 @@ func (pqe *ParallelQueryEngine) IterativeFindNode(target string) []*node {
 			return result
 		default:
 		}
-		
+
 		// Query alpha closest unvisited nodes in parallel
 		var wg sync.WaitGroup
 		newNodes := make(chan []*node, pqe.options.Alpha)
-		
+
 		queried := 0
 		for _, n := range closest {
 			if queried >= pqe.options.Alpha {
 				break
 			}
-			
+
 			nodeID := n.id.RawString()
 			mu.Lock()
 			if visited[nodeID] {
@@ -361,49 +361,49 @@ func (pqe *ParallelQueryEngine) IterativeFindNode(target string) []*node {
 			}
 			visited[nodeID] = true
 			mu.Unlock()
-			
+
 			wg.Add(1)
 			queried++
-			
+
 			go func(n *node) {
 				defer wg.Done()
-				
+
 				req := &QueryRequest{
 					Type:   QueryFindNode,
 					Target: target,
 					Node:   n,
 				}
-				
+
 				resp := pqe.executeQuery(req)
 				if resp.Success && len(resp.Nodes) > 0 {
 					newNodes <- resp.Nodes
 				}
 			}(n)
 		}
-		
+
 		// Wait for all queries in this round
 		wg.Wait()
 		close(newNodes)
-		
+
 		// Collect new nodes
 		var allNewNodes []*node
 		for nodes := range newNodes {
 			allNewNodes = append(allNewNodes, nodes...)
 		}
-		
+
 		if len(allNewNodes) == 0 {
 			break // No new nodes found, we're done
 		}
-		
+
 		// Add to result
 		mu.Lock()
 		result = append(result, allNewNodes...)
 		mu.Unlock()
-		
+
 		// Update closest nodes for next round
 		closest = allNewNodes
 	}
-	
+
 	return result
 }
 
@@ -411,19 +411,19 @@ func (pqe *ParallelQueryEngine) IterativeFindNode(target string) []*node {
 func (pqe *ParallelQueryEngine) IterativeGetPeers(infoHash []byte) []*Peer {
 	ctx, cancel := context.WithTimeout(context.Background(), pqe.options.TotalTimeout)
 	defer cancel()
-	
+
 	target := string(infoHash)
-	
+
 	// Get initial closest nodes
 	closest := pqe.dht.routingTable.GetNeighbors(newBitmapFromString(target), pqe.options.Alpha)
 	if len(closest) == 0 {
 		return nil
 	}
-	
+
 	visited := make(map[string]bool)
 	var peers []*Peer
 	var peersMu sync.Mutex
-	
+
 	for round := 0; round < 10; round++ {
 		select {
 		case <-ctx.Done():
@@ -434,43 +434,43 @@ func (pqe *ParallelQueryEngine) IterativeGetPeers(infoHash []byte) []*Peer {
 			return result
 		default:
 		}
-		
+
 		var wg sync.WaitGroup
 		newData := make(chan *QueryResponse, pqe.options.Alpha)
-		
+
 		queried := 0
 		for _, n := range closest {
 			if queried >= pqe.options.Alpha {
 				break
 			}
-			
+
 			nodeID := n.id.RawString()
 			if visited[nodeID] {
 				continue
 			}
 			visited[nodeID] = true
-			
+
 			wg.Add(1)
 			queried++
-			
+
 			go func(n *node) {
 				defer wg.Done()
-				
+
 				req := &QueryRequest{
 					Type:     QueryGetPeers,
 					Target:   target,
 					Node:     n,
 					InfoHash: infoHash,
 				}
-				
+
 				resp := pqe.executeQuery(req)
 				newData <- resp
 			}(n)
 		}
-		
+
 		wg.Wait()
 		close(newData)
-		
+
 		var newNodes []*node
 		for resp := range newData {
 			if resp.Success {
@@ -484,19 +484,19 @@ func (pqe *ParallelQueryEngine) IterativeGetPeers(infoHash []byte) []*Peer {
 				}
 			}
 		}
-		
+
 		if len(newNodes) == 0 {
 			break
 		}
-		
+
 		closest = newNodes
 	}
-	
+
 	peersMu.Lock()
 	result := make([]*Peer, len(peers))
 	copy(result, peers)
 	peersMu.Unlock()
-	
+
 	return result
 }
 

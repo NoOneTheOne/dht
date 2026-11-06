@@ -18,9 +18,9 @@ var defaultBootstrapNodes = []string{
 
 // bootstrapManager handles the DHT bootstrap process
 type bootstrapManager struct {
-	dht          *DHT
-	bootstrapMu  sync.Mutex
-	lastBootstrap time.Time
+	dht            *DHT
+	bootstrapMu    sync.Mutex
+	lastBootstrap  time.Time
 	bootstrapCount int
 }
 
@@ -39,7 +39,7 @@ func (bm *bootstrapManager) join() {
 	// Combine configured prime nodes with default bootstrap nodes
 	allNodes := make([]string, 0, len(bm.dht.PrimeNodes)+len(defaultBootstrapNodes))
 	allNodes = append(allNodes, bm.dht.PrimeNodes...)
-	
+
 	// Add default nodes that aren't already in the list
 	existing := make(map[string]bool)
 	for _, n := range bm.dht.PrimeNodes {
@@ -74,7 +74,7 @@ func (bm *bootstrapManager) join() {
 		wg.Add(1)
 		go func(nodeAddr string) {
 			defer wg.Done()
-			
+
 			select {
 			case <-done:
 				return // Timeout reached
@@ -90,11 +90,11 @@ func (bm *bootstrapManager) join() {
 			// Send find_node to bootstrap the routing table
 			tempNode := &node{addr: realAddr}
 			bm.dht.transactionManager.findNode(tempNode, bm.dht.node.id.RawString())
-			
+
 			mu.Lock()
 			successCount++
 			mu.Unlock()
-			
+
 			log.Printf("[Bootstrap] Sent find_node to %s", nodeAddr)
 		}(addr)
 	}
@@ -109,8 +109,8 @@ func (bm *bootstrapManager) join() {
 
 	bm.lastBootstrap = time.Now()
 	bm.bootstrapCount++
-	
-	log.Printf("[Bootstrap] Bootstrap attempt #%d completed, contacted %d nodes", 
+
+	log.Printf("[Bootstrap] Bootstrap attempt #%d completed, contacted %d nodes",
 		bm.bootstrapCount, successCount)
 }
 

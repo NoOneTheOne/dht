@@ -13,10 +13,10 @@ import (
 
 // MetadataCache caches fetched metadata to avoid redundant network requests
 type MetadataCache struct {
-	cache    map[string]*CachedMetadata
-	mu       sync.RWMutex
-	maxSize  int
-	maxAge   time.Duration
+	cache   map[string]*CachedMetadata
+	mu      sync.RWMutex
+	maxSize int
+	maxAge  time.Duration
 }
 
 // CachedMetadata represents cached metadata with expiration
@@ -36,10 +36,10 @@ func NewMetadataCache(maxSize int, maxAge time.Duration) *MetadataCache {
 		maxSize: maxSize,
 		maxAge:  maxAge,
 	}
-	
+
 	// Start cleanup goroutine
 	go mc.cleanupLoop()
-	
+
 	return mc
 }
 
@@ -47,20 +47,20 @@ func NewMetadataCache(maxSize int, maxAge time.Duration) *MetadataCache {
 func (mc *MetadataCache) Get(infoHash string) (*CachedMetadata, bool) {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
-	
+
 	cached, ok := mc.cache[infoHash]
 	if !ok {
 		return nil, false
 	}
-	
+
 	// Check if expired
 	if time.Since(cached.CachedAt) > mc.maxAge {
 		return nil, false
 	}
-	
+
 	// Update access count
 	cached.AccessCount++
-	
+
 	return cached, true
 }
 
@@ -68,12 +68,12 @@ func (mc *MetadataCache) Get(infoHash string) (*CachedMetadata, bool) {
 func (mc *MetadataCache) Set(infoHash string, metadata []byte, name string, size int64) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	
+
 	// Evict if at capacity
 	if len(mc.cache) >= mc.maxSize {
 		mc.evictOldest()
 	}
-	
+
 	mc.cache[infoHash] = &CachedMetadata{
 		InfoHash:    infoHash,
 		Metadata:    metadata,
@@ -89,14 +89,14 @@ func (mc *MetadataCache) Set(infoHash string, metadata []byte, name string, size
 func (mc *MetadataCache) evictOldest() {
 	var oldestKey string
 	var oldestTime time.Time
-	
+
 	for key, cached := range mc.cache {
 		if oldestKey == "" || cached.CachedAt.Before(oldestTime) {
 			oldestKey = key
 			oldestTime = cached.CachedAt
 		}
 	}
-	
+
 	if oldestKey != "" {
 		delete(mc.cache, oldestKey)
 	}
@@ -106,7 +106,7 @@ func (mc *MetadataCache) evictOldest() {
 func (mc *MetadataCache) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		mc.cleanup()
 	}
@@ -116,7 +116,7 @@ func (mc *MetadataCache) cleanupLoop() {
 func (mc *MetadataCache) cleanup() {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	
+
 	now := time.Now()
 	for key, cached := range mc.cache {
 		if now.Sub(cached.CachedAt) > mc.maxAge {
@@ -142,38 +142,38 @@ func GetMetadataCache() *MetadataCache {
 
 // MetadataFetcher provides enhanced metadata fetching with retry and parallel requests
 type MetadataFetcher struct {
-	wire         *Wire
-	maxRetries   int
-	timeout      time.Duration
+	wire          *Wire
+	maxRetries    int
+	timeout       time.Duration
 	parallelPeers int
 }
 
 // NewMetadataFetcher creates a new metadata fetcher
 func NewMetadataFetcher(wire *Wire, maxRetries int, timeout time.Duration) *MetadataFetcher {
 	return &MetadataFetcher{
-		wire:         wire,
-		maxRetries:   maxRetries,
-		timeout:      timeout,
+		wire:          wire,
+		maxRetries:    maxRetries,
+		timeout:       timeout,
 		parallelPeers: 3,
 	}
 }
 
 // FetchResult represents the result of a metadata fetch
 type FetchResult struct {
-	InfoHash   string
-	Metadata   []byte
-	Name       string
-	Size       int64
-	Source     string // "cache" or "network"
-	Duration   time.Duration
-	Error      error
+	InfoHash string
+	Metadata []byte
+	Name     string
+	Size     int64
+	Source   string // "cache" or "network"
+	Duration time.Duration
+	Error    error
 }
 
 // Fetch attempts to fetch metadata with caching and retry
 func (mf *MetadataFetcher) Fetch(infoHash []byte, peers []Request) *FetchResult {
 	start := time.Now()
 	infoHashHex := hex.EncodeToString(infoHash)
-	
+
 	// Check cache first
 	if cached, ok := globalMetadataCache.Get(infoHashHex); ok {
 		return &FetchResult{
@@ -185,7 +185,7 @@ func (mf *MetadataFetcher) Fetch(infoHash []byte, peers []Request) *FetchResult 
 			Duration: time.Since(start),
 		}
 	}
-	
+
 	// Try fetching from peers with retry
 	var lastErr error
 	for retry := 0; retry < mf.maxRetries; retry++ {
@@ -194,10 +194,10 @@ func (mf *MetadataFetcher) Fetch(infoHash []byte, peers []Request) *FetchResult 
 			if result != nil {
 				// Parse metadata to extract name and size
 				name, size := parseMetadataInfo(result)
-				
+
 				// Cache the result
 				globalMetadataCache.Set(infoHashHex, result, name, size)
-				
+
 				return &FetchResult{
 					InfoHash: infoHashHex,
 					Metadata: result,
@@ -208,14 +208,14 @@ func (mf *MetadataFetcher) Fetch(infoHash []byte, peers []Request) *FetchResult 
 				}
 			}
 		}
-		
+
 		// Wait before retry
 		if retry < mf.maxRetries-1 {
 			time.Sleep(time.Second * time.Duration(retry+1))
 		}
 		lastErr = ErrMetadataFetchFailed
 	}
-	
+
 	return &FetchResult{
 		InfoHash: infoHashHex,
 		Error:    lastErr,
@@ -227,10 +227,10 @@ func (mf *MetadataFetcher) Fetch(infoHash []byte, peers []Request) *FetchResult 
 func (mf *MetadataFetcher) fetchFromPeer(infoHash []byte, peer Request) []byte {
 	// Create a channel to receive the response
 	responseChan := make(chan *Response, 1)
-	
+
 	// Submit request to wire
 	mf.wire.Request(infoHash, peer.IP, peer.Port)
-	
+
 	// Wait for response with timeout
 	select {
 	case resp := <-responseChan:
@@ -258,14 +258,14 @@ func parseMetadataInfo(metadata []byte) (string, int64) {
 	if err != nil {
 		return "", 0
 	}
-	
+
 	info, ok := decoded.(map[string]interface{})
 	if !ok {
 		return "", 0
 	}
-	
+
 	name, _ := info["name"].(string)
-	
+
 	var size int64
 	if length, ok := info["length"].(int); ok {
 		size = int64(length)
@@ -279,7 +279,7 @@ func parseMetadataInfo(metadata []byte) (string, int64) {
 			}
 		}
 	}
-	
+
 	return name, size
 }
 
@@ -350,6 +350,6 @@ func LogMetadataStats() {
 	stats := GetMetadataStats()
 	cacheSize, cacheMax := globalMetadataCache.Stats()
 	log.Printf("[Metadata] Cache: %d/%d, Hits: %d, Misses: %d, Fetches: %d, Failed: %d, AvgTime: %v",
-		cacheSize, cacheMax, stats.CacheHits, stats.CacheMisses, 
+		cacheSize, cacheMax, stats.CacheHits, stats.CacheMisses,
 		stats.NetworkFetches, stats.FailedFetches, stats.AvgFetchTime)
 }

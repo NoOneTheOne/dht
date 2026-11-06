@@ -12,7 +12,7 @@ import (
 
 	"github.com/huin/goupnp/dcps/internetgateway2"
 	"github.com/jackpal/gateway"
-	"github.com/jackpal/go-nat-pmp"
+	natpmp "github.com/jackpal/go-nat-pmp"
 )
 
 // Mapping represents a port mapping

@@ -10,10 +10,10 @@ import (
 	"github.com/NoOneTheOne/dht/internal/basic"
 	"github.com/NoOneTheOne/dht/internal/config"
 	"github.com/NoOneTheOne/dht/internal/dht"
-	"github.com/NoOneTheOne/dht/internal/storage/es"
 	"github.com/NoOneTheOne/dht/internal/metrics"
-	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 	"github.com/NoOneTheOne/dht/internal/nat"
+	"github.com/NoOneTheOne/dht/internal/storage/es"
+	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
 
 type file struct {

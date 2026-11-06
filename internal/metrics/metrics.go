@@ -188,7 +188,7 @@ var (
 	)
 
 	// Uptime
-	startTime = time.Now()
+	startTime   = time.Now()
 	uptimeGauge = promauto.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "dht_uptime_seconds",
@@ -300,13 +300,13 @@ var (
 
 // DHTStats holds DHT network statistics
 type DHTStats struct {
-	RoutingTableNodes   int
-	BootstrapCount      int
-	PacketsReceived     int
-	PacketsSent         int
-	ActiveTransactions  int
-	BlacklistedNodes    int
-	TorrentsDiscovered  int
+	RoutingTableNodes  int
+	BootstrapCount     int
+	PacketsReceived    int
+	PacketsSent        int
+	ActiveTransactions int
+	BlacklistedNodes   int
+	TorrentsDiscovered int
 }
 
 // SetMySQLStatsGetter sets the function to get MySQL connection stats

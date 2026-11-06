@@ -578,9 +578,11 @@ type nodeHeapItem struct {
 
 type topKNodeHeap []*nodeHeapItem
 
-func (h topKNodeHeap) Len() int           { return len(h) }
-func (h topKNodeHeap) Less(i, j int) bool { return h[i].distance.Compare(h[j].distance, maxPrefixLength) == 1 }
-func (h topKNodeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h topKNodeHeap) Len() int { return len(h) }
+func (h topKNodeHeap) Less(i, j int) bool {
+	return h[i].distance.Compare(h[j].distance, maxPrefixLength) == 1
+}
+func (h topKNodeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
 func (h *topKNodeHeap) Push(x interface{}) {
 	*h = append(*h, x.(*nodeHeapItem))

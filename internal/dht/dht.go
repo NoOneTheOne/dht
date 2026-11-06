@@ -5,12 +5,13 @@ package dht
 import (
 	"encoding/hex"
 	"errors"
-	"github.com/NoOneTheOne/dht/internal/config"
 	"log"
 	"math"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/NoOneTheOne/dht/internal/config"
 )
 
 var udpBufPool = sync.Pool{
@@ -148,7 +149,7 @@ func New(initParam *InitParam) *DHT {
 		localIP = net.ParseIP("127.0.0.1")
 	}
 	nodeID := generateNodeID(localIP)
-	
+
 	node, err := newNode(nodeID, initParam.Network, initParam.Address)
 	if err != nil {
 		log.Fatalln(err)

@@ -97,7 +97,7 @@ func DecodeCompactPeerInfo(data []byte) (net.IP, int, error) {
 
 // CompactPeerList represents a list of peers in compact format
 type CompactPeerList struct {
-	Peers []CompactPeerInfo
+	Peers  []CompactPeerInfo
 	IsIPv6 bool
 }
 
@@ -112,7 +112,7 @@ func NewCompactPeerList(isIPv6 bool) *CompactPeerList {
 // Add adds a peer to the list
 func (cpl *CompactPeerList) Add(ip net.IP, port int) error {
 	peer := CompactPeerInfo{IP: ip, Port: port}
-	
+
 	// Validate consistency
 	if peer.IsIPv6() != cpl.IsIPv6 {
 		if cpl.IsIPv6 {
@@ -120,7 +120,7 @@ func (cpl *CompactPeerList) Add(ip net.IP, port int) error {
 		}
 		return errors.New("cannot add IPv6 peer to IPv4 list")
 	}
-	
+
 	cpl.Peers = append(cpl.Peers, peer)
 	return nil
 }
@@ -131,9 +131,9 @@ func (cpl *CompactPeerList) Encode() ([]byte, error) {
 	if cpl.IsIPv6 {
 		expectedSize = CompactIPv6Size
 	}
-	
+
 	result := make([]byte, len(cpl.Peers)*expectedSize)
-	
+
 	for i, peer := range cpl.Peers {
 		encoded, err := peer.Encode()
 		if err != nil {
@@ -141,7 +141,7 @@ func (cpl *CompactPeerList) Encode() ([]byte, error) {
 		}
 		copy(result[i*expectedSize:], encoded)
 	}
-	
+
 	return result, nil
 }
 
@@ -151,14 +151,14 @@ func (cpl *CompactPeerList) Decode(data []byte) error {
 	if cpl.IsIPv6 {
 		expectedSize = CompactIPv6Size
 	}
-	
+
 	if len(data)%expectedSize != 0 {
 		return errors.New("invalid compact peer list length")
 	}
-	
+
 	count := len(data) / expectedSize
 	cpl.Peers = make([]CompactPeerInfo, count)
-	
+
 	for i := 0; i < count; i++ {
 		start := i * expectedSize
 		end := start + expectedSize
@@ -166,13 +166,13 @@ func (cpl *CompactPeerList) Decode(data []byte) error {
 			return err
 		}
 	}
-	
+
 	return nil
 }
 
 // CompactNodeList represents a list of nodes in compact format
 type CompactNodeList struct {
-	Nodes []CompactNodeInfo
+	Nodes  []CompactNodeInfo
 	IsIPv6 bool
 }
 
@@ -196,9 +196,9 @@ func (cnl *CompactNodeList) Add(id string, ip net.IP, port int) error {
 	if len(id) != 20 {
 		return errors.New("node ID must be 20 bytes")
 	}
-	
+
 	node := CompactNodeInfo{ID: id, IP: ip, Port: port}
-	
+
 	// Validate consistency
 	isIPv6 := ip.To4() == nil
 	if isIPv6 != cnl.IsIPv6 {
@@ -207,7 +207,7 @@ func (cnl *CompactNodeList) Add(id string, ip net.IP, port int) error {
 		}
 		return errors.New("cannot add IPv6 node to IPv4 list")
 	}
-	
+
 	cnl.Nodes = append(cnl.Nodes, node)
 	return nil
 }
@@ -218,15 +218,15 @@ func (cnl *CompactNodeList) Encode() ([]byte, error) {
 	if cnl.IsIPv6 {
 		expectedSize = CompactNodeInfoIPv6Size
 	}
-	
+
 	result := make([]byte, len(cnl.Nodes)*expectedSize)
-	
+
 	for i, node := range cnl.Nodes {
 		offset := i * expectedSize
-		
+
 		// Copy node ID (20 bytes)
 		copy(result[offset:offset+20], node.ID)
-		
+
 		// Encode and copy peer info
 		peerInfo, err := EncodeCompactPeerInfo(node.IP, node.Port)
 		if err != nil {
@@ -234,7 +234,7 @@ func (cnl *CompactNodeList) Encode() ([]byte, error) {
 		}
 		copy(result[offset+20:], peerInfo)
 	}
-	
+
 	return result, nil
 }
 
@@ -244,26 +244,26 @@ func (cnl *CompactNodeList) Decode(data []byte) error {
 	if cnl.IsIPv6 {
 		expectedSize = CompactNodeInfoIPv6Size
 	}
-	
+
 	if len(data)%expectedSize != 0 {
 		return errors.New("invalid compact node list length")
 	}
-	
+
 	count := len(data) / expectedSize
 	cnl.Nodes = make([]CompactNodeInfo, count)
-	
+
 	for i := 0; i < count; i++ {
 		offset := i * expectedSize
-		
+
 		// Extract node ID
 		cnl.Nodes[i].ID = string(data[offset : offset+20])
-		
+
 		// Extract peer info
 		peerSize := CompactIPv4Size
 		if cnl.IsIPv6 {
 			peerSize = CompactIPv6Size
 		}
-		
+
 		ip, port, err := DecodeCompactPeerInfo(data[offset+20 : offset+20+peerSize])
 		if err != nil {
 			return err
@@ -271,7 +271,7 @@ func (cnl *CompactNodeList) Decode(data []byte) error {
 		cnl.Nodes[i].IP = ip
 		cnl.Nodes[i].Port = port
 	}
-	
+
 	return nil
 }
 
@@ -283,17 +283,17 @@ func (bce *BatchCompactEncoder) EncodePeersBatch(peers []CompactPeerInfo) ([]byt
 	if len(peers) == 0 {
 		return []byte{}, nil
 	}
-	
+
 	// Determine if IPv6 based on first peer
 	isIPv6 := peers[0].IsIPv6()
-	
+
 	list := NewCompactPeerList(isIPv6)
 	for _, peer := range peers {
 		if err := list.Add(peer.IP, peer.Port); err != nil {
 			return nil, err
 		}
 	}
-	
+
 	return list.Encode()
 }
 
@@ -311,17 +311,17 @@ func (bce *BatchCompactEncoder) EncodeNodesBatch(nodes []CompactNodeInfo) ([]byt
 	if len(nodes) == 0 {
 		return []byte{}, nil
 	}
-	
+
 	// Determine if IPv6 based on first node
 	isIPv6 := nodes[0].IP.To4() == nil
-	
+
 	list := NewCompactNodeList(isIPv6)
 	for _, node := range nodes {
 		if err := list.Add(node.ID, node.IP, node.Port); err != nil {
 			return nil, err
 		}
 	}
-	
+
 	return list.Encode()
 }
 

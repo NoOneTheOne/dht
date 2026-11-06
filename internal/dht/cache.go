@@ -10,9 +10,9 @@ import (
 
 // CacheItem represents a cached item with metadata
 type CacheItem struct {
-	Key        string
-	Value      interface{}
-	Expiration time.Time
+	Key         string
+	Value       interface{}
+	Expiration  time.Time
 	AccessCount int64
 	LastAccess  time.Time
 	CreatedAt   time.Time
@@ -25,7 +25,7 @@ type LRUCache struct {
 	items      map[string]*list.Element
 	evictList  *list.List
 	defaultTTL time.Duration
-	
+
 	// Statistics
 	stats CacheStats
 }
@@ -54,10 +54,10 @@ func NewLRUCache(maxSize int, defaultTTL time.Duration) *LRUCache {
 func (c *LRUCache) Get(key string) (interface{}, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	if elem, ok := c.items[key]; ok {
 		item := elem.Value.(*CacheItem)
-		
+
 		// Check expiration
 		if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
 			c.removeElement(elem)
@@ -65,18 +65,18 @@ func (c *LRUCache) Get(key string) (interface{}, bool) {
 			c.stats.Misses++
 			return nil, false
 		}
-		
+
 		// Move to front (most recently used)
 		c.evictList.MoveToFront(elem)
-		
+
 		// Update access stats
 		item.AccessCount++
 		item.LastAccess = time.Now()
-		
+
 		c.stats.Hits++
 		return item.Value, true
 	}
-	
+
 	c.stats.Misses++
 	return nil, false
 }
@@ -90,12 +90,12 @@ func (c *LRUCache) Set(key string, value interface{}) {
 func (c *LRUCache) SetWithTTL(key string, value interface{}, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	var expiration time.Time
 	if ttl > 0 {
 		expiration = time.Now().Add(ttl)
 	}
-	
+
 	if elem, ok := c.items[key]; ok {
 		// Update existing item
 		c.evictList.MoveToFront(elem)
@@ -106,7 +106,7 @@ func (c *LRUCache) SetWithTTL(key string, value interface{}, ttl time.Duration) 
 		c.stats.Updates++
 		return
 	}
-	
+
 	// Create new item
 	item := &CacheItem{
 		Key:         key,
@@ -116,11 +116,11 @@ func (c *LRUCache) SetWithTTL(key string, value interface{}, ttl time.Duration) 
 		LastAccess:  time.Now(),
 		CreatedAt:   time.Now(),
 	}
-	
+
 	elem := c.evictList.PushFront(item)
 	c.items[key] = elem
 	c.stats.Inserts++
-	
+
 	// Evict if over capacity
 	if c.evictList.Len() > c.maxSize {
 		c.removeOldest()
@@ -131,7 +131,7 @@ func (c *LRUCache) SetWithTTL(key string, value interface{}, ttl time.Duration) 
 func (c *LRUCache) Remove(key string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	if elem, ok := c.items[key]; ok {
 		c.removeElement(elem)
 		return true
@@ -143,17 +143,17 @@ func (c *LRUCache) Remove(key string) bool {
 func (c *LRUCache) Contains(key string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	elem, ok := c.items[key]
 	if !ok {
 		return false
 	}
-	
+
 	item := elem.Value.(*CacheItem)
 	if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
 		return false
 	}
-	
+
 	return true
 }
 
@@ -168,7 +168,7 @@ func (c *LRUCache) Len() int {
 func (c *LRUCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	c.items = make(map[string]*list.Element)
 	c.evictList.Init()
 }
@@ -208,10 +208,10 @@ func (c *LRUCache) removeElement(elem *list.Element) {
 func (c *LRUCache) Cleanup() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	now := time.Now()
 	removed := 0
-	
+
 	for key, elem := range c.items {
 		item := elem.Value.(*CacheItem)
 		if !item.Expiration.IsZero() && now.After(item.Expiration) {
@@ -221,7 +221,7 @@ func (c *LRUCache) Cleanup() int {
 			_ = key // avoid unused variable warning
 		}
 	}
-	
+
 	return removed
 }
 
@@ -229,7 +229,7 @@ func (c *LRUCache) Cleanup() int {
 func (c *LRUCache) StartCleanupRoutine(interval time.Duration, stopChan <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-stopChan:
@@ -249,11 +249,11 @@ type NodeCache struct {
 
 // CachedNodeInfo represents cached node information
 type CachedNodeInfo struct {
-	Node       *node
-	LastPing   time.Time
-	PingCount  int
-	LastPong   time.Time
-	PongCount  int
+	Node        *node
+	LastPing    time.Time
+	PingCount   int
+	LastPong    time.Time
+	PongCount   int
 	Reliability float64 // 0.0 to 1.0
 }
 
@@ -291,12 +291,12 @@ func (nc *NodeCache) UpdatePong(addr string) {
 	if info, ok := nc.Get(addr); ok {
 		info.LastPong = time.Now()
 		info.PongCount++
-		
+
 		// Calculate reliability
 		if info.PingCount > 0 {
 			info.Reliability = float64(info.PongCount) / float64(info.PingCount)
 		}
-		
+
 		nc.Set(addr, info)
 	}
 }
@@ -308,10 +308,10 @@ type QueryResultCache struct {
 
 // CachedQueryResult represents a cached query result
 type CachedQueryResult struct {
-	QueryType  QueryType
-	Target     string
-	Results    interface{} // []*node or []*Peer
-	CachedAt   time.Time
+	QueryType   QueryType
+	Target      string
+	Results     interface{} // []*node or []*Peer
+	CachedAt    time.Time
 	ResultCount int
 }
 
@@ -348,10 +348,10 @@ type InfoHashCache struct {
 
 // CachedPeers represents cached peers for an infohash
 type CachedPeers struct {
-	InfoHash  string
-	Peers     []*Peer
-	CachedAt  time.Time
-	Source    string // Where we learned about these peers
+	InfoHash string
+	Peers    []*Peer
+	CachedAt time.Time
+	Source   string // Where we learned about these peers
 }
 
 // NewInfoHashCache creates a new infohash cache

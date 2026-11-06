@@ -10,11 +10,11 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/NoOneTheOne/dht/internal/config"
 	"github.com/NoOneTheOne/dht/internal/metrics"
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
+	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const maxQueryLen = 200
@@ -178,9 +178,9 @@ func getMemoryUsage() gin.H {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return gin.H{
-		"alloc_mb":      m.Alloc / 1024 / 1024,
+		"alloc_mb":       m.Alloc / 1024 / 1024,
 		"total_alloc_mb": m.TotalAlloc / 1024 / 1024,
-		"sys_mb":        m.Sys / 1024 / 1024,
-		"num_gc":        m.NumGC,
+		"sys_mb":         m.Sys / 1024 / 1024,
+		"num_gc":         m.NumGC,
 	}
 }

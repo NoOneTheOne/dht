@@ -22,7 +22,7 @@ func (nq *NodeQuality) UpdateSuccess(responseTime time.Duration) {
 	atomic.AddInt32(&nq.SuccessCount, 1)
 	atomic.StoreInt32(&nq.FailureCount, 0) // Reset failure count on success
 	nq.LastSeen = time.Now()
-	
+
 	// Update average response time (exponential moving average)
 	rtMs := responseTime.Milliseconds()
 	currentRT := atomic.LoadInt64(&nq.ResponseTimeMs)
@@ -106,12 +106,12 @@ func CleanupNodeQuality(nodeID string) {
 
 // RoutingTableStats holds statistics about the routing table
 type RoutingTableStats struct {
-	TotalNodes      int
-	TotalBuckets    int
-	NonEmptyBuckets int
+	TotalNodes        int
+	TotalBuckets      int
+	NonEmptyBuckets   int
 	AvgNodesPerBucket float64
-	OldestNode      time.Time
-	NewestNode      time.Time
+	OldestNode        time.Time
+	NewestNode        time.Time
 }
 
 // GetRoutingTableStats returns statistics about the routing table
@@ -133,11 +133,11 @@ func (rt *routingTable) GetStats() RoutingTableStats {
 	for e := range rt.cachedKBuckets.Iter() {
 		bucket := e.Value.(*KBucket)
 		bucketCount++
-		
+
 		nodeCount := bucket.nodes.Len()
 		if nodeCount > 0 {
 			nonEmptyCount++
-			
+
 			// Check node timestamps
 			for n := range bucket.nodes.Iter() {
 				node := n.Value.(*node)
@@ -167,20 +167,20 @@ func (rt *routingTable) GetStats() RoutingTableStats {
 // 3. Cover ID ranges we haven't explored much
 func (rt *routingTable) OptimizedRefresh() {
 	now := time.Now()
-	
+
 	type bucketPriority struct {
 		bucket   *KBucket
 		priority float64
 	}
-	
+
 	var priorities []bucketPriority
-	
+
 	rt.RLock()
 	for e := range rt.cachedKBuckets.Iter() {
 		bucket := e.Value.(*KBucket)
 		age := now.Sub(bucket.LastChanged())
 		nodeCount := bucket.nodes.Len()
-		
+
 		// Priority = age factor + scarcity factor
 		// Older buckets and buckets with fewer nodes get higher priority
 		ageFactor := float64(age.Minutes()) / 15.0 // Normalize to 15-minute intervals
@@ -188,31 +188,31 @@ func (rt *routingTable) OptimizedRefresh() {
 		if nodeCount > 0 {
 			scarcityFactor = float64(rt.k) / float64(nodeCount)
 		}
-		
+
 		priority := ageFactor * scarcityFactor
-		
+
 		priorities = append(priorities, bucketPriority{bucket: bucket, priority: priority})
 	}
 	rt.RUnlock()
-	
+
 	// Sort by priority (highest first)
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i].priority > priorities[j].priority
 	})
-	
+
 	// Refresh top priority buckets
 	refreshCount := 0
 	maxRefresh := 3 // Refresh at most 3 buckets per cycle
-	
+
 	for _, bp := range priorities {
 		if refreshCount >= maxRefresh {
 			break
 		}
-		
+
 		if bp.bucket.nodes.Len() == 0 {
 			continue
 		}
-		
+
 		// Refresh this bucket
 		i := 0
 		for e := range bp.bucket.nodes.Iter() {
@@ -227,7 +227,7 @@ func (rt *routingTable) OptimizedRefresh() {
 		}
 		refreshCount++
 	}
-	
+
 	if rt.dht.IsCrawlMode() {
 		for e := range rt.clearQueue.Iter() {
 			rt.Remove(e.Value.(*node).id)

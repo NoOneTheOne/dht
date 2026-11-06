@@ -21,49 +21,49 @@ const (
 
 // SecurityManager manages security features
 type SecurityManager struct {
-	mu              sync.RWMutex
-	level           SecurityLevel
-	blacklist       *AdvancedBlacklist
-	rateLimiter     *RateLimiter
+	mu                sync.RWMutex
+	level             SecurityLevel
+	blacklist         *AdvancedBlacklist
+	rateLimiter       *RateLimiter
 	maliciousDetector *MaliciousNodeDetector
-	auditLogger     *AuditLogger
+	auditLogger       *AuditLogger
 }
 
 // NewSecurityManager creates a new security manager
 func NewSecurityManager(level SecurityLevel) *SecurityManager {
 	return &SecurityManager{
-		level:           level,
-		blacklist:       NewAdvancedBlacklist(100000),
-		rateLimiter:     NewRateLimiter(100, time.Second), // 100 requests per second
+		level:             level,
+		blacklist:         NewAdvancedBlacklist(100000),
+		rateLimiter:       NewRateLimiter(100, time.Second), // 100 requests per second
 		maliciousDetector: NewMaliciousNodeDetector(),
-		auditLogger:     NewAuditLogger(10000),
+		auditLogger:       NewAuditLogger(10000),
 	}
 }
 
 // AdvancedBlacklist provides enhanced IP blacklisting
 type AdvancedBlacklist struct {
-	mu         sync.RWMutex
-	maxSize    int
-	ips        map[string]*BlacklistEntry
-	subnets    map[string]*BlacklistEntry // CIDR notation
-	patterns   []BlacklistPattern
+	mu       sync.RWMutex
+	maxSize  int
+	ips      map[string]*BlacklistEntry
+	subnets  map[string]*BlacklistEntry // CIDR notation
+	patterns []BlacklistPattern
 }
 
 // BlacklistEntry represents a blacklisted IP or subnet
 type BlacklistEntry struct {
-	Value      string
-	Reason     string
-	AddedAt    time.Time
-	ExpiresAt  time.Time
-	HitCount   int64
-	Permanent  bool
+	Value     string
+	Reason    string
+	AddedAt   time.Time
+	ExpiresAt time.Time
+	HitCount  int64
+	Permanent bool
 }
 
 // BlacklistPattern represents a pattern-based blacklist rule
 type BlacklistPattern struct {
-	Pattern    string // IP prefix pattern like "192.168." or "10."
-	Reason     string
-	Permanent  bool
+	Pattern   string // IP prefix pattern like "192.168." or "10."
+	Reason    string
+	Permanent bool
 }
 
 // NewAdvancedBlacklist creates a new advanced blacklist
@@ -74,7 +74,7 @@ func NewAdvancedBlacklist(maxSize int) *AdvancedBlacklist {
 		subnets:  make(map[string]*BlacklistEntry),
 		patterns: make([]BlacklistPattern, 0),
 	}
-	
+
 	// Add default patterns for known bad ranges
 	bl.AddPattern("0.", "Zero network", true)
 	bl.AddPattern("127.", "Loopback", true)
@@ -82,7 +82,7 @@ func NewAdvancedBlacklist(maxSize int) *AdvancedBlacklist {
 	bl.AddPattern("224.", "Multicast", true)
 	bl.AddPattern("240.", "Reserved", true)
 	bl.AddPattern("255.", "Broadcast", true)
-	
+
 	return bl
 }
 
@@ -90,11 +90,11 @@ func NewAdvancedBlacklist(maxSize int) *AdvancedBlacklist {
 func (bl *AdvancedBlacklist) AddIP(ip string, reason string, duration time.Duration) {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	
+
 	if len(bl.ips) >= bl.maxSize {
 		bl.evictOldest()
 	}
-	
+
 	entry := &BlacklistEntry{
 		Value:     ip,
 		Reason:    reason,
@@ -102,11 +102,11 @@ func (bl *AdvancedBlacklist) AddIP(ip string, reason string, duration time.Durat
 		HitCount:  0,
 		Permanent: duration == 0,
 	}
-	
+
 	if duration > 0 {
 		entry.ExpiresAt = time.Now().Add(duration)
 	}
-	
+
 	bl.ips[ip] = entry
 	log.Printf("[Security] Blacklisted IP %s: %s", ip, reason)
 }
@@ -115,7 +115,7 @@ func (bl *AdvancedBlacklist) AddIP(ip string, reason string, duration time.Durat
 func (bl *AdvancedBlacklist) AddSubnet(cidr string, reason string, duration time.Duration) {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	
+
 	entry := &BlacklistEntry{
 		Value:     cidr,
 		Reason:    reason,
@@ -123,11 +123,11 @@ func (bl *AdvancedBlacklist) AddSubnet(cidr string, reason string, duration time
 		HitCount:  0,
 		Permanent: duration == 0,
 	}
-	
+
 	if duration > 0 {
 		entry.ExpiresAt = time.Now().Add(duration)
 	}
-	
+
 	bl.subnets[cidr] = entry
 	log.Printf("[Security] Blacklisted subnet %s: %s", cidr, reason)
 }
@@ -136,7 +136,7 @@ func (bl *AdvancedBlacklist) AddSubnet(cidr string, reason string, duration time
 func (bl *AdvancedBlacklist) AddPattern(pattern string, reason string, permanent bool) {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	
+
 	bl.patterns = append(bl.patterns, BlacklistPattern{
 		Pattern:   pattern,
 		Reason:    reason,
@@ -148,12 +148,12 @@ func (bl *AdvancedBlacklist) AddPattern(pattern string, reason string, permanent
 func (bl *AdvancedBlacklist) IsBlacklisted(ipStr string) (bool, string) {
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()
-	
+
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false, ""
 	}
-	
+
 	// Check exact IP match
 	if entry, ok := bl.ips[ipStr]; ok {
 		if entry.Permanent || time.Now().Before(entry.ExpiresAt) {
@@ -161,7 +161,7 @@ func (bl *AdvancedBlacklist) IsBlacklisted(ipStr string) (bool, string) {
 			return true, entry.Reason
 		}
 	}
-	
+
 	// Check subnet matches
 	for cidr, entry := range bl.subnets {
 		if entry.Permanent || time.Now().Before(entry.ExpiresAt) {
@@ -172,14 +172,14 @@ func (bl *AdvancedBlacklist) IsBlacklisted(ipStr string) (bool, string) {
 			}
 		}
 	}
-	
+
 	// Check pattern matches
 	for _, pattern := range bl.patterns {
 		if len(ipStr) >= len(pattern.Pattern) && ipStr[:len(pattern.Pattern)] == pattern.Pattern {
 			return true, pattern.Reason
 		}
 	}
-	
+
 	return false, ""
 }
 
@@ -194,24 +194,24 @@ func (bl *AdvancedBlacklist) RemoveIP(ip string) {
 func (bl *AdvancedBlacklist) Cleanup() int {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	
+
 	now := time.Now()
 	removed := 0
-	
+
 	for ip, entry := range bl.ips {
 		if !entry.Permanent && now.After(entry.ExpiresAt) {
 			delete(bl.ips, ip)
 			removed++
 		}
 	}
-	
+
 	for cidr, entry := range bl.subnets {
 		if !entry.Permanent && now.After(entry.ExpiresAt) {
 			delete(bl.subnets, cidr)
 			removed++
 		}
 	}
-	
+
 	return removed
 }
 
@@ -220,7 +220,7 @@ func (bl *AdvancedBlacklist) Cleanup() int {
 func (bl *AdvancedBlacklist) evictOldest() {
 	var oldestIP string
 	var oldestTime time.Time
-	
+
 	for ip, entry := range bl.ips {
 		if entry.Permanent {
 			continue
@@ -230,7 +230,7 @@ func (bl *AdvancedBlacklist) evictOldest() {
 			oldestTime = entry.AddedAt
 		}
 	}
-	
+
 	if oldestIP != "" {
 		delete(bl.ips, oldestIP)
 	}
@@ -245,12 +245,12 @@ func (bl *AdvancedBlacklist) Stats() (ips int, subnets int, patterns int) {
 
 // RateLimiter implements token bucket rate limiting
 type RateLimiter struct {
-	mu         sync.Mutex
-	rate       int           // tokens per interval
-	interval   time.Duration // refill interval
-	tokens     map[string]*TokenBucket
+	mu            sync.Mutex
+	rate          int           // tokens per interval
+	interval      time.Duration // refill interval
+	tokens        map[string]*TokenBucket
 	cleanupTicker *time.Ticker
-	stopChan   chan struct{}
+	stopChan      chan struct{}
 }
 
 // TokenBucket represents a token bucket for an IP
@@ -268,10 +268,10 @@ func NewRateLimiter(rate int, interval time.Duration) *RateLimiter {
 		tokens:   make(map[string]*TokenBucket),
 		stopChan: make(chan struct{}),
 	}
-	
+
 	// Start cleanup routine
 	go rl.cleanup()
-	
+
 	return rl
 }
 
@@ -279,7 +279,7 @@ func NewRateLimiter(rate int, interval time.Duration) *RateLimiter {
 func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
+
 	bucket, exists := rl.tokens[ip]
 	if !exists {
 		bucket = &TokenBucket{
@@ -289,20 +289,20 @@ func (rl *RateLimiter) Allow(ip string) bool {
 		}
 		rl.tokens[ip] = bucket
 	}
-	
+
 	// Refill tokens
 	now := time.Now()
 	elapsed := now.Sub(bucket.LastRefill)
 	refill := float64(rl.rate) * elapsed.Seconds() / rl.interval.Seconds()
 	bucket.Tokens = min(bucket.Tokens+refill, bucket.MaxTokens)
 	bucket.LastRefill = now
-	
+
 	// Check if allowed
 	if bucket.Tokens >= 1 {
 		bucket.Tokens--
 		return true
 	}
-	
+
 	return false
 }
 
@@ -310,7 +310,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 func (rl *RateLimiter) GetRemainingTokens(ip string) float64 {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
+
 	if bucket, exists := rl.tokens[ip]; exists {
 		return bucket.Tokens
 	}
@@ -321,7 +321,7 @@ func (rl *RateLimiter) GetRemainingTokens(ip string) float64 {
 func (rl *RateLimiter) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-rl.stopChan:
@@ -392,7 +392,7 @@ func NewMaliciousNodeDetector() *MaliciousNodeDetector {
 func (mnd *MaliciousNodeDetector) RecordFailedRequest(nodeID string, ip string) {
 	mnd.mu.Lock()
 	defer mnd.mu.Unlock()
-	
+
 	node := mnd.getOrCreateNode(nodeID, ip)
 	node.FailedRequests++
 	node.LastSeen = time.Now()
@@ -403,7 +403,7 @@ func (mnd *MaliciousNodeDetector) RecordFailedRequest(nodeID string, ip string) 
 func (mnd *MaliciousNodeDetector) RecordInvalidMessage(nodeID string, ip string, reason string) {
 	mnd.mu.Lock()
 	defer mnd.mu.Unlock()
-	
+
 	node := mnd.getOrCreateNode(nodeID, ip)
 	node.InvalidMessages++
 	node.LastSeen = time.Now()
@@ -415,7 +415,7 @@ func (mnd *MaliciousNodeDetector) RecordInvalidMessage(nodeID string, ip string,
 func (mnd *MaliciousNodeDetector) RecordSpam(nodeID string, ip string) {
 	mnd.mu.Lock()
 	defer mnd.mu.Unlock()
-	
+
 	node := mnd.getOrCreateNode(nodeID, ip)
 	node.SpamCount++
 	node.LastSeen = time.Now()
@@ -429,7 +429,7 @@ func (mnd *MaliciousNodeDetector) getOrCreateNode(nodeID string, ip string) *Sus
 	if key == "" {
 		key = ip
 	}
-	
+
 	node, exists := mnd.suspiciousNodes[key]
 	if !exists {
 		node = &SuspiciousNode{
@@ -441,7 +441,7 @@ func (mnd *MaliciousNodeDetector) getOrCreateNode(nodeID string, ip string) *Sus
 		}
 		mnd.suspiciousNodes[key] = node
 	}
-	
+
 	return node
 }
 
@@ -450,22 +450,22 @@ func (mnd *MaliciousNodeDetector) getOrCreateNode(nodeID string, ip string) *Sus
 func (mnd *MaliciousNodeDetector) updateScore(node *SuspiciousNode) {
 	// Calculate score based on various factors
 	score := 0.0
-	
+
 	// Failed requests contribute to score
 	if node.FailedRequests > 0 {
 		score += float64(node.FailedRequests) / float64(mnd.thresholds.MaxFailedRequests) * 0.3
 	}
-	
+
 	// Invalid messages contribute more
 	if node.InvalidMessages > 0 {
 		score += float64(node.InvalidMessages) / float64(mnd.thresholds.MaxInvalidMessages) * 0.4
 	}
-	
+
 	// Spam contributes significantly
 	if node.SpamCount > 0 {
 		score += float64(node.SpamCount) / float64(mnd.thresholds.MaxSpamCount) * 0.3
 	}
-	
+
 	// Cap at 1.0
 	node.Score = min(score, 1.0)
 }
@@ -474,7 +474,7 @@ func (mnd *MaliciousNodeDetector) updateScore(node *SuspiciousNode) {
 func (mnd *MaliciousNodeDetector) IsSuspicious(nodeID string) (bool, float64) {
 	mnd.mu.RLock()
 	defer mnd.mu.RUnlock()
-	
+
 	if node, exists := mnd.suspiciousNodes[nodeID]; exists {
 		return node.Score >= mnd.thresholds.SuspiciousScore, node.Score
 	}
@@ -485,7 +485,7 @@ func (mnd *MaliciousNodeDetector) IsSuspicious(nodeID string) (bool, float64) {
 func (mnd *MaliciousNodeDetector) IsMalicious(nodeID string) (bool, float64) {
 	mnd.mu.RLock()
 	defer mnd.mu.RUnlock()
-	
+
 	if node, exists := mnd.suspiciousNodes[nodeID]; exists {
 		return node.Score >= mnd.thresholds.MaliciousScore, node.Score
 	}
@@ -496,7 +496,7 @@ func (mnd *MaliciousNodeDetector) IsMalicious(nodeID string) (bool, float64) {
 func (mnd *MaliciousNodeDetector) GetSuspiciousNodes() []*SuspiciousNode {
 	mnd.mu.RLock()
 	defer mnd.mu.RUnlock()
-	
+
 	result := make([]*SuspiciousNode, 0)
 	for _, node := range mnd.suspiciousNodes {
 		if node.Score >= mnd.thresholds.SuspiciousScore {
@@ -510,25 +510,25 @@ func (mnd *MaliciousNodeDetector) GetSuspiciousNodes() []*SuspiciousNode {
 func (mnd *MaliciousNodeDetector) Cleanup(maxAge time.Duration) int {
 	mnd.mu.Lock()
 	defer mnd.mu.Unlock()
-	
+
 	now := time.Now()
 	removed := 0
-	
+
 	for key, node := range mnd.suspiciousNodes {
 		if now.Sub(node.LastSeen) > maxAge && node.Score < mnd.thresholds.SuspiciousScore {
 			delete(mnd.suspiciousNodes, key)
 			removed++
 		}
 	}
-	
+
 	return removed
 }
 
 // AuditLogger provides security audit logging
 type AuditLogger struct {
-	mu       sync.Mutex
-	maxSize  int
-	entries  []*AuditEntry
+	mu      sync.Mutex
+	maxSize int
+	entries []*AuditEntry
 }
 
 // AuditEntry represents an audit log entry
@@ -554,7 +554,7 @@ func NewAuditLogger(maxSize int) *AuditLogger {
 func (al *AuditLogger) Log(eventType string, sourceIP string, targetIP string, nodeID string, details string, severity string) {
 	al.mu.Lock()
 	defer al.mu.Unlock()
-	
+
 	entry := &AuditEntry{
 		Timestamp: time.Now(),
 		EventType: eventType,
@@ -564,14 +564,14 @@ func (al *AuditLogger) Log(eventType string, sourceIP string, targetIP string, n
 		Details:   details,
 		Severity:  severity,
 	}
-	
+
 	al.entries = append(al.entries, entry)
-	
+
 	// Trim if over capacity
 	if len(al.entries) > al.maxSize {
 		al.entries = al.entries[len(al.entries)-al.maxSize:]
 	}
-	
+
 	// Log critical events immediately
 	if severity == "CRITICAL" {
 		log.Printf("[AUDIT] CRITICAL: %s - %s (from %s to %s)", eventType, details, sourceIP, targetIP)
@@ -582,11 +582,11 @@ func (al *AuditLogger) Log(eventType string, sourceIP string, targetIP string, n
 func (al *AuditLogger) GetEntries(limit int) []*AuditEntry {
 	al.mu.Lock()
 	defer al.mu.Unlock()
-	
+
 	if limit > len(al.entries) {
 		limit = len(al.entries)
 	}
-	
+
 	result := make([]*AuditEntry, limit)
 	copy(result, al.entries[len(al.entries)-limit:])
 	return result
@@ -596,7 +596,7 @@ func (al *AuditLogger) GetEntries(limit int) []*AuditEntry {
 func (al *AuditLogger) GetEntriesBySeverity(severity string) []*AuditEntry {
 	al.mu.Lock()
 	defer al.mu.Unlock()
-	
+
 	result := make([]*AuditEntry, 0)
 	for _, entry := range al.entries {
 		if entry.Severity == severity {
@@ -629,28 +629,28 @@ func GetSecurityManager() *SecurityManager {
 // ValidateRequest performs security validation on a request
 func ValidateRequest(sourceIP string, nodeID string, messageType string) error {
 	sm := GetSecurityManager()
-	
+
 	// Check blacklist
 	if blocked, reason := sm.blacklist.IsBlacklisted(sourceIP); blocked {
-		sm.auditLogger.Log("BLOCKED_REQUEST", sourceIP, "", nodeID, 
+		sm.auditLogger.Log("BLOCKED_REQUEST", sourceIP, "", nodeID,
 			"Blocked: "+reason+" (message: "+messageType+")", "WARNING")
 		return &SecurityError{Message: "IP blacklisted: " + reason}
 	}
-	
+
 	// Check rate limit
 	if !sm.rateLimiter.Allow(sourceIP) {
 		sm.auditLogger.Log("RATE_LIMITED", sourceIP, "", nodeID,
 			"Rate limited (message: "+messageType+")", "WARNING")
 		return &SecurityError{Message: "rate limit exceeded"}
 	}
-	
+
 	// Check malicious node
 	if isMalicious, score := sm.maliciousDetector.IsMalicious(nodeID); isMalicious {
 		sm.auditLogger.Log("MALICIOUS_NODE", sourceIP, "", nodeID,
 			"Malicious node detected (score: "+string(rune(score))+")", "CRITICAL")
 		return &SecurityError{Message: "malicious node detected"}
 	}
-	
+
 	return nil
 }
 
