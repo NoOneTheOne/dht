@@ -3,12 +3,14 @@ package mysql
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/NoOneTheOne/dht/pkg/config"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Data struct {
@@ -57,7 +59,8 @@ func getDB() *gorm.DB {
 }
 
 func Write(d *Data) error {
-	return getDB().Create(d).Error
+	d.Name = strings.ToValidUTF8(d.Name, "")
+	return getDB().Clauses(clause.OnConflict{DoNothing: true}).Create(d).Error
 }
 
 func Search(name string) ([]Data, int64, error) {
