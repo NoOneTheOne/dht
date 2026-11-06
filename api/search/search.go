@@ -6,13 +6,18 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/NoOneTheOne/dht/pkg/config"
 	"github.com/NoOneTheOne/dht/pkg/mysql"
 )
 
 const maxQueryLen = 200
+
+var startTime = time.Now()
 
 func main() {
 	gin.SetMode(gin.ReleaseMode)
@@ -57,8 +62,57 @@ func main() {
 	})
 
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		health := gin.H{
+			"status":     "ok",
+			"uptime":     time.Since(startTime).String(),
+			"goroutines": runtime.NumGoroutine(),
+			"memory":     getMemoryUsage(),
+		}
+
+		// Check config
+		cfg := config.GetConfig()
+		if cfg == nil {
+			health["status"] = "degraded"
+			health["config"] = "not loaded"
+		} else {
+			health["config"] = "loaded"
+			health["storage_type"] = cfg.Storage.Type
+		}
+
+		// Check MySQL connection
+		db, err := mysql.GetDB().DB()
+		if err != nil {
+			health["status"] = "unhealthy"
+			health["mysql"] = "error: " + err.Error()
+		} else if err := db.Ping(); err != nil {
+			health["status"] = "unhealthy"
+			health["mysql"] = "ping failed: " + err.Error()
+		} else {
+			health["mysql"] = "connected"
+			stats := db.Stats()
+			health["mysql_pool"] = gin.H{
+				"open_connections": stats.OpenConnections,
+				"in_use":           stats.InUse,
+				"idle":             stats.Idle,
+			}
+		}
+
+		statusCode := http.StatusOK
+		if health["status"] == "unhealthy" {
+			statusCode = http.StatusServiceUnavailable
+		} else if health["status"] == "degraded" {
+			statusCode = http.StatusPartialContent
+		}
+
+		c.JSON(statusCode, health)
 	})
+
+	webDir := filepath.Join(filepath.Dir(os.Args[0]), "web")
+	if _, err := os.Stat(webDir); err == nil {
+		router.Static("/", webDir)
+	} else {
+		log.Printf("web directory not found at %s, serving API only", webDir)
+	}
 
 	port := os.Getenv("SEARCH_API_PORT")
 	if port == "" {
@@ -67,5 +121,16 @@ func main() {
 	err := router.Run(":" + port)
 	if err != nil {
 		log.Fatalln(err)
+	}
+}
+
+func getMemoryUsage() gin.H {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return gin.H{
+		"alloc_mb":      m.Alloc / 1024 / 1024,
+		"total_alloc_mb": m.TotalAlloc / 1024 / 1024,
+		"sys_mb":        m.Sys / 1024 / 1024,
+		"num_gc":        m.NumGC,
 	}
 }

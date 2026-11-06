@@ -20,3 +20,7 @@ config/config.yml
 # OS
 .DS_Store
 Thumbs.db
+
+# Web
+web/node_modules
+web/dist

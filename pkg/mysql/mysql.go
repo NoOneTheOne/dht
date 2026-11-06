@@ -34,7 +34,7 @@ func getCfg() *config.Config {
 	return config.GetConfig()
 }
 
-func getDB() *gorm.DB {
+func GetDB() *gorm.DB {
 	once.Do(func() {
 		c := getCfg()
 		dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
@@ -61,7 +61,7 @@ func getDB() *gorm.DB {
 
 func Write(d *Data) error {
 	d.Name = strings.ToValidUTF8(d.Name, "")
-	return getDB().Clauses(clause.OnConflict{
+	return GetDB().Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "infohash"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("`count` + 1")}),
 	}).Create(d).Error
@@ -71,7 +71,7 @@ func Search(name string) ([]Data, int64, error) {
 	var results []Data
 	var total int64
 
-	query := getDB().Model(&Data{}).Where("name LIKE ?", "%"+name+"%")
+	query := GetDB().Model(&Data{}).Where("name LIKE ?", "%"+name+"%")
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err

@@ -1,3 +1,10 @@
+FROM node:20-alpine AS web-builder
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install
+COPY web/ .
+RUN npm run build
+
 FROM golang:1.26-alpine AS builder
 
 WORKDIR /build
@@ -42,6 +49,7 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 WORKDIR /app
 COPY --from=builder /build/dht-search .
+COPY --from=web-builder /web/dist ./web
 USER appuser
 
 EXPOSE 30080

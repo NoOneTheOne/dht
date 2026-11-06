@@ -7,3 +7,5 @@ README.md
 LICENSE
 internal
 test
+web/node_modules
+web/dist
