@@ -272,7 +272,7 @@ func ExtractIPv4FromMapped(ip6 net.IP) net.IP {
 	if ip6[0] == 0 && ip6[1] == 0 && ip6[2] == 0 && ip6[3] == 0 &&
 		ip6[4] == 0 && ip6[5] == 0 && ip6[6] == 0 && ip6[7] == 0 &&
 		ip6[8] == 0 && ip6[9] == 0 && ip6[10] == 0xff && ip6[11] == 0xff {
-		return net.IP(ip6[12:16])
+		return ip6[12:16]
 	}
 
 	return nil
