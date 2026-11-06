@@ -36,6 +36,10 @@ func main() {
 
 	router.GET("/search", func(c *gin.Context) {
 		name := c.Query("name")
+		if name == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameter: name"})
+			return
+		}
 		if len(name) > maxQueryLen {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "query too long"})
 			return

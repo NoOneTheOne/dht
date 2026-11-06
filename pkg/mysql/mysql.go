@@ -64,10 +64,7 @@ func Search(name string) ([]Data, int64, error) {
 	var results []Data
 	var total int64
 
-	query := getDB().Model(&Data{})
-	if name != "" {
-		query = query.Where("name LIKE ?", "%"+name+"%")
-	}
+	query := getDB().Model(&Data{}).Where("name LIKE ?", "%"+name+"%")
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
