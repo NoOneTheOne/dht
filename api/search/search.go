@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/NoOneTheOne/dht/pkg/config"
+	"github.com/NoOneTheOne/dht/pkg/metrics"
 	"github.com/NoOneTheOne/dht/pkg/mysql"
 )
 
@@ -38,23 +40,46 @@ func main() {
 		)
 	}))
 	router.Use(gin.Recovery())
+	router.Use(metrics.Middleware())
+
+	// Set up MySQL stats getter for metrics
+	metrics.SetMySQLStatsGetter(func() (open, inUse, idle int) {
+		db, err := mysql.GetDB().DB()
+		if err != nil {
+			return 0, 0, 0
+		}
+		stats := db.Stats()
+		return stats.OpenConnections, stats.InUse, stats.Idle
+	})
+
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	router.GET("/search", func(c *gin.Context) {
 		name := c.Query("name")
 		if name == "" {
+			metrics.RecordSearchError("missing_parameter")
 			c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameter: name"})
 			return
 		}
 		if len(name) > maxQueryLen {
+			metrics.RecordSearchError("query_too_long")
 			c.JSON(http.StatusBadRequest, gin.H{"error": "query too long"})
 			return
 		}
+
+		start := time.Now()
 		results, total, err := mysql.Search(name)
+		duration := time.Since(start)
+		metrics.RecordMySQLQuery("search", duration, err)
+
 		if err != nil {
+			metrics.RecordSearchError("mysql_error")
 			log.Printf("search error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
+
+		metrics.RecordSearch(len(results))
 		c.JSON(http.StatusOK, gin.H{
 			"total": total,
 			"items": results,
@@ -109,7 +134,18 @@ func main() {
 
 	webDir := filepath.Join(filepath.Dir(os.Args[0]), "web")
 	if _, err := os.Stat(webDir); err == nil {
-		router.Static("/", webDir)
+		router.NoRoute(func(c *gin.Context) {
+			path := c.Request.URL.Path
+			if path == "/" {
+				path = "/index.html"
+			}
+			filePath := filepath.Join(webDir, path)
+			if _, err := os.Stat(filePath); err == nil {
+				c.File(filePath)
+			} else {
+				c.File(filepath.Join(webDir, "index.html"))
+			}
+		})
 	} else {
 		log.Printf("web directory not found at %s, serving API only", webDir)
 	}
