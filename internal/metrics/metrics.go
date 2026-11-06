@@ -293,7 +293,7 @@ var (
 
 	// Blank identifiers to prevent staticcheck from flagging these as unused.
 	// These metrics are registered with Prometheus via promauto for their side effects.
-	_ = memStatsCache
+	_ = &memStatsCache
 	_ = getCachedMemStats
 	_ = mysqlConnectionsOpen
 	_ = mysqlConnectionsInUse
