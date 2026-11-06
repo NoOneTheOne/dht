@@ -44,6 +44,6 @@ WORKDIR /app
 COPY --from=builder /build/dht-search .
 USER appuser
 
-EXPOSE 8080
+EXPOSE 30080
 
 CMD ["./dht-search"]

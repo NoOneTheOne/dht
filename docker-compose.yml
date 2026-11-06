@@ -20,10 +20,10 @@ services:
       target: search
     container_name: dht-search
     environment:
-      SEARCH_API_PORT: "8080"
+      SEARCH_API_PORT: "30080"
       CONFIG_FILE_PATH: "/app/config.yml"
     ports:
-      - "${SEARCH_PORT:-8080}:8080"
+      - "${SEARCH_PORT:-30080}:30080"
     volumes:
       - ./config/config.yml:/app/config.yml:ro
     restart: unless-stopped

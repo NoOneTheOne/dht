@@ -58,7 +58,7 @@ func main() {
 
 	port := os.Getenv("SEARCH_API_PORT")
 	if port == "" {
-		port = "8080"
+		port = "30080"
 	}
 	err := router.Run(":" + port)
 	if err != nil {
