@@ -2,9 +2,9 @@ package dht
 
 import (
 	"container/heap"
+	"container/list"
 	"errors"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
@@ -57,9 +57,7 @@ func (node *node) CompactIPPortInfo() string {
 // CompactNodeInfo returns "Compact node info".
 // See http://www.bittorrent.org/beps/bep_0005.html.
 func (node *node) CompactNodeInfo() string {
-	return strings.Join([]string{
-		node.id.RawString(), node.CompactIPPortInfo(),
-	}, "")
+	return node.id.RawString() + node.CompactIPPortInfo()
 }
 
 // Peer represents a peer contact.
@@ -113,12 +111,13 @@ func newPeersManager(dht *DHT) *peersManager {
 // Insert adds a peer into peersManager.
 func (pm *peersManager) Insert(infoHash string, peer *Peer) {
 	pm.Lock()
-	if _, ok := pm.table.Get(infoHash); !ok {
-		pm.table.Set(infoHash, newKeyedDeque())
-	}
-	pm.Unlock()
+	defer pm.Unlock()
 
-	v, _ := pm.table.Get(infoHash)
+	v, ok := pm.table.Get(infoHash)
+	if !ok {
+		pm.table.Set(infoHash, newKeyedDeque())
+		v, _ = pm.table.Get(infoHash)
+	}
 	queue := v.(*keyedDeque)
 
 	queue.Push(peer.CompactIPPortInfo(), peer)
@@ -177,10 +176,7 @@ func (bucket *KBucket) LastChanged() time.Time {
 func (bucket *KBucket) RandomChildID() string {
 	prefixLen := bucket.prefix.Size / 8
 
-	return strings.Join([]string{
-		bucket.prefix.RawString()[:prefixLen],
-		randomString(20 - prefixLen),
-	}, "")
+	return bucket.prefix.RawString()[:prefixLen] + randomString(20-prefixLen)
 }
 
 // UpdateTimestamp update bucket's last changed time.
@@ -214,12 +210,22 @@ func (bucket *KBucket) Replace(no *node) {
 
 	no = bucket.candidates.Remove(bucket.candidates.Back()).(*node)
 
-	inserted := false
+	// Collect nodes first to avoid deadlock: Iter() holds RLock,
+	// InsertBefore needs Lock on the same syncedList.
+	type nodeEntry struct {
+		elem           *list.Element
+		lastActiveTime time.Time
+	}
+	var entries []nodeEntry
 	for e := range bucket.nodes.Iter() {
-		if e.Value.(*node).lastActiveTime.After(
-			no.lastActiveTime) && !inserted {
+		n := e.Value.(*node)
+		entries = append(entries, nodeEntry{elem: e, lastActiveTime: n.lastActiveTime})
+	}
 
-			bucket.nodes.InsertBefore(no, e)
+	inserted := false
+	for _, entry := range entries {
+		if entry.lastActiveTime.After(no.lastActiveTime) && !inserted {
+			bucket.nodes.InsertBefore(no, entry.elem)
 			inserted = true
 		}
 	}
@@ -417,19 +423,13 @@ func (rt *routingTable) Insert(nd *node) bool {
 // GetNeighbors returns the size-length nodes closest to id.
 func (rt *routingTable) GetNeighbors(id *bitmap, size int) []*node {
 	rt.RLock()
-	nodes := make([]interface{}, 0, rt.cachedNodes.Len())
+	nodes := make([]*node, 0, rt.cachedNodes.Len())
 	for item := range rt.cachedNodes.Iter() {
 		nodes = append(nodes, item.val.(*node))
 	}
 	rt.RUnlock()
 
-	neighbors := getTopK(nodes, id, size)
-	result := make([]*node, len(neighbors))
-
-	for i, nd := range neighbors {
-		result[i] = nd.(*node)
-	}
-	return result
+	return getTopKNodes(nodes, id, size)
 }
 
 // GetNeighborCompactInfos Get Neighbor Ids return the size-length compact node info closest to id.
@@ -568,6 +568,54 @@ func (kHeap *topKHeap) Pop() interface{} {
 	x := (*kHeap)[n-1]
 	*kHeap = (*kHeap)[:n-1]
 	return x
+}
+
+// nodeHeapItem is a typed version of heapItem to avoid interface{} boxing.
+type nodeHeapItem struct {
+	distance *bitmap
+	node     *node
+}
+
+type topKNodeHeap []*nodeHeapItem
+
+func (h topKNodeHeap) Len() int           { return len(h) }
+func (h topKNodeHeap) Less(i, j int) bool { return h[i].distance.Compare(h[j].distance, maxPrefixLength) == 1 }
+func (h topKNodeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *topKNodeHeap) Push(x interface{}) {
+	*h = append(*h, x.(*nodeHeapItem))
+}
+
+func (h *topKNodeHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// getTopKNodes solves the top-k problem with typed []*node, avoiding interface{} boxing.
+func getTopKNodes(nodes []*node, id *bitmap, k int) []*node {
+	h := make(topKNodeHeap, 0, k+1)
+
+	for _, n := range nodes {
+		distance := id.Xor(n.id)
+		if h.Len() == k {
+			last := h[h.Len()-1]
+			if last.distance.Compare(distance, maxPrefixLength) == 1 {
+				heap.Push(&h, &nodeHeapItem{distance: distance, node: n})
+				heap.Pop(&h)
+			}
+		} else {
+			heap.Push(&h, &nodeHeapItem{distance: distance, node: n})
+		}
+	}
+
+	result := make([]*node, h.Len())
+	for i := len(result) - 1; i >= 0; i-- {
+		result[i] = heap.Pop(&h).(*nodeHeapItem).node
+	}
+	return result
 }
 
 // getTopK solves the top-k problem with heap. It's time complexity is

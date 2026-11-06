@@ -70,7 +70,9 @@ func (tm *tokenManager) token(addr *net.UDPAddr) string {
 
 // clear removes expired tokens.
 func (tm *tokenManager) clear() {
-	for range time.Tick(time.Minute * 3) {
+	ticker := time.NewTicker(time.Minute * 3)
+	defer ticker.Stop()
+	for range ticker.C {
 		keys := make([]interface{}, 0, 100)
 
 		for item := range tm.Iter() {
@@ -131,6 +133,8 @@ func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
 	_, err := dht.conn.WriteToUDP([]byte(Encode(data)), addr)
 	if err != nil {
 		dht.blackList.insert(addr.IP.String(), -1)
+	} else {
+		RecordPacketSent()
 	}
 	return err
 }
@@ -192,7 +196,7 @@ func (tm *transactionManager) newTransaction(id string, q *query) *transaction {
 // genIndexKey generates an indexed key which consists of queryType and
 // address.
 func (tm *transactionManager) genIndexKey(queryType, address string) string {
-	return strings.Join([]string{queryType, address}, ":")
+	return queryType + ":" + address
 }
 
 // genIndexKeyByTrans generates an indexed key by a transaction.
@@ -211,13 +215,13 @@ func (tm *transactionManager) insert(trans *transaction) {
 
 // delete removes a transaction from transactionManager.
 func (tm *transactionManager) delete(transID string) {
+	tm.Lock()
+	defer tm.Unlock()
+
 	v, ok := tm.transactions.Get(transID)
 	if !ok {
 		return
 	}
-
-	tm.Lock()
-	defer tm.Unlock()
 
 	trans := v.(*transaction)
 	tm.transactions.Delete(trans.id)
@@ -325,9 +329,15 @@ func (tm *transactionManager) sendQuery(
 	}
 
 	data := makeQuery(tm.genTransID(), queryType, a)
-	tm.queryChan <- &query{
+	q := &query{
 		node: no,
 		data: data,
+	}
+
+	// Non-blocking send: drop if channel is full to avoid blocking the caller
+	select {
+	case tm.queryChan <- q:
+	default:
 	}
 }
 
@@ -753,11 +763,12 @@ var handlers = map[string]func(*DHT, *net.UDPAddr, map[string]interface{}) bool{
 
 // handle handles packets received from udp.
 func handle(dht *DHT, pkt packet) {
-	if len(dht.workerTokens) == dht.PacketWorkerLimit {
+	// Non-blocking acquire of worker token; drop packet if at capacity
+	select {
+	case dht.workerTokens <- struct{}{}:
+	default:
 		return
 	}
-
-	dht.workerTokens <- struct{}{}
 
 	go func() {
 		defer func() {

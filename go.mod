@@ -1,12 +1,15 @@
 module github.com/NoOneTheOne/dht
 
-go 1.26.0
+go 1.26.2
 
-require gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
+require gopkg.in/yaml.v3 v3.0.1
 
 require (
 	github.com/elastic/go-elasticsearch/v7 v7.14.0
 	github.com/gin-gonic/gin v1.7.4
+	github.com/huin/goupnp v1.3.1
+	github.com/jackpal/gateway v1.2.0
+	github.com/jackpal/go-nat-pmp v1.1.0
 	github.com/prometheus/client_golang v1.25.0
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.2
@@ -34,7 +37,9 @@ require (
 	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/ugorji/go/codec v1.1.7 // indirect
-	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

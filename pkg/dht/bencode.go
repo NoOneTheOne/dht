@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sort"
 	"strconv"
-	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -86,19 +85,25 @@ func DecodeInt(data []byte, start int) (
 func decodeItem(data []byte, i int) (
 	result interface{}, index int, err error) {
 
-	var decodeFunc = []func([]byte, int) (interface{}, int, error){
-		DecodeString, DecodeInt, DecodeList, DecodeDict,
+	if i >= len(data) {
+		err = errors.New("invalid bencode when decode item")
+		return
 	}
 
-	for _, f := range decodeFunc {
-		result, index, err = f(data, i)
-		if err == nil {
-			return
-		}
+	// First-byte dispatch instead of trying each decoder sequentially
+	switch {
+	case data[i] >= '0' && data[i] <= '9':
+		return DecodeString(data, i)
+	case data[i] == 'i':
+		return DecodeInt(data, i)
+	case data[i] == 'l':
+		return DecodeList(data, i)
+	case data[i] == 'd':
+		return DecodeDict(data, i)
+	default:
+		err = errors.New("invalid bencode when decode item")
+		return
 	}
-
-	err = errors.New("invalid bencode when decode item")
-	return
 }
 
 // DecodeList decodes a list value.
@@ -197,71 +202,51 @@ func Decode(data []byte) (result interface{}, err error) {
 
 // EncodeString encodes a string value.
 func EncodeString(data string) string {
-	return strings.Join([]string{strconv.Itoa(len(data)), data}, ":")
+	return strconv.Itoa(len(data)) + ":" + data
 }
 
 // EncodeInt encodes a int value.
 func EncodeInt(data int) string {
-	return strings.Join([]string{"i", strconv.Itoa(data), "e"}, "")
-}
-
-// EncodeItem encodes an item of dict or list.
-func encodeItem(data interface{}) (item string) {
-	switch v := data.(type) {
-	case string:
-		item = EncodeString(v)
-	case int:
-		item = EncodeInt(v)
-	case []interface{}:
-		item = EncodeList(v)
-	case map[string]interface{}:
-		item = EncodeDict(v)
-	default:
-		panic("invalid type when encode item")
-	}
-	return
-}
-
-// EncodeList encodes a list value.
-func EncodeList(data []interface{}) string {
-	result := make([]string, len(data))
-
-	for i, item := range data {
-		result[i] = encodeItem(item)
-	}
-
-	return strings.Join([]string{"l", strings.Join(result, ""), "e"}, "")
-}
-
-// EncodeDict encodes a dict value.
-func EncodeDict(data map[string]interface{}) string {
-	keys := make([]string, 0, len(data))
-	for key := range data {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	result := make([]string, len(keys))
-	for i, key := range keys {
-		result[i] = strings.Join(
-			[]string{EncodeString(key), encodeItem(data[key])},
-			"")
-	}
-
-	return strings.Join([]string{"d", strings.Join(result, ""), "e"}, "")
+	return "i" + strconv.Itoa(data) + "e"
 }
 
 // Encode encodes a string, int, dict or list value to a bencoded string.
 func Encode(data interface{}) string {
+	var buf bytes.Buffer
+	encodeToBuffer(&buf, data)
+	return buf.String()
+}
+
+func encodeToBuffer(buf *bytes.Buffer, data interface{}) {
 	switch v := data.(type) {
 	case string:
-		return EncodeString(v)
+		buf.WriteString(strconv.Itoa(len(v)))
+		buf.WriteByte(':')
+		buf.WriteString(v)
 	case int:
-		return EncodeInt(v)
+		buf.WriteByte('i')
+		buf.WriteString(strconv.Itoa(v))
+		buf.WriteByte('e')
 	case []interface{}:
-		return EncodeList(v)
+		buf.WriteByte('l')
+		for _, item := range v {
+			encodeToBuffer(buf, item)
+		}
+		buf.WriteByte('e')
 	case map[string]interface{}:
-		return EncodeDict(v)
+		buf.WriteByte('d')
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			buf.WriteString(strconv.Itoa(len(key)))
+			buf.WriteByte(':')
+			buf.WriteString(key)
+			encodeToBuffer(buf, v[key])
+		}
+		buf.WriteByte('e')
 	default:
 		panic("invalid type when encode")
 	}

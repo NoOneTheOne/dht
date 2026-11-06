@@ -71,7 +71,9 @@ func Search(name string) ([]Data, int64, error) {
 	var results []Data
 	var total int64
 
-	query := GetDB().Model(&Data{}).Where("name LIKE ?", "%"+name+"%")
+	// Escape LIKE special characters in user input
+	escaped := escapeLike(name)
+	query := GetDB().Model(&Data{}).Where("name LIKE ? ESCAPE '\\'", "%"+escaped+"%")
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -80,4 +82,12 @@ func Search(name string) ([]Data, int64, error) {
 		return nil, 0, err
 	}
 	return results, total, nil
+}
+
+// escapeLike escapes special LIKE pattern characters (%, _, \)
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }

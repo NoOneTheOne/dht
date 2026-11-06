@@ -3,12 +3,32 @@ package metrics
 import (
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+// memStatsCache caches runtime.MemStats to avoid calling ReadMemStats
+// multiple times per Prometheus scrape (each call triggers stop-the-world).
+var memStatsCache = struct {
+	mu      sync.Mutex
+	stats   runtime.MemStats
+	updated time.Time
+	ttl     time.Duration
+}{ttl: time.Second}
+
+func getCachedMemStats() runtime.MemStats {
+	memStatsCache.mu.Lock()
+	defer memStatsCache.mu.Unlock()
+	if time.Since(memStatsCache.updated) > memStatsCache.ttl {
+		runtime.ReadMemStats(&memStatsCache.stats)
+		memStatsCache.updated = time.Now()
+	}
+	return memStatsCache.stats
+}
 
 var (
 	// HTTP metrics
@@ -129,9 +149,7 @@ var (
 			Help: "Current memory allocation in bytes",
 		},
 		func() float64 {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			return float64(m.Alloc)
+			return float64(getCachedMemStats().Alloc)
 		},
 	)
 
@@ -141,9 +159,7 @@ var (
 			Help: "Total memory obtained from system in bytes",
 		},
 		func() float64 {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			return float64(m.Sys)
+			return float64(getCachedMemStats().Sys)
 		},
 	)
 
@@ -153,9 +169,7 @@ var (
 			Help: "Total number of GC runs",
 		},
 		func() float64 {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			return float64(m.NumGC)
+			return float64(getCachedMemStats().NumGC)
 		},
 	)
 
@@ -165,8 +179,7 @@ var (
 			Help: "Last GC pause duration in seconds",
 		},
 		func() float64 {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
+			m := getCachedMemStats()
 			if m.NumGC > 0 {
 				return float64(m.PauseNs[(m.NumGC+255)%256]) / 1e9
 			}
@@ -185,16 +198,125 @@ var (
 			return time.Since(startTime).Seconds()
 		},
 	)
+
+	// DHT network metrics
+	dhtRoutingTableNodes = promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "dht_routing_table_nodes",
+			Help: "Number of nodes in the DHT routing table",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().RoutingTableNodes)
+			}
+			return 0
+		},
+	)
+
+	dhtBootstrapCount = promauto.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "dht_bootstrap_total",
+			Help: "Total number of bootstrap attempts",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().BootstrapCount)
+			}
+			return 0
+		},
+	)
+
+	dhtPacketsReceived = promauto.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "dht_packets_received_total",
+			Help: "Total number of UDP packets received",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().PacketsReceived)
+			}
+			return 0
+		},
+	)
+
+	dhtPacketsSent = promauto.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "dht_packets_sent_total",
+			Help: "Total number of UDP packets sent",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().PacketsSent)
+			}
+			return 0
+		},
+	)
+
+	dhtActiveTransactions = promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "dht_active_transactions",
+			Help: "Number of active DHT transactions",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().ActiveTransactions)
+			}
+			return 0
+		},
+	)
+
+	dhtBlacklistedNodes = promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "dht_blacklisted_nodes",
+			Help: "Number of blacklisted nodes",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().BlacklistedNodes)
+			}
+			return 0
+		},
+	)
+
+	dhtTorrentsDiscovered = promauto.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "dht_torrents_discovered_total",
+			Help: "Total number of torrents discovered",
+		},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().TorrentsDiscovered)
+			}
+			return 0
+		},
+	)
 )
 
 // MySQL stats getters (will be set by mysql package)
 var (
 	mysqlStatsGetter func() (open, inUse, idle int)
+	dhtStatsGetter   func() DHTStats
 )
+
+// DHTStats holds DHT network statistics
+type DHTStats struct {
+	RoutingTableNodes   int
+	BootstrapCount      int
+	PacketsReceived     int
+	PacketsSent         int
+	ActiveTransactions  int
+	BlacklistedNodes    int
+	TorrentsDiscovered  int
+}
 
 // SetMySQLStatsGetter sets the function to get MySQL connection stats
 func SetMySQLStatsGetter(getter func() (open, inUse, idle int)) {
 	mysqlStatsGetter = getter
+}
+
+// SetDHTStatsGetter sets the function to get DHT statistics
+func SetDHTStatsGetter(getter func() DHTStats) {
+	dhtStatsGetter = getter
 }
 
 func getMySQLOpenConnections() float64 {

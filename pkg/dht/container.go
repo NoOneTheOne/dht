@@ -75,16 +75,20 @@ func (smap *syncedMap) Clear() {
 
 // Iter returns a chan which output all items.
 func (smap *syncedMap) Iter() <-chan mapItem {
-	ch := make(chan mapItem)
+	// Snapshot under lock, then release before sending to avoid deadlock
+	// when consumer calls write methods on the same map.
+	smap.RLock()
+	items := make([]mapItem, 0, len(smap.data))
+	for key, val := range smap.data {
+		items = append(items, mapItem{key: key, val: val})
+	}
+	smap.RUnlock()
+
+	ch := make(chan mapItem, len(items))
 	go func() {
-		smap.RLock()
-		for key, val := range smap.data {
-			ch <- mapItem{
-				key: key,
-				val: val,
-			}
+		for _, item := range items {
+			ch <- item
 		}
-		smap.RUnlock()
 		close(ch)
 	}()
 	return ch
@@ -190,13 +194,20 @@ func (slist *syncedList) Len() int {
 
 // Iter returns a chan which output all elements.
 func (slist *syncedList) Iter() <-chan *list.Element {
-	ch := make(chan *list.Element)
+	// Snapshot under lock, then release before sending to avoid deadlock
+	// when consumer calls write methods on the same list.
+	slist.RLock()
+	elements := make([]*list.Element, 0, slist.queue.Len())
+	for e := slist.queue.Front(); e != nil; e = e.Next() {
+		elements = append(elements, e)
+	}
+	slist.RUnlock()
+
+	ch := make(chan *list.Element, len(elements))
 	go func() {
-		slist.RLock()
-		for e := slist.queue.Front(); e != nil; e = e.Next() {
+		for _, e := range elements {
 			ch <- e
 		}
-		slist.RUnlock()
 		close(ch)
 	}()
 	return ch

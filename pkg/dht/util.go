@@ -57,13 +57,19 @@ func int2bytes(val uint64) []byte {
 // decodeCompactIPPortInfo decodes compactIP-address/port info in BitTorrent
 // DHT Protocol. It returns the ip and port number.
 func decodeCompactIPPortInfo(info string) (ip net.IP, port int, err error) {
-	if len(info) != 6 {
-		err = errors.New("compact info should be 6-length long")
+	if len(info) != 6 && len(info) != 18 {
+		err = errors.New("compact info should be 6-length (IPv4) or 18-length (IPv6) long")
 		return
 	}
 
-	ip = net.IPv4(info[0], info[1], info[2], info[3])
-	port = int((uint16(info[4]) << 8) | uint16(info[5]))
+	if len(info) == 6 {
+		ip = net.IPv4(info[0], info[1], info[2], info[3])
+		port = int((uint16(info[4]) << 8) | uint16(info[5]))
+	} else {
+		ip = net.IP(make([]byte, 16))
+		copy(ip, info[:16])
+		port = int((uint16(info[16]) << 8) | uint16(info[17]))
+	}
 	return
 }
 
@@ -82,7 +88,14 @@ func encodeCompactIPPortInfo(ip net.IP, port int) (info string, err error) {
 		p[0] = 0
 	}
 
-	info = string(append(ip, p...))
+	// Normalize to IPv4 if possible for compact encoding
+	if ip4 := ip.To4(); ip4 != nil {
+		info = string(append(ip4, p...))
+	} else if ip6 := ip.To16(); ip6 != nil {
+		info = string(append(ip6, p...))
+	} else {
+		err = errors.New("invalid IP address")
+	}
 	return
 }
 
@@ -103,6 +116,48 @@ func getLocalIPs() (ips []string) {
 		ips = append(ips, ip.String())
 	}
 	return
+}
+
+// getLocalIP returns the first non-loopback local IPv4 address
+func getLocalIP() (net.IP, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue // interface is down
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue // loopback interface
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4, nil
+			}
+		}
+	}
+
+	return nil, errors.New("no local IP found")
 }
 
 // getRemoteIP returns the wlan ip.
@@ -140,5 +195,5 @@ func getRemoteIP() (ip string, err error) {
 
 // genAddress returns a ip:port address.
 func genAddress(ip string, port int) string {
-	return strings.Join([]string{ip, strconv.Itoa(port)}, ":")
+	return ip + ":" + strconv.Itoa(port)
 }

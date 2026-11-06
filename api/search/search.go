@@ -139,7 +139,21 @@ func main() {
 			if path == "/" {
 				path = "/index.html"
 			}
-			filePath := filepath.Join(webDir, path)
+			filePath := filepath.Join(webDir, filepath.Clean(path))
+			// Prevent path traversal: ensure resolved path is under webDir
+			rel, err := filepath.Rel(webDir, filePath)
+			if err != nil || len(rel) >= 2 && rel[:2] == ".." {
+				c.Status(http.StatusForbidden)
+				return
+			}
+			if abs, err := filepath.Abs(filePath); err == nil {
+				if absAbs, err := filepath.Abs(webDir); err == nil {
+					if len(abs) < len(absAbs) || abs[:len(absAbs)] != absAbs {
+						c.Status(http.StatusForbidden)
+						return
+					}
+				}
+			}
 			if _, err := os.Stat(filePath); err == nil {
 				c.File(filePath)
 			} else {

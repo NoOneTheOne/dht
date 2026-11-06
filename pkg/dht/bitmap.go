@@ -2,9 +2,26 @@ package dht
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 )
+
+// byteToBinary maps each byte value to its 8-bit binary string representation.
+var byteToBinary [256]string
+
+func init() {
+	for i := 0; i < 256; i++ {
+		b := byte(i)
+		byteToBinary[i] = byteBitStr(b, 7) + byteBitStr(b, 6) + byteBitStr(b, 5) + byteBitStr(b, 4) +
+			byteBitStr(b, 3) + byteBitStr(b, 2) + byteBitStr(b, 1) + byteBitStr(b, 0)
+	}
+}
+
+func byteBitStr(b byte, pos int) string {
+	if b&(1<<uint(pos)) != 0 {
+		return "1"
+	}
+	return "0"
+}
 
 // bitmap represents a bit array.
 type bitmap struct {
@@ -134,17 +151,23 @@ func (bitmap *bitmap) Xor(other *bitmap) *bitmap {
 // String returns the bit sequence string of the bitmap.
 func (bitmap *bitmap) String() string {
 	div, mod := bitmap.Size>>3, bitmap.Size&0x07
-	buff := make([]string, div+mod)
+
+	var buf strings.Builder
+	buf.Grow(bitmap.Size)
 
 	for i := 0; i < div; i++ {
-		buff[i] = fmt.Sprintf("%08b", bitmap.data[i])
+		buf.WriteString(byteToBinary[bitmap.data[i]])
 	}
 
-	for i := div; i < div+mod; i++ {
-		buff[i] = fmt.Sprintf("%1b", bitmap.Bit(div*8+(i-div)))
+	for i := div << 3; i < div<<3+mod; i++ {
+		if bitmap.Bit(i) == 1 {
+			buf.WriteByte('1')
+		} else {
+			buf.WriteByte('0')
+		}
 	}
 
-	return strings.Join(buff, "")
+	return buf.String()
 }
 
 // RawString returns the string value of bitmap.data.

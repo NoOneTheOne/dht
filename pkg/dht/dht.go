@@ -9,8 +9,16 @@ import (
 	"log"
 	"math"
 	"net"
+	"sync"
 	"time"
 )
+
+var udpBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 8192)
+		return &b
+	},
+}
 
 var (
 	// ErrNotReady is the error when DHT is not initialized.
@@ -125,6 +133,7 @@ type DHT struct {
 	peersManager       *peersManager
 	tokenManager       *tokenManager
 	blackList          *blackList
+	bootstrapMgr       *bootstrapManager
 	Ready              bool
 	packets            chan packet
 	workerTokens       chan struct{}
@@ -133,7 +142,14 @@ type DHT struct {
 // New returns a DHT pointer. If config is nil, then config will be set to
 // the default config.
 func New(initParam *InitParam) *DHT {
-	node, err := newNode(randomString(20), initParam.Network, initParam.Address)
+	// Generate BEP-42 compliant node ID based on local IP
+	localIP, err := getLocalIP()
+	if err != nil {
+		localIP = net.ParseIP("127.0.0.1")
+	}
+	nodeID := generateNodeID(localIP)
+	
+	node, err := newNode(nodeID, initParam.Network, initParam.Address)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -186,6 +202,7 @@ func (dht *DHT) init() {
 	dht.peersManager = newPeersManager(dht)
 	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
 	dht.transactionManager = newTransactionManager(dht.MaxTransactionCursor, dht)
+	dht.bootstrapMgr = newBootstrapManager(dht)
 
 	go dht.transactionManager.run()
 	go dht.tokenManager.clear()
@@ -194,6 +211,12 @@ func (dht *DHT) init() {
 
 // join makes current node join the dht network.
 func (dht *DHT) join() {
+	if dht.bootstrapMgr != nil {
+		dht.bootstrapMgr.join()
+		return
+	}
+
+	// Fallback to original implementation if bootstrap manager not initialized
 	for _, addr := range dht.PrimeNodes {
 		RealAddress, err := net.ResolveUDPAddr(dht.Network, addr)
 		if err != nil {
@@ -212,14 +235,19 @@ func (dht *DHT) join() {
 func (dht *DHT) listen() {
 	go func() {
 		for {
-			buff := make([]byte, 8192)
+			bufp := udpBufPool.Get().(*[]byte)
+			buff := *bufp
 			n, RealAddress, err := dht.conn.ReadFromUDP(buff)
 			if err != nil {
+				udpBufPool.Put(bufp)
 				continue
 			}
 
+			RecordPacketReceived()
+
 			data := make([]byte, n)
 			copy(data, buff[:n])
+			udpBufPool.Put(bufp)
 			dht.packets <- packet{data, RealAddress}
 		}
 	}()
@@ -270,18 +298,50 @@ func (dht *DHT) Run() {
 	dht.Ready = true
 
 	var pkt packet
-	tick := time.Tick(dht.CheckKBucketPeriod)
+	kBucketTicker := time.NewTicker(dht.CheckKBucketPeriod)
+	defer kBucketTicker.Stop()
+	evictTicker := time.NewTicker(10 * time.Minute)
+	defer evictTicker.Stop()
 
 	for {
 		select {
 		case pkt = <-dht.packets:
 			handle(dht, pkt)
-		case <-tick:
-			if dht.routingTable.Len() == 0 {
+		case <-kBucketTicker.C:
+			// Use bootstrap manager to check if re-bootstrap is needed
+			if dht.bootstrapMgr != nil && dht.bootstrapMgr.needsRebootstrap() {
+				dht.join()
+			} else if dht.routingTable.Len() == 0 {
 				dht.join()
 			} else if dht.transactionManager.len() == 0 {
-				go dht.routingTable.Fresh()
+				// Use optimized refresh instead of regular Fresh
+				go dht.routingTable.OptimizedRefresh()
 			}
+		case <-evictTicker.C:
+			// Periodically evict stale nodes (older than 15 minutes)
+			go dht.routingTable.EvictStaleNodes(15 * time.Minute)
 		}
 	}
+}
+
+// DHTStats holds DHT statistics for external monitoring
+type DHTStats struct {
+	RoutingTableNodes  int
+	BootstrapCount     int
+	ActiveTransactions int
+	BlacklistedNodes   int
+}
+
+// GetDHTStats returns current DHT statistics
+func (dht *DHT) GetDHTStats() DHTStats {
+	stats := DHTStats{
+		RoutingTableNodes:  dht.routingTable.Len(),
+		ActiveTransactions: dht.transactionManager.len(),
+		BlacklistedNodes:   dht.blackList.len(),
+	}
+	if dht.bootstrapMgr != nil {
+		count, _ := dht.bootstrapMgr.getBootstrapStats()
+		stats.BootstrapCount = count
+	}
+	return stats
 }

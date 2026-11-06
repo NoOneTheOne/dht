@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
@@ -42,11 +44,18 @@ func Write(i, t string, data []byte) (string, error) {
 		Body:         bytes.NewReader(data),
 	}
 
-	res, err := req.Do(context.Background(), getClient())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := req.Do(ctx, getClient())
 	if err != nil {
 		return "", err
 	}
 	defer res.Body.Close()
+
+	if res.IsError() {
+		return "", fmt.Errorf("elasticsearch write error: status=%d index=%s", res.StatusCode, i)
+	}
 
 	return res.String(), nil
 }
@@ -66,8 +75,11 @@ func Search(q string) map[string]interface{} {
 	}
 
 	c := config.GetConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	res, err := getClient().Search(
-		getClient().Search.WithContext(context.Background()),
+		getClient().Search.WithContext(ctx),
 		getClient().Search.WithIndex(c.Elasticsearch.Index),
 		getClient().Search.WithBody(&buf),
 		getClient().Search.WithTrackTotalHits(true),
@@ -78,6 +90,11 @@ func Search(q string) map[string]interface{} {
 		return nil
 	}
 	defer res.Body.Close()
+
+	if res.IsError() {
+		log.Printf("elasticsearch search error: status=%d", res.StatusCode)
+		return nil
+	}
 
 	var r map[string]interface{}
 	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {

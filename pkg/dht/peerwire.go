@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 	"time"
 )
 
@@ -378,9 +377,7 @@ func (wire *Wire) Run() {
 				<-wire.workerTokens
 			}()
 
-			key := strings.Join([]string{
-				string(r.InfoHash), genAddress(r.IP, r.Port),
-			}, ":")
+			key := string(r.InfoHash) + ":" + genAddress(r.IP, r.Port)
 
 			if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) ||
 				wire.queue.Has(key) {
