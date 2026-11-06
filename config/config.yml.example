@@ -1,0 +1,30 @@
+# storage type: "mysql" or "elasticsearch"
+storage:
+  type: mysql
+
+# MySQL — 外置服务，请填入你的实际连接信息
+mysql:
+  addresses: "YOUR_MYSQL_HOST:3306"
+  username: "YOUR_MYSQL_USERNAME"
+  password: "YOUR_MYSQL_PASSWORD"
+  database: "YOUR_MYSQL_DATABASE"
+  table: "YOUR_MYSQL_TABLE"
+
+# Elasticsearch — 外置服务，storage.type 为 elasticsearch 时使用
+elasticsearch:
+  addresses: [ "http://YOUR_ES_HOST:9200" ]
+  username: "YOUR_ES_USERNAME"
+  password: "YOUR_ES_PASSWORD"
+  index: "YOUR_ES_INDEX"
+
+tracker:
+  list: [ "router.bittorrent.com:6881",
+          "router.utorrent.com:6881",
+          "dht.transmissionbt.com:6881",
+          "udp://tracker.openbittorrent.com:6969/announce",
+          "udp://tracker.opentrackr.org:1337/announce",
+          "udp://open.demonii.com:1337/announce",
+          "udp://tracker.lelux.fi:6969/announce",
+          "udp://exodus.desync.com:6969/announce",
+          "udp://opentor.org:2710/announce",
+          "udp://tracker.sylphix.com:6969/announce" ]

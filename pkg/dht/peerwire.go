@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"io/ioutil"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -72,7 +72,9 @@ func sendMessage(conn *net.TCPConn, data []byte) error {
 	length := int32(len(data))
 
 	buffer := bytes.NewBuffer(nil)
-	binary.Write(buffer, binary.BigEndian, length)
+	if err := binary.Write(buffer, binary.BigEndian, length); err != nil {
+		return err
+	}
 
 	conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
 	_, err := conn.Write(append(buffer.Bytes(), data...))
@@ -235,7 +237,9 @@ func (wire *Wire) fetchMetadata(r Request) {
 
 	defer func() {
 		pieces = nil
-		recover()
+		if rv := recover(); rv != nil {
+			log.Printf("fetchMetadata panic for %s:%d: %v", r.IP, r.Port, rv)
+		}
 	}()
 
 	infoHash := r.InfoHash
@@ -282,7 +286,7 @@ func (wire *Wire) fetchMetadata(r Request) {
 				return
 			}
 
-			payload, err := ioutil.ReadAll(data)
+			payload, err := io.ReadAll(data)
 			if err != nil {
 				return
 			}
@@ -331,8 +335,12 @@ func (wire *Wire) fetchMetadata(r Request) {
 			piece := dict["piece"].(int)
 			pieceLen := length - 2 - index
 
+			expectedLastPieceLen := metadataSize % BLOCK
+			if expectedLastPieceLen == 0 {
+				expectedLastPieceLen = BLOCK
+			}
 			if (piece != piecesNum-1 && pieceLen != BLOCK) ||
-				(piece == piecesNum-1 && pieceLen != metadataSize%BLOCK) {
+				(piece == piecesNum-1 && pieceLen != expectedLastPieceLen) {
 				return
 			}
 

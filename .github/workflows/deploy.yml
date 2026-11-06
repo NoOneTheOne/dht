@@ -1,0 +1,64 @@
+name: Deploy to Self-Hosted Runner
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up .env file
+        run: |
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+
+      - name: Set up config.yml
+        run: |
+          if [ ! -f config/config.yml ]; then
+            echo "ERROR: config/config.yml not found. Copy config/config.yml.example and fill in your external MySQL/ES connection info."
+            exit 1
+          fi
+
+      - name: Stop existing services
+        run: docker compose down --remove-orphans || true
+
+      - name: Build and start services
+        run: |
+          docker compose build
+          docker compose up -d
+
+      - name: Verify services are running
+        run: |
+          echo "Waiting for services to start..."
+          for i in $(seq 1 12); do
+            if docker compose ps --format json | grep -q '"running"'; then
+              echo "Services are up!"
+              break
+            fi
+            if [ "$i" -eq 12 ]; then
+              echo "ERROR: Services failed to start within 60 seconds"
+              docker compose ps
+              docker compose logs --tail=50
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "=== Docker Compose Status ==="
+          docker compose ps
+          echo ""
+          echo "=== Spider Container Logs (last 20 lines) ==="
+          docker compose logs --tail=20 dht-spider || true
+          echo ""
+          echo "=== Search Container Logs (last 20 lines) ==="
+          docker compose logs --tail=20 dht-search || true
+
+      - name: Cleanup unused images
+        if: always()
+        run: docker image prune -f

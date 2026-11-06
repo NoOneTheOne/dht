@@ -15,8 +15,8 @@ DHT实现了BitTorrent DHT协议，主要包括：
 
 ## Installation
 
-    go get github.com/summeroch/dht
+    go get github.com/NoOneTheOne/dht
 
 ## Usage
 
-[releases](https://github.com/summeroch/dht-spider/releases) 页面下载对应的二进制文件(或自行编译)。将可执行文件与config.yml放置于同一路径下即可运行。
+[releases](https://github.com/NoOneTheOne/dht/releases) 页面下载对应的二进制文件(或自行编译)。将可执行文件与config.yml放置于同一路径下即可运行。

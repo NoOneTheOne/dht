@@ -1,0 +1,29 @@
+services:
+  dht-spider:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: spider
+    container_name: dht-spider
+    environment:
+      CONFIG_FILE_PATH: "/app/config.yml"
+    ports:
+      - "${DHT_PORT:-6881}:6881/udp"
+    volumes:
+      - ./config/config.yml:/app/config.yml:ro
+    restart: unless-stopped
+
+  dht-search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: search
+    container_name: dht-search
+    environment:
+      SEARCH_API_PORT: "8080"
+      CONFIG_FILE_PATH: "/app/config.yml"
+    ports:
+      - "${SEARCH_PORT:-8080}:8080"
+    volumes:
+      - ./config/config.yml:/app/config.yml:ro
+    restart: unless-stopped

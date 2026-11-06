@@ -1,0 +1,75 @@
+package mysql
+
+import (
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/NoOneTheOne/dht/pkg/config"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+type Data struct {
+	Name     string    `gorm:"column:name;type:varchar(512);not null" json:"name"`
+	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey" json:"infohash"`
+	Time     time.Time `gorm:"column:time;not null" json:"time"`
+	Length   int64     `gorm:"column:length;default:0" json:"length"`
+}
+
+func (Data) TableName() string {
+	return getCfg().MySQL.Table
+}
+
+var (
+	db   *gorm.DB
+	once sync.Once
+)
+
+func getCfg() *config.Config {
+	return config.GetConfig()
+}
+
+func getDB() *gorm.DB {
+	once.Do(func() {
+		c := getCfg()
+		dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+			c.MySQL.Username, c.MySQL.Password, c.MySQL.Addresses, c.MySQL.Database)
+		var err error
+		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+		if err != nil {
+			log.Fatalf("failed to connect MySQL at %s: %v", c.MySQL.Addresses, err)
+		}
+		sqlDB, err := db.DB()
+		if err != nil {
+			log.Fatalf("failed to get underlying sql.DB: %v", err)
+		}
+		sqlDB.SetMaxIdleConns(10)
+		sqlDB.SetMaxOpenConns(100)
+		sqlDB.SetConnMaxLifetime(time.Hour)
+	})
+	return db
+}
+
+func Write(d *Data) error {
+	return getDB().Create(d).Error
+}
+
+func Search(name string) ([]Data, int64, error) {
+	var results []Data
+	var total int64
+
+	query := getDB().Model(&Data{})
+	if name != "" {
+		query = query.Where("name LIKE ?", "%"+name+"%")
+	}
+
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if err := query.Order("`time` DESC").Limit(50).Find(&results).Error; err != nil {
+		return nil, 0, err
+	}
+	return results, total, nil
+}

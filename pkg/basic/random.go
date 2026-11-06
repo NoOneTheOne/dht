@@ -2,8 +2,8 @@ package basic
 
 import (
 	"math/rand"
+	"sync"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -13,10 +13,15 @@ const (
 	letterIdMax  = 63 / letterIdBits
 )
 
-var src = rand.NewSource(time.Now().UnixNano())
+var (
+	src = rand.NewSource(time.Now().UnixNano())
+	mu  sync.Mutex
+)
 
 func RandStr(n int) string {
 	b := make([]byte, n)
+	mu.Lock()
+	defer mu.Unlock()
 	for i, cache, remain := n-1, src.Int63(), letterIdMax; i >= 0; {
 		if remain == 0 {
 			cache, remain = src.Int63(), letterIdMax
@@ -28,5 +33,5 @@ func RandStr(n int) string {
 		cache >>= letterIdBits
 		remain--
 	}
-	return *(*string)(unsafe.Pointer(&b))
+	return string(b)
 }

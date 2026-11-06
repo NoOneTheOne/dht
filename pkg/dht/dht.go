@@ -5,7 +5,7 @@ package dht
 import (
 	"encoding/hex"
 	"errors"
-	"github.com/summeroch/dht-spider/pkg/config"
+	"github.com/NoOneTheOne/dht/pkg/config"
 	"log"
 	"math"
 	"net"
@@ -156,7 +156,7 @@ func New(initParam *InitParam) *DHT {
 		}
 
 		ip, err := getRemoteIP()
-		if err != nil {
+		if err == nil && ip != "" {
 			d.blackList.insert(ip, -1)
 		}
 	}()
@@ -211,14 +211,16 @@ func (dht *DHT) join() {
 // listen receives message from udp.
 func (dht *DHT) listen() {
 	go func() {
-		buff := make([]byte, 8192)
 		for {
+			buff := make([]byte, 8192)
 			n, RealAddress, err := dht.conn.ReadFromUDP(buff)
 			if err != nil {
 				continue
 			}
 
-			dht.packets <- packet{buff[:n], RealAddress}
+			data := make([]byte, n)
+			copy(data, buff[:n])
+			dht.packets <- packet{data, RealAddress}
 		}
 	}()
 }

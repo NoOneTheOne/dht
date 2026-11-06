@@ -4,31 +4,37 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"sync"
+
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
-	"github.com/summeroch/dht-spider/pkg/basic"
-	"github.com/summeroch/dht-spider/pkg/config"
-	"io"
-	"log"
+	"github.com/NoOneTheOne/dht/pkg/basic"
+	"github.com/NoOneTheOne/dht/pkg/config"
 )
 
 var (
-	c = config.GetConfig()
-	r map[string]interface{}
+	client     *elasticsearch.Client
+	clientOnce sync.Once
 )
 
+func getClient() *elasticsearch.Client {
+	clientOnce.Do(func() {
+		c := config.GetConfig()
+		var err error
+		client, err = elasticsearch.NewClient(elasticsearch.Config{
+			Addresses: c.Elasticsearch.Addresses,
+			Username:  c.Elasticsearch.Username,
+			Password:  c.Elasticsearch.Password,
+		})
+		if err != nil {
+			log.Fatalf("failed to create elasticsearch client: %v", err)
+		}
+	})
+	return client
+}
+
 func Write(i, t string, data []byte) (string, error) {
-	cfg := elasticsearch.Config{
-		Addresses: c.Elasticsearch.Addresses,
-		Username:  c.Elasticsearch.Username,
-		Password:  c.Elasticsearch.Password,
-	}
-
-	NewClient, err := elasticsearch.NewClient(cfg)
-	if err != nil {
-		basic.CheckError(err)
-	}
-
 	req := esapi.CreateRequest{
 		Index:        i,
 		DocumentType: t,
@@ -36,30 +42,17 @@ func Write(i, t string, data []byte) (string, error) {
 		Body:         bytes.NewReader(data),
 	}
 
-	res, err := req.Do(context.Background(), NewClient)
+	res, err := req.Do(context.Background(), getClient())
 	if err != nil {
-		basic.CheckError(err)
+		return "", err
 	}
+	defer res.Body.Close()
 
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		basic.CheckError(err)
-	}(res.Body)
-
-	return res.String(), err
+	return res.String(), nil
 }
 
 func Search(q string) map[string]interface{} {
-	cfg := elasticsearch.Config{
-		Addresses: c.Elasticsearch.Addresses,
-		Username:  c.Elasticsearch.Username,
-		Password:  c.Elasticsearch.Password,
-	}
-
-	NewClient, err := elasticsearch.NewClient(cfg)
-
 	var buf bytes.Buffer
-
 	query := map[string]interface{}{
 		"query": map[string]interface{}{
 			"match": map[string]interface{}{
@@ -68,29 +61,28 @@ func Search(q string) map[string]interface{} {
 		},
 	}
 	if err := json.NewEncoder(&buf).Encode(query); err != nil {
-		log.Printf("Error encoding query: %s", err)
+		log.Printf("error encoding query: %v", err)
+		return nil
 	}
 
-	res, err := NewClient.Search(
-		NewClient.Search.WithContext(context.Background()),
-		NewClient.Search.WithIndex("spider"),
-		NewClient.Search.WithBody(&buf),
-		NewClient.Search.WithTrackTotalHits(true),
-		NewClient.Search.WithPretty(),
+	c := config.GetConfig()
+	res, err := getClient().Search(
+		getClient().Search.WithContext(context.Background()),
+		getClient().Search.WithIndex(c.Elasticsearch.Index),
+		getClient().Search.WithBody(&buf),
+		getClient().Search.WithTrackTotalHits(true),
+		getClient().Search.WithPretty(),
 	)
 	if err != nil {
-		log.Fatalf("Error getting response: %s", err)
+		log.Printf("error searching elasticsearch: %v", err)
+		return nil
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			return
-		}
-	}(res.Body)
+	defer res.Body.Close()
 
+	var r map[string]interface{}
 	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
-		log.Fatalf("Error parsing the response body: %s", err)
+		log.Printf("error parsing search response: %v", err)
+		return nil
 	}
-
 	return r
 }

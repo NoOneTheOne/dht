@@ -1,1 +1,22 @@
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+dht-spider
+dht-search
+dht-getpeers
+*.exe
+
+# Environment
+.env
+config/config.yml
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

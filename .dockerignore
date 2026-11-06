@@ -1,0 +1,9 @@
+.git
+.idea
+*.log
+.env
+config/config.yml
+README.md
+LICENSE
+internal
+test

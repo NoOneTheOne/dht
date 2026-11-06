@@ -249,13 +249,10 @@ func (deque *keyedDeque) HasKey(key interface{}) bool {
 
 // Delete deletes a value named key.
 func (deque *keyedDeque) Delete(key interface{}) (v interface{}) {
-	deque.RLock()
-	e, ok := deque.index[key]
-	deque.RUnlock()
-
 	deque.Lock()
 	defer deque.Unlock()
 
+	e, ok := deque.index[key]
 	if ok {
 		v = deque.syncedList.Remove(e)
 		delete(deque.index, key)

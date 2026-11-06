@@ -56,7 +56,7 @@ func (tm *tokenManager) token(addr *net.UDPAddr) string {
 	v, ok := tm.Get(addr.IP.String())
 	tk, _ := v.(token)
 
-	if !ok || time.Now().Sub(tk.createTime) > tm.expiredAfter {
+	if !ok || time.Since(tk.createTime) > tm.expiredAfter {
 		tk = token{
 			data:       randomString(5),
 			createTime: time.Now(),
@@ -74,7 +74,7 @@ func (tm *tokenManager) clear() {
 		keys := make([]interface{}, 0, 100)
 
 		for item := range tm.Iter() {
-			if time.Now().Sub(item.val.(token).createTime) > tm.expiredAfter {
+			if time.Since(item.val.(token).createTime) > tm.expiredAfter {
 				keys = append(keys, item.key)
 			}
 		}
@@ -281,6 +281,7 @@ func (tm *transactionManager) query(q *query, try int) {
 	defer tm.delete(trans.id)
 
 	success := false
+loop:
 	for i := 0; i < try; i++ {
 		if err := send(tm.dht, q.node.addr, q.data); err != nil {
 			break
@@ -289,7 +290,7 @@ func (tm *transactionManager) query(q *query, try int) {
 		select {
 		case <-trans.response:
 			success = true
-			break
+			break loop
 		case <-time.After(time.Second * 15):
 		}
 	}

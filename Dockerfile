@@ -1,0 +1,49 @@
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-spider ./cmd/spider
+RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-getpeers ./cmd/getpeers
+RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-search ./api/search
+
+FROM alpine:3.21 AS spider
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    adduser -D -u 1000 appuser
+
+WORKDIR /app
+COPY --from=builder /build/dht-spider .
+USER appuser
+
+EXPOSE 6881/udp
+
+CMD ["./dht-spider"]
+
+FROM alpine:3.21 AS getpeers
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    adduser -D -u 1000 appuser
+
+WORKDIR /app
+COPY --from=builder /build/dht-getpeers .
+USER appuser
+
+CMD ["./dht-getpeers"]
+
+FROM alpine:3.21 AS search
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    adduser -D -u 1000 appuser
+
+WORKDIR /app
+COPY --from=builder /build/dht-search .
+USER appuser
+
+EXPOSE 8080
+
+CMD ["./dht-search"]

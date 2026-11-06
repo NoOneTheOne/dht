@@ -3,6 +3,7 @@ package dht
 import (
 	"bytes"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -234,13 +235,17 @@ func EncodeList(data []interface{}) string {
 
 // EncodeDict encodes a dict value.
 func EncodeDict(data map[string]interface{}) string {
-	result, i := make([]string, len(data)), 0
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 
-	for key, val := range data {
+	result := make([]string, len(keys))
+	for i, key := range keys {
 		result[i] = strings.Join(
-			[]string{EncodeString(key), encodeItem(val)},
+			[]string{EncodeString(key), encodeItem(data[key])},
 			"")
-		i++
 	}
 
 	return strings.Join([]string{"d", strings.Join(result, ""), "e"}, "")

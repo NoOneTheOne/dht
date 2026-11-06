@@ -515,7 +515,9 @@ func (rt *routingTable) Fresh() {
 			if i < rt.dht.RefreshNodeNum {
 				no := e.Value.(*node)
 				rt.dht.transactionManager.findNode(no, bucket.RandomChildID())
-				rt.clearQueue.PushBack(no)
+				if rt.dht.IsCrawlMode() {
+					rt.clearQueue.PushBack(no)
+				}
 			}
 			i++
 		}
@@ -525,9 +527,8 @@ func (rt *routingTable) Fresh() {
 		for e := range rt.clearQueue.Iter() {
 			rt.Remove(e.Value.(*node).id)
 		}
+		rt.clearQueue.Clear()
 	}
-
-	rt.clearQueue.Clear()
 }
 
 // Len returns the number of nodes in table.

@@ -3,20 +3,23 @@ package dht
 import (
 	"crypto/rand"
 	"errors"
-	"github.com/summeroch/dht-spider/pkg/basic"
 	"io"
-	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/NoOneTheOne/dht/pkg/basic"
 )
 
 // randomString generates a size-length string randomly.
 func randomString(size int) string {
 	buff := make([]byte, size)
-	rand.Read(buff)
+	if _, err := rand.Read(buff); err != nil {
+		log.Fatalf("failed to generate random string: %v", err)
+	}
 	return string(buff)
 }
 
@@ -108,7 +111,7 @@ func getRemoteIP() (ip string, err error) {
 		Timeout: time.Second * 30,
 	}
 
-	req, err := http.NewRequest("GET", "http://ifconfig.me", nil)
+	req, err := http.NewRequest("GET", "https://ifconfig.me", nil)
 	if err != nil {
 		return
 	}
@@ -126,11 +129,11 @@ func getRemoteIP() (ip string, err error) {
 		}
 	}(res.Body)
 
-	data, err := ioutil.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
 	if err != nil {
 		return
 	}
-	ip = string(data)
+	ip = strings.TrimSpace(string(data))
 
 	return
 }
