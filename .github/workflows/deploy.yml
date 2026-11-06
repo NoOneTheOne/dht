@@ -19,10 +19,15 @@ jobs:
             cp .env.example .env
           fi
 
-      - name: Set up config.yml
+      - name: Set up config.yml from runner-local path
         run: |
-          if [ ! -f config/config.yml ]; then
-            echo "ERROR: config/config.yml not found. Copy config/config.yml.example and fill in your external MySQL/ES connection info."
+          mkdir -p config
+          if [ -f /volume/dht/config.yml ]; then
+            cp /volume/dht/config.yml config/config.yml
+            echo "config.yml copied from /volume/dht/"
+          else
+            echo "ERROR: /volume/dht/config.yml not found on runner."
+            echo "Please place your config.yml at /volume/dht/config.yml"
             exit 1
           fi
 
