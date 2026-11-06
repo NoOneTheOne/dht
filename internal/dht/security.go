@@ -604,14 +604,6 @@ func (al *AuditLogger) GetEntriesBySeverity(severity string) []*AuditEntry {
 	return result
 }
 
-// min returns the minimum of two float64 values
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // Global security manager instance
 var globalSecurityManager *SecurityManager
 var securityOnce sync.Once
