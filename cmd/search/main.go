@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gorm.io/gorm"
 )
 
 const maxQueryLen = 200
@@ -44,12 +46,7 @@ func main() {
 
 	// Set up MySQL stats getter for metrics
 	metrics.SetMySQLStatsGetter(func() (open, inUse, idle int) {
-		db, err := mysql.GetDB().DB()
-		if err != nil {
-			return 0, 0, 0
-		}
-		stats := db.Stats()
-		return stats.OpenConnections, stats.InUse, stats.Idle
+		return mysqlStats(mysql.GetDB)
 	})
 
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
@@ -105,22 +102,7 @@ func main() {
 		}
 
 		// Check MySQL connection
-		db, err := mysql.GetDB().DB()
-		if err != nil {
-			health["status"] = "unhealthy"
-			health["mysql"] = "error: " + err.Error()
-		} else if err := db.Ping(); err != nil {
-			health["status"] = "unhealthy"
-			health["mysql"] = "ping failed: " + err.Error()
-		} else {
-			health["mysql"] = "connected"
-			stats := db.Stats()
-			health["mysql_pool"] = gin.H{
-				"open_connections": stats.OpenConnections,
-				"in_use":           stats.InUse,
-				"idle":             stats.Idle,
-			}
-		}
+		checkMySQLHealth(c.Request.Context(), health, mysql.GetDB)
 
 		statusCode := http.StatusOK
 		if health["status"] == "unhealthy" {
@@ -171,6 +153,46 @@ func main() {
 	err := router.Run(":" + port)
 	if err != nil {
 		log.Fatalln(err)
+	}
+}
+
+func mysqlStats(getDB func() (*gorm.DB, error)) (open, inUse, idle int) {
+	db, err := getDB()
+	if err != nil {
+		return 0, 0, 0
+	}
+	pool, err := db.DB()
+	if err != nil {
+		return 0, 0, 0
+	}
+	stats := pool.Stats()
+	return stats.OpenConnections, stats.InUse, stats.Idle
+}
+
+func checkMySQLHealth(parent context.Context, health gin.H, getDB func() (*gorm.DB, error)) {
+	status := health["status"]
+	health["status"] = "unhealthy"
+	health["mysql"] = "unavailable"
+	db, err := getDB()
+	if err != nil {
+		return
+	}
+	pool, err := db.DB()
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	if err := pool.PingContext(ctx); err != nil {
+		return
+	}
+	health["status"] = status
+	health["mysql"] = "connected"
+	stats := pool.Stats()
+	health["mysql_pool"] = gin.H{
+		"open_connections": stats.OpenConnections,
+		"in_use":           stats.InUse,
+		"idle":             stats.Idle,
 	}
 }
 

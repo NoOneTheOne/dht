@@ -5,6 +5,28 @@ import (
 	"testing"
 )
 
+func TestKeyedDequeRefreshKeepsIndexesBounded(t *testing.T) {
+	deque := newKeyedDeque()
+	deque.Push("key", 0)
+	stale, _ := deque.Get("key")
+	for i := 1; i <= 1000; i++ {
+		deque.Push("key", i)
+	}
+	if deque.Len() != 1 || len(deque.index) != 1 || len(deque.invertedIndex) != 1 {
+		t.Fatalf("unbounded indexes: list=%d index=%d inverted=%d", deque.Len(), len(deque.index), len(deque.invertedIndex))
+	}
+	if deque.Remove(stale) != nil {
+		t.Fatal("stale element removed the replacement")
+	}
+	current, ok := deque.Get("key")
+	if !ok || current.Value != 1000 {
+		t.Fatal("current element lost after stale removal")
+	}
+	if deque.Remove(current) != 1000 || deque.Len() != 0 || len(deque.invertedIndex) != 0 {
+		t.Fatal("removal did not clear indexes")
+	}
+}
+
 func TestSyncedMapBasic(t *testing.T) {
 	m := newSyncedMap()
 

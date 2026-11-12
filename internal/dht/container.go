@@ -238,6 +238,7 @@ func (deque *keyedDeque) Push(key interface{}, val interface{}) {
 
 	if e, ok := deque.index[key]; ok {
 		deque.syncedList.Remove(e)
+		delete(deque.invertedIndex, e)
 	}
 	deque.index[key] = deque.syncedList.PushBack(val)
 	deque.invertedIndex[deque.index[key]] = key
@@ -275,14 +276,15 @@ func (deque *keyedDeque) Delete(key interface{}) (v interface{}) {
 
 // Remove Removes overwrites list.List.Remove.
 func (deque *keyedDeque) Remove(e *list.Element) (v interface{}) {
-	deque.RLock()
+	deque.Lock()
+	defer deque.Unlock()
+
 	key, ok := deque.invertedIndex[e]
-	deque.RUnlock()
-
-	if ok {
-		v = deque.Delete(key)
+	if ok && deque.index[key] == e {
+		v = deque.syncedList.Remove(e)
+		delete(deque.index, key)
+		delete(deque.invertedIndex, e)
 	}
-
 	return
 }
 

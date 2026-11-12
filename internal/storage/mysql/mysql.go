@@ -1,13 +1,15 @@
 package mysql
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -25,43 +27,90 @@ func (Data) TableName() string {
 	return getCfg().MySQL.Table
 }
 
+const (
+	operationTimeout  = 10 * time.Second
+	connectionTimeout = 2 * time.Second
+	ioTimeout         = 5 * time.Second
+)
+
 var (
-	db   *gorm.DB
-	once sync.Once
+	db     *gorm.DB
+	dbMu   sync.Mutex
+	initDB = openDB
 )
 
 func getCfg() *config.Config {
 	return config.GetConfig()
 }
 
-func GetDB() *gorm.DB {
-	once.Do(func() {
-		c := getCfg()
-		dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-			c.MySQL.Username, c.MySQL.Password, c.MySQL.Addresses, c.MySQL.Database)
-		var err error
-		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
-		if err != nil {
-			log.Fatalf("failed to connect MySQL at %s: %v", c.MySQL.Addresses, err)
-		}
-		sqlDB, err := db.DB()
-		if err != nil {
-			log.Fatalf("failed to get underlying sql.DB: %v", err)
-		}
-		sqlDB.SetMaxIdleConns(10)
-		sqlDB.SetMaxOpenConns(100)
-		sqlDB.SetConnMaxLifetime(time.Hour)
+func mysqlDSN(c *config.Config) string {
+	dsn := mysqlDriver.NewConfig()
+	dsn.User = c.MySQL.Username
+	dsn.Passwd = c.MySQL.Password
+	dsn.Net = "tcp"
+	dsn.Addr = c.MySQL.Addresses
+	dsn.DBName = c.MySQL.Database
+	dsn.Params = map[string]string{"charset": "utf8mb4"}
+	dsn.ParseTime = true
+	dsn.Loc = time.Local
+	dsn.Timeout = connectionTimeout
+	dsn.ReadTimeout = ioTimeout
+	dsn.WriteTimeout = ioTimeout
+	return dsn.FormatDSN()
+}
 
-		if err := db.AutoMigrate(&Data{}); err != nil {
-			log.Fatalf("failed to auto-migrate table: %v", err)
+func GetDB() (*gorm.DB, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	if db != nil {
+		return db, nil
+	}
+
+	candidate, err := initDB()
+	if err != nil {
+		return nil, err
+	}
+	db = candidate
+	return db, nil
+}
+
+func openDB() (*gorm.DB, error) {
+	pool, err := sql.Open("mysql", mysqlDSN(getCfg()))
+	if err != nil {
+		return nil, fmt.Errorf("open MySQL pool: %w", err)
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = pool.Close()
 		}
-	})
-	return db
+	}()
+	pool.SetMaxIdleConns(10)
+	pool.SetMaxOpenConns(100)
+	pool.SetConnMaxLifetime(time.Hour)
+
+	candidate, err := gorm.Open(mysql.New(mysql.Config{Conn: pool}), &gorm.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("connect MySQL: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+	defer cancel()
+	if err := candidate.WithContext(ctx).AutoMigrate(&Data{}); err != nil {
+		return nil, fmt.Errorf("migrate MySQL: %w", err)
+	}
+	initialized = true
+	return candidate, nil
 }
 
 func Write(d *Data) error {
+	db, err := GetDB()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+	defer cancel()
 	d.Name = strings.ToValidUTF8(d.Name, "")
-	return GetDB().Clauses(clause.OnConflict{
+	return db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "infohash"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("`count` + 1")}),
 	}).Create(d).Error
@@ -71,8 +120,14 @@ func Search(name string) ([]Data, int64, error) {
 	var results []Data
 	var total int64
 
+	db, err := GetDB()
+	if err != nil {
+		return nil, 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+	defer cancel()
 	escaped := escapeLike(name)
-	query := GetDB().Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
+	query := db.WithContext(ctx).Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err

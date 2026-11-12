@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"time"
 )
@@ -29,7 +28,34 @@ const (
 	EXTENDED = 20
 	// HANDSHAKE represents handshake bit
 	HANDSHAKE = 0
+
+	// Allow a metadata piece plus message IDs and 1 KiB of headers.
+	maxWireMessageSize      = BLOCK + 2 + 1024
+	metadataDownloadTimeout = time.Minute
+	localMetadataID         = 1
 )
+
+var errWireMessageTooLarge = errors.New("peer wire message too large")
+
+// Keepalives must not extend the download deadline.
+type metadataConn struct {
+	net.Conn
+	deadline time.Time
+}
+
+func (conn *metadataConn) SetReadDeadline(deadline time.Time) error {
+	if deadline.IsZero() || deadline.After(conn.deadline) {
+		deadline = conn.deadline
+	}
+	return conn.Conn.SetReadDeadline(deadline)
+}
+
+func (conn *metadataConn) SetWriteDeadline(deadline time.Time) error {
+	if deadline.IsZero() || deadline.After(conn.deadline) {
+		deadline = conn.deadline
+	}
+	return conn.Conn.SetWriteDeadline(deadline)
+}
 
 var handshakePrefix = []byte{
 	19, 66, 105, 116, 84, 111, 114, 114, 101, 110, 116, 32, 112, 114,
@@ -37,7 +63,7 @@ var handshakePrefix = []byte{
 }
 
 // read size-length bytes from conn to data.
-func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
+func read(conn net.Conn, size int, data *bytes.Buffer) error {
 	conn.SetReadDeadline(time.Now().Add(time.Second * 15))
 
 	n, err := io.CopyN(data, conn, int64(size))
@@ -48,14 +74,18 @@ func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
 }
 
 // readMessage gets a message from the tcp connection.
-func readMessage(conn *net.TCPConn, data *bytes.Buffer) (
+func readMessage(conn net.Conn, data *bytes.Buffer) (
 	length int, err error) {
 
 	if err = read(conn, 4, data); err != nil {
 		return
 	}
 
-	length = int(bytes2int(data.Next(4)))
+	frameLength := bytes2int(data.Next(4))
+	if frameLength > maxWireMessageSize {
+		return 0, errWireMessageTooLarge
+	}
+	length = int(frameLength)
 	if length == 0 {
 		return
 	}
@@ -67,7 +97,7 @@ func readMessage(conn *net.TCPConn, data *bytes.Buffer) (
 }
 
 // sendMessage sends data to the connection.
-func sendMessage(conn *net.TCPConn, data []byte) error {
+func sendMessage(conn net.Conn, data []byte) error {
 	length := int32(len(data))
 
 	buffer := bytes.NewBuffer(nil)
@@ -81,7 +111,7 @@ func sendMessage(conn *net.TCPConn, data []byte) error {
 }
 
 // sendHandshake sends handshake message to conn.
-func sendHandshake(conn *net.TCPConn, infoHash, peerID []byte) error {
+func sendHandshake(conn net.Conn, infoHash, peerID []byte) error {
 	data := make([]byte, 68)
 	copy(data[:28], handshakePrefix)
 	copy(data[28:48], infoHash)
@@ -93,19 +123,20 @@ func sendHandshake(conn *net.TCPConn, infoHash, peerID []byte) error {
 }
 
 // onHandshake handles the handshake response.
-func onHandshake(data []byte) (err error) {
-	if !(bytes.Equal(handshakePrefix[:20], data[:20]) && data[25]&0x10 != 0) {
-		err = errors.New("invalid handshake response")
+func onHandshake(data, infoHash []byte) error {
+	if len(data) != 68 || !bytes.Equal(handshakePrefix[:20], data[:20]) ||
+		data[25]&0x10 == 0 || !bytes.Equal(data[28:48], infoHash) {
+		return errors.New("invalid handshake response")
 	}
-	return
+	return nil
 }
 
 // sendExtHandshake requests for the ut_metadata and metadata_size.
-func sendExtHandshake(conn *net.TCPConn) error {
+func sendExtHandshake(conn net.Conn) error {
 	data := append(
 		[]byte{EXTENDED, HANDSHAKE},
 		Encode(map[string]interface{}{
-			"m": map[string]interface{}{"ut_metadata": 1},
+			"m": map[string]interface{}{"ut_metadata": localMetadataID},
 		})...,
 	)
 
@@ -140,8 +171,12 @@ func getUTMetaSize(data []byte) (
 	utMetadata = m["ut_metadata"].(int)
 	metadataSize = dict["metadata_size"].(int)
 
-	if metadataSize > MaxMetadataSize {
-		err = errors.New("metadata_size too long")
+	if utMetadata <= 0 || utMetadata > 255 {
+		err = errors.New("invalid ut_metadata id")
+		return
+	}
+	if metadataSize <= 0 || metadataSize > MaxMetadataSize {
+		err = errors.New("invalid metadata_size")
 	}
 	return
 }
@@ -184,7 +219,21 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 
 // Request pushes the request to the queue.
 func (wire *Wire) Request(infoHash []byte, ip string, port int) {
-	wire.requests <- Request{InfoHash: infoHash, IP: ip, Port: port}
+	if len(infoHash) != 20 || port < 1 || port > 65535 || wire.blackList.in(ip, port) {
+		return
+	}
+	key := string(infoHash) + ":" + genAddress(ip, port)
+	wire.queue.Lock()
+	defer wire.queue.Unlock()
+	if _, exists := wire.queue.data[key]; exists {
+		return
+	}
+	wire.queue.data[key] = struct{}{}
+	select {
+	case wire.requests <- Request{InfoHash: bytes.Clone(infoHash), IP: ip, Port: port}:
+	default:
+		delete(wire.queue.data, key)
+	}
 }
 
 // Response returns a chan of Response.
@@ -192,18 +241,8 @@ func (wire *Wire) Response() <-chan Response {
 	return wire.responses
 }
 
-// isDone returns whether the wire get all pieces of the metadata info.
-func (wire *Wire) isDone(pieces [][]byte) bool {
-	for _, piece := range pieces {
-		if len(piece) == 0 {
-			return false
-		}
-	}
-	return true
-}
-
 func (wire *Wire) requestPieces(
-	conn *net.TCPConn, utMetadata int, metadataSize int, piecesNum int) {
+	conn net.Conn, utMetadata int, metadataSize int, piecesNum int) {
 
 	buffer := make([]byte, 1024)
 	for i := 0; i < piecesNum; i++ {
@@ -218,52 +257,63 @@ func (wire *Wire) requestPieces(
 		length := len(msg) + 2
 		copy(buffer[2:length], msg)
 
-		sendMessage(conn, buffer[:length])
+		if err := sendMessage(conn, buffer[:length]); err != nil {
+			return
+		}
 	}
 	buffer = nil
 }
 
 // fetchMetadata fetches medata info according to infohash from dht.
 func (wire *Wire) fetchMetadata(r Request) {
+	deadline := time.Now().Add(metadataDownloadTimeout)
+	dialer := net.Dialer{Timeout: 15 * time.Second, Deadline: deadline}
+	conn, err := dialer.Dial("tcp", genAddress(r.IP, r.Port))
+	if err != nil {
+		wire.blackList.insert(r.IP, r.Port)
+		return
+	}
+	conn.(*net.TCPConn).SetLinger(0)
+	defer conn.Close()
+	wire.fetchMetadataConn(conn, r, deadline)
+}
+
+// fetchMetadataConn runs a download with a fixed deadline, including writes.
+func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) {
+	if err := raw.SetDeadline(deadline); err != nil {
+		return
+	}
+	conn := &metadataConn{Conn: raw, deadline: deadline}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	var (
+		err          error
 		length       int
 		msgType      byte
 		piecesNum    int
 		pieces       [][]byte
 		utMetadata   int
 		metadataSize int
+		received     int
 	)
 
-	defer func() {
-		pieces = nil
-		if rv := recover(); rv != nil {
-			log.Printf("fetchMetadata panic for %s:%d: %v", r.IP, r.Port, rv)
-		}
-	}()
-
 	infoHash := r.InfoHash
-	address := genAddress(r.IP, r.Port)
-
-	dial, err := net.DialTimeout("tcp", address, time.Second*15)
-	if err != nil {
-		wire.blackList.insert(r.IP, r.Port)
-		return
-	}
-	conn := dial.(*net.TCPConn)
-	conn.SetLinger(0)
-	defer conn.Close()
-
 	data := bytes.NewBuffer(nil)
 	data.Grow(BLOCK)
 
 	if sendHandshake(conn, infoHash, []byte(randomString(20))) != nil ||
 		read(conn, 68, data) != nil ||
-		onHandshake(data.Next(68)) != nil ||
+		onHandshake(data.Next(68), infoHash) != nil ||
 		sendExtHandshake(conn) != nil {
 		return
 	}
 
 	for {
+		select {
+		case <-timer.C:
+			return
+		default:
+		}
 		length, err = readMessage(conn, data)
 		if err != nil {
 			return
@@ -311,6 +361,10 @@ func (wire *Wire) fetchMetadata(r Request) {
 				continue
 			}
 
+			// Inbound IDs follow our handshake, not the peer's outgoing ID map.
+			if extendedID != localMetadataID {
+				continue
+			}
 			if pieces == nil {
 				return
 			}
@@ -327,11 +381,22 @@ func (wire *Wire) fetchMetadata(r Request) {
 				return
 			}
 
+			if dict["msg_type"].(int) == REJECT {
+				return
+			}
 			if dict["msg_type"].(int) != DATA {
 				continue
 			}
 
 			piece := dict["piece"].(int)
+			if piece < 0 || piece >= piecesNum {
+				return
+			}
+			if value, ok := dict["total_size"]; ok {
+				if total, ok := value.(int); !ok || total != metadataSize {
+					return
+				}
+			}
 			pieceLen := length - 2 - index
 
 			expectedLastPieceLen := metadataSize % BLOCK
@@ -343,9 +408,12 @@ func (wire *Wire) fetchMetadata(r Request) {
 				return
 			}
 
+			if pieces[piece] == nil {
+				received++
+			}
 			pieces[piece] = payload[index:]
 
-			if wire.isDone(pieces) {
+			if received == piecesNum {
 				metadataInfo := bytes.Join(pieces, nil)
 
 				info := sha1.Sum(metadataInfo)
@@ -353,9 +421,12 @@ func (wire *Wire) fetchMetadata(r Request) {
 					return
 				}
 
-				wire.responses <- Response{
+				select {
+				case wire.responses <- Response{
 					Request:      r,
 					MetadataInfo: metadataInfo,
+				}:
+				case <-timer.C:
 				}
 				return
 			}
@@ -370,21 +441,18 @@ func (wire *Wire) Run() {
 	go wire.blackList.clear()
 
 	for r := range wire.requests {
+		key := string(r.InfoHash) + ":" + genAddress(r.IP, r.Port)
+		if wire.blackList.in(r.IP, r.Port) {
+			wire.queue.Delete(key)
+			continue
+		}
 		wire.workerTokens <- struct{}{}
-
-		go func(r Request) {
+		go func(r Request, key string) {
 			defer func() {
+				wire.queue.Delete(key)
 				<-wire.workerTokens
 			}()
-
-			key := string(r.InfoHash) + ":" + genAddress(r.IP, r.Port)
-
-			if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) ||
-				wire.queue.Has(key) {
-				return
-			}
-
 			wire.fetchMetadata(r)
-		}(r)
+		}(r, key)
 	}
 }

@@ -1,10 +1,12 @@
 package dht
 
 import (
+	"bytes"
 	"container/heap"
 	"container/list"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"time"
 )
@@ -200,39 +202,29 @@ func (bucket *KBucket) Insert(no *node) bool {
 
 // Replace removes node, then put bucket.candidates.Back() to the right
 // place of bucket.nodes.
-func (bucket *KBucket) Replace(no *node) {
-	bucket.nodes.Delete(no.id.RawString())
+func (bucket *KBucket) Replace(no *node) *node {
+	if bucket.nodes.Delete(no.id.RawString()) == nil {
+		return nil
+	}
 	bucket.UpdateTimestamp()
-
 	if bucket.candidates.Len() == 0 {
-		return
+		return nil
 	}
-
-	no = bucket.candidates.Remove(bucket.candidates.Back()).(*node)
-
-	// Collect nodes first to avoid deadlock: Iter() holds RLock,
-	// InsertBefore needs Lock on the same syncedList.
-	type nodeEntry struct {
-		elem           *list.Element
-		lastActiveTime time.Time
-	}
-	var entries []nodeEntry
+	promoted := bucket.candidates.Remove(bucket.candidates.Back()).(*node)
+	// Snapshot before keyed reordering invalidates the list elements.
+	var entries []*list.Element
 	for e := range bucket.nodes.Iter() {
-		n := e.Value.(*node)
-		entries = append(entries, nodeEntry{elem: e, lastActiveTime: n.lastActiveTime})
+		entries = append(entries, e)
 	}
-
-	inserted := false
-	for _, entry := range entries {
-		if entry.lastActiveTime.After(no.lastActiveTime) && !inserted {
-			bucket.nodes.InsertBefore(no, entry.elem)
-			inserted = true
+	bucket.nodes.Push(promoted.id.RawString(), promoted)
+	// Reappend newer entries to preserve timestamp order using keyed operations.
+	for _, e := range entries {
+		n := e.Value.(*node)
+		if n.lastActiveTime.After(promoted.lastActiveTime) {
+			bucket.nodes.Push(n.id.RawString(), n)
 		}
 	}
-
-	if !inserted {
-		bucket.nodes.PushBack(no)
-	}
+	return promoted
 }
 
 // Fresh pings the expired nodes in the bucket.
@@ -316,12 +308,12 @@ func (tableNode *routingTableNode) Split() {
 
 	for e := range tableNode.KBucket().nodes.Iter() {
 		nd := e.Value.(*node)
-		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().nodes.PushBack(nd)
+		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().nodes.Push(nd.id.RawString(), nd)
 	}
 
 	for e := range tableNode.KBucket().candidates.Iter() {
 		nd := e.Value.(*node)
-		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().candidates.PushBack(nd)
+		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().candidates.Push(nd.id.RawString(), nd)
 	}
 
 	for i := 0; i < 2; i++ {
@@ -364,8 +356,49 @@ func (rt *routingTable) Insert(nd *node) bool {
 	rt.Lock()
 	defer rt.Unlock()
 
-	if rt.dht.blackList.in(nd.addr.IP.String(), nd.addr.Port) ||
-		rt.cachedNodes.Len() >= rt.dht.MaxNodes {
+	if rt.dht.blackList.in(nd.addr.IP.String(), nd.addr.Port) {
+		return false
+	}
+
+	previous, previousBucket := rt.getNodeKBucketByIDLocked(nd.id)
+	byAddress, addressExists := rt.cachedNodes.Get(nd.addr.String())
+	if previous == nil && !addressExists && rt.cachedNodes.Len() >= rt.dht.MaxNodes {
+		return false
+	}
+	// Reserve the endpoint's slot for its replacement rather than a candidate.
+	if addressExists && byAddress.(*node).id.RawString() != nd.id.RawString() {
+		old := byAddress.(*node)
+		if _, b := rt.getNodeKBucketByIDLocked(old.id); b != nil {
+			b.nodes.Delete(old.id.RawString())
+			b.UpdateTimestamp()
+		}
+		rt.cachedNodes.Delete(nd.addr.String())
+	}
+	if previous != nil {
+		rt.cachedNodes.Delete(previous.addr.String())
+		previousBucket.Insert(nd)
+		rt.cachedNodes.Set(nd.addr.String(), nd)
+	}
+	// Remove candidate aliases before they can be promoted back into the table.
+	rt.cachedKBuckets.syncedList.RLock()
+	for e := rt.cachedKBuckets.queue.Front(); e != nil; e = e.Next() {
+		b := e.Value.(*KBucket)
+		var stale []string
+		b.candidates.RLock()
+		for _, c := range b.candidates.index {
+			n := c.Value.(*node)
+			if n.id.RawString() == nd.id.RawString() || n.addr.String() == nd.addr.String() {
+				stale = append(stale, n.id.RawString())
+			}
+		}
+		b.candidates.RUnlock()
+		for _, id := range stale {
+			b.candidates.Delete(id)
+		}
+	}
+	rt.cachedKBuckets.syncedList.RUnlock()
+	if previous != nil {
+		rt.cachedKBuckets.Push(previousBucket.prefix.String(), previousBucket)
 		return false
 	}
 
@@ -391,7 +424,8 @@ func (rt *routingTable) Insert(nd *node) bool {
 			rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
 
 			return isNew
-		} else if root.KBucket().prefix.Compare(nd.id, prefixLen-1) == 0 {
+		} else if root.KBucket().prefix.Size < maxPrefixLength &&
+			root.KBucket().prefix.Compare(rt.dht.node.id, prefixLen-1) == 0 {
 			// If node has the same prefix with bucket, split it.
 
 			root.Split()
@@ -407,7 +441,7 @@ func (rt *routingTable) Insert(nd *node) bool {
 			root = root.Child(nd.id.Bit(prefixLen - 1))
 		} else {
 			// Finally, store node as a candidate and fresh the bucket.
-			root.KBucket().candidates.PushBack(nd)
+			root.KBucket().candidates.Push(nd.id.RawString(), nd)
 			if root.KBucket().candidates.Len() > rt.k {
 				root.KBucket().candidates.Remove(
 					root.KBucket().candidates.Front())
@@ -422,12 +456,15 @@ func (rt *routingTable) Insert(nd *node) bool {
 
 // GetNeighbors returns the size-length nodes closest to id.
 func (rt *routingTable) GetNeighbors(id *bitmap, size int) []*node {
-	rt.RLock()
-	nodes := make([]*node, 0, rt.cachedNodes.Len())
-	for item := range rt.cachedNodes.Iter() {
-		nodes = append(nodes, item.val.(*node))
+	if size <= 0 {
+		return nil
 	}
-	rt.RUnlock()
+	rt.cachedNodes.RLock()
+	nodes := make([]*node, 0, len(rt.cachedNodes.data))
+	for _, value := range rt.cachedNodes.data {
+		nodes = append(nodes, value.(*node))
+	}
+	rt.cachedNodes.RUnlock()
 
 	return getTopKNodes(nodes, id, size)
 }
@@ -452,22 +489,7 @@ func (rt *routingTable) GetNodeKBucketByID(id *bitmap) (
 	rt.RLock()
 	defer rt.RUnlock()
 
-	var next *routingTableNode
-	root := rt.root
-
-	for prefixLen := 1; prefixLen <= maxPrefixLength; prefixLen++ {
-		next = root.Child(id.Bit(prefixLen - 1))
-		if next == nil {
-			v, ok := root.KBucket().nodes.Get(id.RawString())
-			if !ok {
-				return
-			}
-			nd, bucket = v.Value.(*node), root.KBucket()
-			return
-		}
-		root = next
-	}
-	return
+	return rt.getNodeKBucketByIDLocked(id)
 }
 
 // GetNodeByAddress finds node by address.
@@ -484,18 +506,30 @@ func (rt *routingTable) GetNodeByAddress(address string) (no *node, ok bool) {
 
 // Remove deletes the node whose id is `id`.
 func (rt *routingTable) Remove(id *bitmap) {
-	if nd, bucket := rt.GetNodeKBucketByID(id); nd != nil {
-		bucket.Replace(nd)
+	rt.Lock()
+	defer rt.Unlock()
+	rt.removeLocked(id)
+}
+
+// removeLocked updates both indexes while the table write lock is held.
+func (rt *routingTable) removeLocked(id *bitmap) {
+	if nd, bucket := rt.getNodeKBucketByIDLocked(id); nd != nil {
+		promoted := bucket.Replace(nd)
 		rt.cachedNodes.Delete(nd.addr.String())
+		if promoted != nil {
+			rt.cachedNodes.Set(promoted.addr.String(), promoted)
+		}
 		rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
 	}
 }
 
 // RemoveByAddr Remove the node whose address is `ip:port`.
 func (rt *routingTable) RemoveByAddr(address string) {
+	rt.Lock()
+	defer rt.Unlock()
 	v, ok := rt.cachedNodes.Get(address)
 	if ok {
-		rt.Remove(v.(*node).id)
+		rt.removeLocked(v.(*node).id)
 	}
 }
 
@@ -539,52 +573,58 @@ func (rt *routingTable) Len() int {
 	return rt.cachedNodes.Len()
 }
 
-// nodeHeapItem is a typed version to avoid interface{} boxing.
 type nodeHeapItem struct {
-	distance *bitmap
+	distance [20]byte
 	node     *node
 }
 
-type topKNodeHeap []*nodeHeapItem
+type topKNodeHeap []nodeHeapItem
 
 func (h topKNodeHeap) Len() int { return len(h) }
 func (h topKNodeHeap) Less(i, j int) bool {
-	return h[i].distance.Compare(h[j].distance, maxPrefixLength) == 1
+	return bytes.Compare(h[i].distance[:], h[j].distance[:]) > 0
 }
 func (h topKNodeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
 func (h *topKNodeHeap) Push(x interface{}) {
-	*h = append(*h, x.(*nodeHeapItem))
+	*h = append(*h, x.(nodeHeapItem))
 }
 
 func (h *topKNodeHeap) Pop() interface{} {
 	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
 	return x
 }
 
-// getTopKNodes solves the top-k problem with typed []*node, avoiding interface{} boxing.
 func getTopKNodes(nodes []*node, id *bitmap, k int) []*node {
-	h := make(topKNodeHeap, 0, k+1)
-
+	k = min(k, len(nodes))
+	if k <= 0 {
+		return nil
+	}
+	h := make(topKNodeHeap, 0, k)
 	for _, n := range nodes {
-		distance := id.Xor(n.id)
-		if h.Len() == k {
-			last := h[h.Len()-1]
-			if last.distance.Compare(distance, maxPrefixLength) == 1 {
-				heap.Push(&h, &nodeHeapItem{distance: distance, node: n})
-				heap.Pop(&h)
+		var distance [20]byte
+		for i := range distance {
+			distance[i] = id.data[i] ^ n.id.data[i]
+		}
+		if len(h) < k {
+			h = append(h, nodeHeapItem{distance: distance, node: n})
+			if len(h) == k {
+				heap.Init(&h)
 			}
-		} else {
-			heap.Push(&h, &nodeHeapItem{distance: distance, node: n})
+		} else if bytes.Compare(distance[:], h[0].distance[:]) < 0 {
+			h[0] = nodeHeapItem{distance: distance, node: n}
+			heap.Fix(&h, 0)
 		}
 	}
 
-	result := make([]*node, h.Len())
-	for i := len(result) - 1; i >= 0; i-- {
-		result[i] = heap.Pop(&h).(*nodeHeapItem).node
+	slices.SortFunc(h, func(a, b nodeHeapItem) int {
+		return bytes.Compare(a.distance[:], b.distance[:])
+	})
+	result := make([]*node, len(h))
+	for i := range h {
+		result[i] = h[i].node
 	}
 	return result
 }

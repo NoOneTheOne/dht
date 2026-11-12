@@ -7,8 +7,14 @@ services:
     container_name: dht-spider
     environment:
       CONFIG_FILE_PATH: "/app/config.yml"
+    command:
+      - ./dht-spider
+      - -port=${DHT_PORT:-6881}
+      - -query-workers=${DHT_QUERY_WORKERS:-64}
+      - -query-timeout=${DHT_QUERY_TIMEOUT:-5s}
+      - -metadata-workers=${DHT_METADATA_WORKERS:-64}
     ports:
-      - "${DHT_PORT:-6881}:6881/udp"
+      - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
     volumes:
       - ./config/config.yml:/app/config.yml:ro
     restart: unless-stopped

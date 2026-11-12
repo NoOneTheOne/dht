@@ -252,10 +252,8 @@ func (rt *routingTable) EvictStaleNodes(maxAge time.Duration) int {
 	}
 
 	for _, n := range nodesToEvict {
-		if nd, bucket := rt.getNodeKBucketByIDLocked(n.id); nd != nil {
-			bucket.Replace(nd)
-			rt.cachedNodes.Delete(nd.addr.String())
-			rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
+		if nd, _ := rt.getNodeKBucketByIDLocked(n.id); nd != nil {
+			rt.removeLocked(nd.id)
 			evicted++
 		}
 	}
@@ -265,20 +263,13 @@ func (rt *routingTable) EvictStaleNodes(maxAge time.Duration) int {
 
 // getNodeKBucketByIDLocked is like GetNodeKBucketByID but assumes the caller holds rt.Lock().
 func (rt *routingTable) getNodeKBucketByIDLocked(id *bitmap) (nd *node, bucket *KBucket) {
-	var next *routingTableNode
 	root := rt.root
-
-	for prefixLen := 1; prefixLen <= maxPrefixLength; prefixLen++ {
-		next = root.Child(id.Bit(prefixLen - 1))
-		if next == nil {
-			v, ok := root.KBucket().nodes.Get(id.RawString())
-			if !ok {
-				return
-			}
-			nd, bucket = v.Value.(*node), root.KBucket()
-			return
-		}
-		root = next
+	for bit := 0; root.KBucket() == nil; bit++ {
+		root = root.Child(id.Bit(bit))
 	}
-	return
+	bucket = root.KBucket()
+	if v, ok := bucket.nodes.Get(id.RawString()); ok {
+		return v.Value.(*node), bucket
+	}
+	return nil, nil
 }

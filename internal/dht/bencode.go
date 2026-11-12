@@ -9,6 +9,9 @@ import (
 	"unicode/utf8"
 )
 
+// maxBencodeDepth limits simultaneously nested containers, including the root.
+const maxBencodeDepth = 64
+
 // find returns the index of first target in data starting from `start`.
 // It returns -1 if target not found.
 func find(data []byte, start int, target rune) (index int) {
@@ -24,7 +27,7 @@ func find(data []byte, start int, target rune) (index int) {
 func DecodeString(data []byte, start int) (
 	result interface{}, index int, err error) {
 
-	if start >= len(data) || data[start] < '0' || data[start] > '9' {
+	if start < 0 || start >= len(data) || data[start] < '0' || data[start] > '9' {
 		err = errors.New("invalid string bencode")
 		return
 	}
@@ -60,7 +63,7 @@ func DecodeString(data []byte, start int) (
 func DecodeInt(data []byte, start int) (
 	result interface{}, index int, err error) {
 
-	if start >= len(data) || data[start] != 'i' {
+	if start < 0 || start >= len(data) || data[start] != 'i' {
 		err = errors.New("invalid int bencode")
 		return
 	}
@@ -81,11 +84,11 @@ func DecodeInt(data []byte, start int) (
 	return
 }
 
-// decodeItem decodes an item of dict or list.
-func decodeItem(data []byte, i int) (
+// decodeItem decodes an item with depth enclosing containers.
+func decodeItem(data []byte, i, depth int) (
 	result interface{}, index int, err error) {
 
-	if i >= len(data) {
+	if i < 0 || i >= len(data) {
 		err = errors.New("invalid bencode when decode item")
 		return
 	}
@@ -97,21 +100,30 @@ func decodeItem(data []byte, i int) (
 	case data[i] == 'i':
 		return DecodeInt(data, i)
 	case data[i] == 'l':
-		return DecodeList(data, i)
+		return decodeList(data, i, depth)
 	case data[i] == 'd':
-		return DecodeDict(data, i)
+		return decodeDict(data, i, depth)
 	default:
 		err = errors.New("invalid bencode when decode item")
 		return
 	}
 }
 
-// DecodeList decodes a list value.
+// DecodeList decodes a list prefix and returns the position after its closing 'e'.
 func DecodeList(data []byte, start int) (
 	result interface{}, index int, err error) {
+	return decodeList(data, start, 0)
+}
 
-	if start >= len(data) || data[start] != 'l' {
+func decodeList(data []byte, start, depth int) (
+	result interface{}, index int, err error) {
+
+	if start < 0 || start >= len(data) || data[start] != 'l' {
 		err = errors.New("invalid list bencode")
+		return
+	}
+	if depth >= maxBencodeDepth {
+		err = errors.New("bencode nesting too deep")
 		return
 	}
 
@@ -125,7 +137,7 @@ func DecodeList(data []byte, start int) (
 			break
 		}
 
-		item, index, err = decodeItem(data, index)
+		item, index, err = decodeItem(data, index, depth+1)
 		if err != nil {
 			return
 		}
@@ -142,12 +154,21 @@ func DecodeList(data []byte, start int) (
 	return
 }
 
-// DecodeDict decodes a map value.
+// DecodeDict decodes a dictionary prefix and returns the position after its closing 'e'.
 func DecodeDict(data []byte, start int) (
 	result interface{}, index int, err error) {
+	return decodeDict(data, start, 0)
+}
 
-	if start >= len(data) || data[start] != 'd' {
+func decodeDict(data []byte, start, depth int) (
+	result interface{}, index int, err error) {
+
+	if start < 0 || start >= len(data) || data[start] != 'd' {
 		err = errors.New("invalid dict bencode")
+		return
+	}
+	if depth >= maxBencodeDepth {
+		err = errors.New("bencode nesting too deep")
 		return
 	}
 
@@ -176,7 +197,7 @@ func DecodeDict(data []byte, start int) (
 			return
 		}
 
-		item, index, err = decodeItem(data, index)
+		item, index, err = decodeItem(data, index, depth+1)
 		if err != nil {
 			return
 		}
@@ -194,10 +215,16 @@ func DecodeDict(data []byte, start int) (
 	return
 }
 
-// Decode decodes a bencoded string to string, int, list or map.
+// Decode decodes exactly one bencoded string, int, list or map.
 func Decode(data []byte) (result interface{}, err error) {
-	result, _, err = decodeItem(data, 0)
-	return
+	result, index, err := decodeItem(data, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	if index != len(data) {
+		return nil, errors.New("trailing data after bencode value")
+	}
+	return result, nil
 }
 
 // EncodeString encodes a string value.

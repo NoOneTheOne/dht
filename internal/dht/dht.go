@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
@@ -73,7 +74,9 @@ type InitParam struct {
 	// the size of packet handler
 	PacketWorkerLimit int
 	// the nodes num to be fresh in a KBucket
-	RefreshNodeNum int
+	RefreshNodeNum   int
+	QueryWorkerLimit int
+	QueryTimeout     time.Duration
 }
 
 // NewStandardConfig returns a InitParam pointer with default values.
@@ -93,6 +96,8 @@ func NewStandardConfig() *InitParam {
 		BlockedIPs:           make([]string, 0),
 		BlackListMaxSize:     65536,
 		Try:                  2,
+		QueryWorkerLimit:     64,
+		QueryTimeout:         5 * time.Second,
 		Mode:                 "StandardMode",
 		PacketJobLimit:       1024,
 		PacketWorkerLimit:    256,
@@ -117,10 +122,12 @@ func NewCrawlConfig() *InitParam {
 		BlockedIPs:           make([]string, 0),
 		BlackListMaxSize:     65536,
 		Try:                  2,
+		QueryWorkerLimit:     64,
+		QueryTimeout:         5 * time.Second,
 		Mode:                 "CrawlMode",
 		PacketJobLimit:       1024,
 		PacketWorkerLimit:    256,
-		RefreshNodeNum:       1024,
+		RefreshNodeNum:       64,
 	}
 }
 
@@ -135,7 +142,7 @@ type DHT struct {
 	tokenManager       *tokenManager
 	blackList          *blackList
 	bootstrapMgr       *bootstrapManager
-	Ready              bool
+	ready              atomic.Bool
 	packets            chan packet
 	workerTokens       chan struct{}
 }
@@ -265,7 +272,7 @@ func (dht *DHT) id(target string) string {
 
 // GetPeers returns peers who have announced having infoHash.
 func (dht *DHT) GetPeers(infoHash string) error {
-	if !dht.Ready {
+	if !dht.ready.Load() || dht.routingTable.Len() == 0 {
 		return ErrNotReady
 	}
 
@@ -281,8 +288,12 @@ func (dht *DHT) GetPeers(infoHash string) error {
 		infoHash = string(data)
 	}
 
+	if len(infoHash) != 20 {
+		return errors.New("info hash must be 20 bytes or 40 hexadecimal characters")
+	}
+
 	neighbors := dht.routingTable.GetNeighbors(
-		newBitmapFromString(infoHash), dht.routingTable.Len())
+		newBitmapFromString(infoHash), dht.K)
 
 	for _, no := range neighbors {
 		dht.transactionManager.getPeers(no, infoHash)
@@ -295,8 +306,8 @@ func (dht *DHT) GetPeers(infoHash string) error {
 func (dht *DHT) Run() {
 	dht.init()
 	dht.listen()
-	dht.join()
-	dht.Ready = true
+	dht.ready.Store(true)
+	go dht.join()
 
 	var pkt packet
 	kBucketTicker := time.NewTicker(dht.CheckKBucketPeriod)
@@ -310,10 +321,8 @@ func (dht *DHT) Run() {
 			handle(dht, pkt)
 		case <-kBucketTicker.C:
 			// Use bootstrap manager to check if re-bootstrap is needed
-			if dht.bootstrapMgr != nil && dht.bootstrapMgr.needsRebootstrap() {
-				dht.join()
-			} else if dht.routingTable.Len() == 0 {
-				dht.join()
+			if dht.bootstrapMgr.needsRebootstrap() {
+				go dht.join()
 			} else if dht.transactionManager.len() == 0 {
 				// Use optimized refresh instead of regular Fresh
 				go dht.routingTable.OptimizedRefresh()

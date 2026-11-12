@@ -3,8 +3,12 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"log"
+	"math"
+	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/basic"
@@ -29,7 +33,57 @@ type bitTorrent struct {
 	Length   int64     `json:"length,omitempty"`
 }
 
+func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
+	if value, exists := info["files"]; exists {
+		if _, exists := info["length"]; exists {
+			return nil, 0, false
+		}
+		items, ok := value.([]interface{})
+		if !ok || len(items) == 0 {
+			return nil, 0, false
+		}
+		files := make([]file, 0, len(items))
+		var total int64
+		for _, item := range items {
+			entry, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, 0, false
+			}
+			length, ok := entry["length"].(int)
+			if !ok || length < 0 || int64(length) > math.MaxInt64-total {
+				return nil, 0, false
+			}
+			path, ok := entry["path"].([]interface{})
+			if !ok || len(path) == 0 {
+				return nil, 0, false
+			}
+			for _, part := range path {
+				if value, ok := part.(string); !ok || value == "" {
+					return nil, 0, false
+				}
+			}
+			files = append(files, file{Path: path, Length: length})
+			total += int64(length)
+		}
+		return files, total, true
+	}
+	length, ok := info["length"].(int)
+	if !ok || length < 0 {
+		return nil, 0, false
+	}
+	return nil, int64(length), true
+}
+
 func main() {
+	port := flag.Int("port", 6881, "DHT UDP listen port; forward the same public UDP port to this node")
+	autoNAT := flag.Bool("nat", false, "automatically map UDP port using UPnP/NAT-PMP (disable for manual forwarding or Docker bridge)")
+	queryWorkers := flag.Int("query-workers", 64, "maximum concurrent outbound DHT queries")
+	queryTimeout := flag.Duration("query-timeout", 5*time.Second, "timeout per DHT query attempt")
+	metadataWorkers := flag.Int("metadata-workers", 64, "maximum concurrent metadata TCP connections")
+	flag.Parse()
+	if *port < 1 || *port > 65535 || *queryWorkers < 1 || *metadataWorkers < 1 || *queryTimeout <= 0 {
+		log.Fatal("port must be 1..65535, worker limits and query timeout must be positive")
+	}
 	var c = config.GetConfig()
 
 	if logPath := os.Getenv("LOG_FILE_PATH"); logPath != "" {
@@ -41,11 +95,13 @@ func main() {
 	}
 	log.SetFlags(log.LstdFlags)
 
-	// NAT traversal: try to map DHT port (6881 is the standard DHT port)
-	go setupNAT(6881)
+	if *autoNAT {
+		go setupNAT(*port)
+	} else {
+		log.Printf("[NAT] Manual forwarding: public UDP %d -> node UDP %d; preserve the source port for outbound UDP", *port, *port)
+	}
 
-	// Create wire for metadata exchange
-	w := dht.NewWire(65536, 4096, 1024)
+	w := dht.NewWire(65536, 4096, *metadataWorkers)
 	go func() {
 		for resp := range w.Response() {
 			metadata, err := dht.Decode(resp.MetadataInfo)
@@ -63,6 +119,10 @@ func main() {
 				continue
 			}
 
+			files, length, ok := torrentFiles(info)
+			if !ok {
+				continue
+			}
 			infoHash := hex.EncodeToString(resp.InfoHash)
 
 			switch c.Storage.Type {
@@ -71,11 +131,7 @@ func main() {
 					Name:     name,
 					InfoHash: infoHash,
 					Time:     time.Now(),
-				}
-				if v, ok := info["length"]; ok {
-					if length, ok := v.(int); ok {
-						data.Length = int64(length)
-					}
+					Length:   length,
 				}
 				if err := mysql.Write(data); err != nil {
 					log.Printf("mysql write error: %v", err)
@@ -88,33 +144,8 @@ func main() {
 					Time:     time.Now(),
 					InfoHash: infoHash,
 					Name:     name,
-				}
-				if v, ok := info["files"]; ok {
-					if files, ok := v.([]interface{}); ok {
-						bt.Files = make([]file, 0, len(files))
-						for _, item := range files {
-							f, ok := item.(map[string]interface{})
-							if !ok {
-								continue
-							}
-							path, ok := f["path"].([]interface{})
-							if !ok {
-								continue
-							}
-							length, ok := f["length"].(int)
-							if !ok {
-								continue
-							}
-							bt.Files = append(bt.Files, file{
-								Path:   path,
-								Length: length,
-							})
-						}
-					}
-				} else if v, ok := info["length"]; ok {
-					if length, ok := v.(int); ok {
-						bt.Length = int64(length)
-					}
+					Files:    files,
+					Length:   length,
 				}
 
 				if data, err := json.Marshal(bt); err != nil {
@@ -136,6 +167,10 @@ func main() {
 
 	// Configure DHT
 	initConfig := dht.NewCrawlConfig()
+	initConfig.Address = net.JoinHostPort("", strconv.Itoa(*port))
+	initConfig.QueryWorkerLimit = *queryWorkers
+	initConfig.QueryTimeout = *queryTimeout
+	log.Printf("[DHT] Listening on UDP %d, query workers=%d timeout=%s, metadata workers=%d", *port, *queryWorkers, *queryTimeout, *metadataWorkers)
 	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
 		if len(infoHash) != 20 {
 			log.Printf("invalid infohash length: %d", len(infoHash))

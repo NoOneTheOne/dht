@@ -128,12 +128,9 @@ func makeError(t string, errCode int, errMsg string) map[string]interface{} {
 
 // send data to the udp.
 func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
-	dht.conn.SetWriteDeadline(time.Now().Add(time.Second * 15))
-
+	dht.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err := dht.conn.WriteToUDP([]byte(Encode(data)), addr)
-	if err != nil {
-		dht.blackList.insert(addr.IP.String(), -1)
-	} else {
+	if err == nil {
 		RecordPacketSent()
 	}
 	return err
@@ -160,6 +157,7 @@ type transactionManager struct {
 	cursor       uint64
 	maxCursor    uint64
 	queryChan    chan *query
+	pending      map[string]struct{}
 	dht          *DHT
 }
 
@@ -171,6 +169,7 @@ func newTransactionManager(maxCursor uint64, dht *DHT) *transactionManager {
 		index:        newSyncedMap(),
 		maxCursor:    maxCursor,
 		queryChan:    make(chan *query, 1024),
+		pending:      make(map[string]struct{}),
 		dht:          dht,
 	}
 }
@@ -205,12 +204,17 @@ func (tm *transactionManager) genIndexKeyByTrans(trans *transaction) string {
 }
 
 // insert adds a transaction to transactionManager.
-func (tm *transactionManager) insert(trans *transaction) {
+func (tm *transactionManager) insert(trans *transaction) bool {
 	tm.Lock()
 	defer tm.Unlock()
 
+	key := tm.genIndexKeyByTrans(trans)
+	if tm.index.Has(key) {
+		return false
+	}
 	tm.transactions.Set(trans.id, trans)
-	tm.index.Set(tm.genIndexKeyByTrans(trans), trans)
+	tm.index.Set(key, trans)
+	return true
 }
 
 // delete removes a transaction from transactionManager.
@@ -281,7 +285,9 @@ func (tm *transactionManager) query(q *query, try int) {
 	transID := q.data["t"].(string)
 	trans := tm.newTransaction(transID, q)
 
-	tm.insert(trans)
+	if !tm.insert(trans) {
+		return
+	}
 	defer tm.delete(trans.id)
 
 	success := false
@@ -295,7 +301,7 @@ loop:
 		case <-trans.response:
 			success = true
 			break loop
-		case <-time.After(time.Second * 15):
+		case <-time.After(tm.dht.QueryTimeout):
 		}
 	}
 
@@ -307,9 +313,22 @@ loop:
 
 // run starts to listen and consume the query chan.
 func (tm *transactionManager) run() {
-	for q := range tm.queryChan {
-		go tm.query(q, tm.dht.Try)
+	var workers sync.WaitGroup
+	for i := 0; i < tm.dht.QueryWorkerLimit; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for q := range tm.queryChan {
+				if !tm.dht.blackList.in(q.node.addr.IP.String(), q.node.addr.Port) {
+					tm.query(q, tm.dht.Try)
+				}
+				tm.Lock()
+				delete(tm.pending, tm.genIndexKey(q.data["q"].(string), q.node.addr.String()))
+				tm.Unlock()
+			}
+		}()
 	}
+	workers.Wait()
 }
 
 // sendQuery send query-formed data to the chan.
@@ -329,10 +348,17 @@ func (tm *transactionManager) sendQuery(
 		data: data,
 	}
 
-	// Non-blocking send: drop if channel is full to avoid blocking the caller
+	key := tm.genIndexKey(queryType, no.addr.String())
+	tm.Lock()
+	defer tm.Unlock()
+	if _, exists := tm.pending[key]; exists {
+		return
+	}
+	tm.pending[key] = struct{}{}
 	select {
 	case tm.queryChan <- q:
 	default:
+		delete(tm.pending, key)
 	}
 }
 
@@ -555,10 +581,24 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 
-		if impliedPort, ok := a["implied_port"]; ok &&
-			impliedPort.(int) != 0 {
+		if len(infoHash) != 20 {
+			send(dht, addr, makeError(t, protocolError, "invalid info_hash"))
+			return
+		}
 
-			port = addr.Port
+		if _, ok := a["implied_port"]; ok {
+			if err := ParseKey(a, "implied_port", "int"); err != nil {
+				send(dht, addr, makeError(t, protocolError, err.Error()))
+				return
+			}
+			if a["implied_port"].(int) != 0 {
+				port = addr.Port
+			}
+		}
+
+		if port < 1 || port > 65535 {
+			send(dht, addr, makeError(t, protocolError, "invalid port"))
+			return
 		}
 
 		if dht.IsStandardMode() {
@@ -577,7 +617,10 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
-	no, _ := newNode(id, addr.Network(), addr.String())
+	no, err := newNode(id, addr.Network(), addr.String())
+	if err != nil {
+		return
+	}
 	dht.routingTable.Insert(no)
 	return true
 }
@@ -599,7 +642,10 @@ func findOn(dht *DHT, r map[string]interface{}, target *bitmap,
 
 	hasNew, found := false, false
 	for i := 0; i < len(nodes)/26; i++ {
-		no, _ := newNodeFromCompactInfo(nodes[i*26:(i+1)*26], dht.Network)
+		no, err := newNodeFromCompactInfo(nodes[i*26:(i+1)*26], dht.Network)
+		if err != nil {
+			return err
+		}
 
 		if no.id.RawString() == target.RawString() {
 			found = true
@@ -689,8 +735,12 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		if err := ParseKey(r, "values", "list"); err == nil {
 			values := r["values"].([]interface{})
 			for _, v := range values {
-				p, err := newPeerFromCompactIPPortInfo(v.(string), token)
-				if err != nil {
+				compactInfo, ok := v.(string)
+				if !ok {
+					continue
+				}
+				p, err := newPeerFromCompactIPPortInfo(compactInfo, token)
+				if err != nil || p.Port == 0 {
 					continue
 				}
 				dht.peersManager.Insert(infoHash, p)
@@ -707,8 +757,11 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
-	// inform transManager to delete transaction.
-	trans.response <- struct{}{}
+	// A duplicate response must not block packet handling after notification.
+	select {
+	case trans.response <- struct{}{}:
+	default:
+	}
 
 	dht.blackList.delete(addr.IP.String(), addr.Port)
 	dht.routingTable.Insert(node)
@@ -731,7 +784,10 @@ func handleError(dht *DHT, addr *net.UDPAddr,
 	if trans := dht.transactionManager.filterOne(
 		response["t"].(string), addr); trans != nil {
 
-		trans.response <- struct{}{}
+		select {
+		case trans.response <- struct{}{}:
+		default:
+		}
 	}
 
 	return true
