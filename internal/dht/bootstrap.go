@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,7 +16,6 @@ var defaultBootstrapNodes = []string{
 	"router.utorrent.com:6881",
 	"dht.transmissionbt.com:6881",
 	"dht.aelitis.com:6881",
-	"router.bitcomet.com:6881",
 }
 
 const bootstrapMinRetry = 15 * time.Second
@@ -23,6 +23,7 @@ const bootstrapMaxRetry = 5 * time.Minute
 
 type bootstrapManager struct {
 	dht            *DHT
+	addresses      []string
 	bootstrapMu    sync.Mutex
 	lastBootstrap  time.Time
 	bootstrapCount int
@@ -32,7 +33,11 @@ type bootstrapManager struct {
 }
 
 func newBootstrapManager(dht *DHT) *bootstrapManager {
-	return &bootstrapManager{dht: dht, retryDelay: bootstrapMinRetry}
+	return &bootstrapManager{
+		dht:        dht,
+		addresses:  bootstrapAddresses(dht.PrimeNodes),
+		retryDelay: bootstrapMinRetry,
+	}
 }
 
 func bootstrapAddresses(configured []string) []string {
@@ -40,23 +45,40 @@ func bootstrapAddresses(configured []string) []string {
 	seen := make(map[string]bool)
 	for _, nodes := range [][]string{configured, defaultBootstrapNodes} {
 		for _, addr := range nodes {
-			if !seen[addr] {
-				seen[addr] = true
-				addresses = append(addresses, addr)
+			addr = strings.TrimSpace(addr)
+			if seen[addr] {
+				continue
 			}
+			seen[addr] = true
+			if _, _, err := parseBootstrapAddress(addr); err != nil {
+				log.Printf("[Bootstrap] Ignoring invalid DHT bootstrap address %q: %v; use host:port, not a Tracker announce URL", addr, err)
+				continue
+			}
+			addresses = append(addresses, addr)
 		}
 	}
 	return addresses
 }
 
-func resolveBootstrapAddress(ctx context.Context, network, address string) (*net.UDPAddr, error) {
+func parseBootstrapAddress(address string) (string, int, error) {
+	if strings.Contains(address, "://") {
+		return "", 0, fmt.Errorf("URL endpoints are not DHT bootstrap nodes")
+	}
 	host, portString, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, err
+		return "", 0, err
 	}
 	port, err := strconv.Atoi(portString)
-	if err != nil || port < 1 || port > 65535 || host == "" {
-		return nil, fmt.Errorf("invalid bootstrap address %q", address)
+	if err != nil || port < 1 || port > 65535 || host == "" || strings.ContainsAny(host, "/?#@ \t\r\n") {
+		return "", 0, fmt.Errorf("expected a hostname or IP and a port between 1 and 65535")
+	}
+	return host, port, nil
+}
+
+func resolveBootstrapAddress(ctx context.Context, network, address string) (*net.UDPAddr, error) {
+	host, port, err := parseBootstrapAddress(address)
+	if err != nil {
+		return nil, err
 	}
 	family := "ip"
 	if network == "udp4" {
@@ -102,7 +124,7 @@ func (bm *bootstrapManager) join() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	addresses := bootstrapAddresses(bm.dht.PrimeNodes)
+	addresses := bm.addresses
 	resolved := make(chan *net.UDPAddr, len(addresses))
 	for _, address := range addresses {
 		go func(address string) {

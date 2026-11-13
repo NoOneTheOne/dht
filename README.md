@@ -146,7 +146,9 @@ Docker 镜像使用与项目 Git 标签完全一致的不可变版本标签，�
 | `mysql.password` | MySQL 密码 |
 | `mysql.database` | MySQL 数据库名 |
 | `mysql.table` | 数据表名（自动创建） |
-| `tracker.list` | DHT Tracker 服务器列表 |
+| `tracker.list` | DHT 引导节点列表，格式为 `host:port` 或 `[IPv6]:port`，不是 Tracker announce URL |
+
+`tracker.list` 会与内置 DHT 引导节点合并去重，空列表使用内置节点。`udp://…/announce`、HTTP(S) Tracker URL 不支持 DHT 引导协议，会在启动时提示并跳过，不会转换后发送 DHT 请求。部署时请同步修改 Runner 本地 `/volume/dht/config.yml` 中的这一列表；仅更新仓库模板不会改变生产配置。
 
 ## API 文档
 
