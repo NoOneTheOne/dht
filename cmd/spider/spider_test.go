@@ -2,11 +2,67 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
+
+func TestWriteMySQLBatches(t *testing.T) {
+	for _, n := range []int{0, 1, 100, 205} {
+		input := make(chan mysql.Data, n)
+		for i := 0; i < n; i++ {
+			input <- mysql.Data{Length: int64(i)}
+		}
+		close(input)
+		var batches, seen int
+		writeMySQLBatches(input, nil, func(items []mysql.Data) error {
+			batches++
+			if len(items) == 0 || len(items) > 100 {
+				t.Fatalf("invalid batch length %d", len(items))
+			}
+			for _, item := range items {
+				if item.Length != int64(seen) {
+					t.Fatal("observation lost or repeated")
+				}
+				seen++
+			}
+			return nil
+		})
+		if seen != n || batches != (n+99)/100 {
+			t.Fatalf("n=%d: saw %d items in %d batches", n, seen, batches)
+		}
+	}
+}
+
+func TestWriteMySQLBatchTickAndFailure(t *testing.T) {
+	input := make(chan mysql.Data)
+	ticks := make(chan time.Time)
+	written := make(chan int, 2)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		writeMySQLBatches(input, ticks, func(items []mysql.Data) error {
+			written <- len(items)
+			return errors.New("uncertain commit")
+		})
+	}()
+	input <- mysql.Data{}
+	ticks <- time.Now()
+	if n := <-written; n != 1 {
+		t.Fatalf("tick flushed %d rows", n)
+	}
+	input <- mysql.Data{}
+	close(input)
+	wg.Wait()
+	if n := <-written; n != 1 || len(written) != 0 {
+		t.Fatal("failed write retried or prevented subsequent flush")
+	}
+}
 
 func TestTorrentFiles(t *testing.T) {
 	entry := func(length interface{}) interface{} {
@@ -19,9 +75,10 @@ func TestTorrentFiles(t *testing.T) {
 		count  int
 		valid  bool
 	}{
-		{"single", map[string]interface{}{"length": 7}, 7, 0, true},
-		{"empty single", map[string]interface{}{"length": 0}, 0, 0, true},
-		{"multiple", map[string]interface{}{"files": []interface{}{entry(2), entry(3)}}, 5, 2, true},
+		{"single", map[string]interface{}{"name": "single", "length": 7}, 7, 1, true},
+		{"single int64", map[string]interface{}{"name": "single", "length": int64(7)}, 7, 1, true},
+		{"empty single", map[string]interface{}{"name": "empty", "length": 0}, 0, 1, true},
+		{"multiple", map[string]interface{}{"name": "multi", "files": []interface{}{entry(2), entry(3)}}, 5, 2, true},
 		{"missing", map[string]interface{}{}, 0, 0, false},
 		{"negative single", map[string]interface{}{"length": -1}, 0, 0, false},
 		{"negative file", map[string]interface{}{"files": []interface{}{entry(-1)}}, 0, 0, false},

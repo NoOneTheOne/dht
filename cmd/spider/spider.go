@@ -22,7 +22,7 @@ import (
 
 type file struct {
 	Path   []interface{} `json:"path"`
-	Length int           `json:"length"`
+	Length int64         `json:"length"`
 }
 
 type bitTorrent struct {
@@ -33,7 +33,28 @@ type bitTorrent struct {
 	Length   int64     `json:"length,omitempty"`
 }
 
+func metadataLength(value interface{}) (int64, bool) {
+	switch length := value.(type) {
+	case int:
+		if length < 0 {
+			return 0, false
+		}
+		return int64(length), true
+	case int64:
+		if length < 0 {
+			return 0, false
+		}
+		return length, true
+	default:
+		return 0, false
+	}
+}
+
 func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
+	name, nameOK := info["name"].(string)
+	if !nameOK || name == "" {
+		return nil, 0, false
+	}
 	if value, exists := info["files"]; exists {
 		if _, exists := info["length"]; exists {
 			return nil, 0, false
@@ -49,8 +70,8 @@ func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
 			if !ok {
 				return nil, 0, false
 			}
-			length, ok := entry["length"].(int)
-			if !ok || length < 0 || int64(length) > math.MaxInt64-total {
+			length, ok := metadataLength(entry["length"])
+			if !ok || length > math.MaxInt64-total {
 				return nil, 0, false
 			}
 			path, ok := entry["path"].([]interface{})
@@ -63,15 +84,45 @@ func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
 				}
 			}
 			files = append(files, file{Path: path, Length: length})
-			total += int64(length)
+			total += length
 		}
 		return files, total, true
 	}
-	length, ok := info["length"].(int)
-	if !ok || length < 0 {
+	length, ok := metadataLength(info["length"])
+	if !ok {
 		return nil, 0, false
 	}
-	return nil, int64(length), true
+	return []file{{Path: []interface{}{name}, Length: length}}, length, true
+}
+
+func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
+	batch := make([]mysql.Data, 0, 100)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := write(batch); err != nil {
+			log.Printf("[mysql] batch write failed for %d observations after safe retries; not replayed because commit outcome may be unknown: %v", len(batch), err)
+		} else {
+			log.Printf("[mysql] persisted %d metadata observations", len(batch))
+		}
+		batch = batch[:0]
+	}
+	for {
+		select {
+		case item, ok := <-input:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, item)
+			if len(batch) == cap(batch) {
+				flush()
+			}
+		case <-ticks:
+			flush()
+		}
+	}
 }
 
 func main() {
@@ -102,7 +153,16 @@ func main() {
 	}
 
 	w := dht.NewWire(65536, 4096, *metadataWorkers)
+	mysqlWrites := make(chan mysql.Data, 100)
+	if c.Storage.Type == "mysql" {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			writeMySQLBatches(mysqlWrites, ticker.C, mysql.WriteBatch)
+		}()
+	}
 	go func() {
+		defer close(mysqlWrites)
 		for resp := range w.Response() {
 			metadata, err := dht.Decode(resp.MetadataInfo)
 			if err != nil {
@@ -115,7 +175,7 @@ func main() {
 			}
 
 			name, ok := info["name"].(string)
-			if !ok {
+			if !ok || name == "" {
 				continue
 			}
 
@@ -127,16 +187,11 @@ func main() {
 
 			switch c.Storage.Type {
 			case "mysql":
-				data := &mysql.Data{
+				mysqlWrites <- mysql.Data{
 					Name:     name,
 					InfoHash: infoHash,
 					Time:     time.Now(),
 					Length:   length,
-				}
-				if err := mysql.Write(data); err != nil {
-					log.Printf("mysql write error: %v", err)
-				} else {
-					log.Printf("[mysql] %s | %s | %d", data.Name, data.InfoHash, data.Length)
 				}
 
 			case "elasticsearch":
@@ -171,13 +226,18 @@ func main() {
 	initConfig.QueryWorkerLimit = *queryWorkers
 	initConfig.QueryTimeout = *queryTimeout
 	log.Printf("[DHT] Listening on UDP %d, query workers=%d timeout=%s, metadata workers=%d", *port, *queryWorkers, *queryTimeout, *metadataWorkers)
-	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
-		if len(infoHash) != 20 {
-			log.Printf("invalid infohash length: %d", len(infoHash))
+	queuePeer := func(infoHash, ip string, peerPort int) {
+		if len(infoHash) != 20 || !dht.IsPublicPeerIP(ip) {
 			return
 		}
 		dht.RecordTorrentDiscovered()
-		w.Request([]byte(infoHash), ip, port)
+		w.Request([]byte(infoHash), ip, peerPort)
+	}
+	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
+		queuePeer(infoHash, ip, port)
+	}
+	initConfig.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
+		queuePeer(infoHash, peer.IP.String(), peer.Port)
 	}
 
 	// Create DHT instance

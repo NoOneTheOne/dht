@@ -75,12 +75,16 @@ func DecodeInt(data []byte, start int) (
 		return
 	}
 
-	result, err = strconv.Atoi(string(data[start+1 : index]))
+	parsed, err := strconv.ParseInt(string(data[start+1:index]), 10, 64)
 	if err != nil {
-		return
+		return nil, 0, err
+	}
+	if strconv.IntSize == 64 || (parsed >= -1<<31 && parsed <= 1<<31-1) {
+		result = int(parsed)
+	} else {
+		result = parsed
 	}
 	index++
-
 	return
 }
 

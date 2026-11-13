@@ -195,5 +195,12 @@ func getRemoteIP() (ip string, err error) {
 
 // genAddress returns a ip:port address.
 func genAddress(ip string, port int) string {
-	return ip + ":" + strconv.Itoa(port)
+	return net.JoinHostPort(ip, strconv.Itoa(port))
+}
+
+func IsPublicPeerIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsGlobalUnicast() && !parsed.IsPrivate() &&
+		!parsed.IsLinkLocalUnicast() && !parsed.IsLoopback() &&
+		!(&net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}).Contains(parsed)
 }

@@ -57,7 +57,7 @@ type InitParam struct {
 	MaxNodes int
 	// callback when got get_peers request
 	OnGetPeers func(string, string, int)
-	// callback when receive get_peers response
+	// OnGetPeersResponse func(string, *Peer)
 	OnGetPeersResponse func(string, *Peer)
 	// callback when got announce_peer request
 	OnAnnouncePeer func(string, string, int)
@@ -142,6 +142,7 @@ type DHT struct {
 	tokenManager       *tokenManager
 	blackList          *blackList
 	bootstrapMgr       *bootstrapManager
+	reachability       *reachabilityCheck
 	ready              atomic.Bool
 	packets            chan packet
 	workerTokens       chan struct{}
@@ -211,6 +212,7 @@ func (dht *DHT) init() {
 	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
 	dht.transactionManager = newTransactionManager(dht.MaxTransactionCursor, dht)
 	dht.bootstrapMgr = newBootstrapManager(dht)
+	dht.reachability = newReachabilityCheck()
 
 	go dht.transactionManager.run()
 	go dht.tokenManager.clear()
@@ -306,6 +308,7 @@ func (dht *DHT) GetPeers(infoHash string) error {
 func (dht *DHT) Run() {
 	dht.init()
 	dht.listen()
+	go dht.reachability.logStartup(dht.conn.LocalAddr().(*net.UDPAddr).Port)
 	dht.ready.Store(true)
 	go dht.join()
 

@@ -2,7 +2,9 @@ package dht
 
 import (
 	"fmt"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -42,6 +44,21 @@ func TestDecodeString(t *testing.T) {
 }
 
 func TestDecodeInt(t *testing.T) {
+	large := "i9223372036854775807e"
+	result, _, err := DecodeInt([]byte(large), 0)
+	if err != nil {
+		t.Fatalf("large DecodeInt() = %v, %v", result, err)
+	}
+	if value, ok := result.(int64); !ok || value != math.MaxInt64 {
+		if strconv.IntSize == 64 {
+			if value, ok := result.(int); !ok || int64(value) != math.MaxInt64 {
+				t.Fatalf("large DecodeInt() = %v", result)
+			}
+		} else {
+			t.Fatalf("large DecodeInt() = %v", result)
+		}
+	}
+
 	tests := []struct {
 		name    string
 		input   string

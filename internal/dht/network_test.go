@@ -223,6 +223,8 @@ func TestWireDeduplicatesActivePeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	// The endpoint remains reserved after Run takes it out of the channel.
+	wire.Request(make([]byte, 20), "::ffff:127.0.0.1", port)
 	listener.SetDeadline(time.Now().Add(50 * time.Millisecond))
 	if duplicate, err := listener.AcceptTCP(); err == nil {
 		duplicate.Close()
@@ -286,7 +288,7 @@ func TestWireQueuedRequestsDeduplicateAndRollback(t *testing.T) {
 	workers.Wait()
 	wire.Request(make([]byte, 20), "127.0.0.1", 6882)
 	wire.Request(make([]byte, 20), "127.0.0.1", 6883)
-	if len(wire.requests) != 2 || wire.queue.Len() != 2 {
+	if len(wire.requests) != 2 || wire.queue.Len() != 2 || wire.infoHashes[string(make([]byte, 20))] != 2 {
 		t.Fatal("duplicate or rejected requests retained queue capacity")
 	}
 	first := <-wire.requests
@@ -298,7 +300,7 @@ func TestWireQueuedRequestsDeduplicateAndRollback(t *testing.T) {
 	if len(wire.requests) != 2 {
 		t.Fatal("overflow reservation was not released")
 	}
-	wire.queue.Delete(string(first.InfoHash) + ":" + genAddress(first.IP, first.Port))
+	wire.releaseRequest(first)
 	<-wire.requests
 	wire.Request(first.InfoHash, first.IP, first.Port)
 	if len(wire.requests) != 2 {
@@ -306,12 +308,116 @@ func TestWireQueuedRequestsDeduplicateAndRollback(t *testing.T) {
 	}
 }
 
+func TestWireLimitsRequestsPerHash(t *testing.T) {
+	wire := NewWire(10, 128, 1)
+	hash := make([]byte, 20)
+	var workers sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		workers.Add(1)
+		go func(port int) {
+			defer workers.Done()
+			wire.Request(hash, "127.0.0.1", port)
+		}(10000 + i)
+	}
+	workers.Wait()
+	if len(wire.requests) != 3 || wire.queue.Len() != 3 || wire.infoHashes[string(hash)] != 3 {
+		t.Fatal("same hash did not retain exactly three distinct peer opportunities")
+	}
+	otherHash := make([]byte, 20)
+	otherHash[0] = 1
+	wire.Request(otherHash, "127.0.0.1", 6881)
+	if len(wire.requests) != 4 || wire.infoHashes[string(otherHash)] != 1 {
+		t.Fatal("busy hash blocked another hash")
+	}
+	// Taking a request from the channel does not free its active reservation.
+	active := <-wire.requests
+	wire.Request(hash, "127.0.0.1", 20000)
+	if len(wire.requests) != 3 || wire.queue.Len() != 4 {
+		t.Fatal("active request was not counted toward the per-hash limit")
+	}
+	wire.releaseRequest(active)
+	wire.Request(hash, "127.0.0.1", 20000)
+	if len(wire.requests) != 4 || wire.infoHashes[string(hash)] != 3 {
+		t.Fatal("released slot did not admit another peer")
+	}
+	for len(wire.requests) != 0 {
+		wire.releaseRequest(<-wire.requests)
+	}
+	if wire.queue.Len() != 0 || len(wire.infoHashes) != 0 {
+		t.Fatal("completed requests retained hash reservations")
+	}
+	wire.Request(active.InfoHash, active.IP, active.Port)
+	if len(wire.requests) != 1 {
+		t.Fatal("completed hash and endpoint were permanently cached")
+	}
+}
+
+func TestWireBlacklistDiscardReleasesRequests(t *testing.T) {
+	wire := NewWire(10, 3, 1)
+	hash := make([]byte, 20)
+	for port := 6881; port <= 6883; port++ {
+		wire.Request(hash, "127.0.0.1", port)
+		wire.blackList.insert("127.0.0.1", port)
+	}
+	close(wire.requests)
+	wire.Run()
+	wire.queue.Lock()
+	defer wire.queue.Unlock()
+	if len(wire.queue.data) != 0 || len(wire.infoHashes) != 0 || len(wire.workerTokens) != 0 {
+		t.Fatal("blacklisted requests retained reservations or started workers")
+	}
+}
+
+func TestWireFailedWorkerReleasesRequests(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	wire := NewWire(10, 10, 1)
+	hash := make([]byte, 20)
+	port := listener.Addr().(*net.TCPAddr).Port
+	done := make(chan struct{})
+	go func() {
+		wire.Run()
+		close(done)
+	}()
+	defer func() {
+		close(wire.requests)
+		<-done
+	}()
+	for attempt := 0; attempt < 2; attempt++ {
+		wire.Request(hash, "127.0.0.1", port)
+		listener.SetDeadline(time.Now().Add(time.Second))
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close() // Fail the handshake, without blacklisting the endpoint.
+		deadline := time.Now().Add(time.Second)
+		for {
+			wire.queue.Lock()
+			empty := len(wire.queue.data) == 0 && len(wire.infoHashes) == 0
+			wire.queue.Unlock()
+			if empty {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("failed download retained endpoint or hash reservation")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func TestWireFullQueueDoesNotBlock(t *testing.T) {
 	wire := NewWire(10, 1, 1)
 	wire.Request(make([]byte, 20), "127.0.0.1", 6881)
+	otherHash := make([]byte, 20)
+	otherHash[0] = 1
 	done := make(chan struct{})
 	go func() {
-		wire.Request(make([]byte, 20), "127.0.0.1", 6882)
+		wire.Request(otherHash, "127.0.0.1", 6882)
 		close(done)
 	}()
 	select {
@@ -319,7 +425,13 @@ func TestWireFullQueueDoesNotBlock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("full metadata queue blocked DHT packet handler")
 	}
-	if len(wire.requests) != 1 {
-		t.Fatal("queue capacity was not respected")
+	if len(wire.requests) != 1 || wire.queue.Len() != 1 || len(wire.infoHashes) != 1 {
+		t.Fatal("full queue retained a rejected hash or endpoint")
+	}
+	first := <-wire.requests
+	wire.releaseRequest(first)
+	wire.Request(otherHash, "127.0.0.1", 6882)
+	if len(wire.requests) != 1 || wire.infoHashes[string(otherHash)] != 1 {
+		t.Fatal("full queue prevented a later retry for another hash")
 	}
 }

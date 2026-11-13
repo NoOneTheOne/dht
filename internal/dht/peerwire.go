@@ -33,6 +33,7 @@ const (
 	maxWireMessageSize      = BLOCK + 2 + 1024
 	metadataDownloadTimeout = time.Minute
 	localMetadataID         = 1
+	maxRequestsPerInfoHash  = 3
 )
 
 var errWireMessageTooLarge = errors.New("peer wire message too large")
@@ -98,15 +99,14 @@ func readMessage(conn net.Conn, data *bytes.Buffer) (
 
 // sendMessage sends data to the connection.
 func sendMessage(conn net.Conn, data []byte) error {
-	length := int32(len(data))
-
-	buffer := bytes.NewBuffer(nil)
-	if err := binary.Write(buffer, binary.BigEndian, length); err != nil {
-		return err
-	}
-
+	frame := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
+	copy(frame[4:], data)
 	conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
-	_, err := conn.Write(append(buffer.Bytes(), data...))
+	n, err := conn.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -198,6 +198,7 @@ type Response struct {
 type Wire struct {
 	blackList    *blackList
 	queue        *syncedMap
+	infoHashes   map[string]int // Queued and active requests, guarded by queue's lock.
 	requests     chan Request
 	responses    chan Response
 	workerTokens chan struct{}
@@ -211,6 +212,7 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 	return &Wire{
 		blackList:    newBlackList(blackListSize),
 		queue:        newSyncedMap(),
+		infoHashes:   make(map[string]int),
 		requests:     make(chan Request, requestQueueSize),
 		responses:    make(chan Response, 1024),
 		workerTokens: make(chan struct{}, workerQueueSize),
@@ -219,20 +221,54 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 
 // Request pushes the request to the queue.
 func (wire *Wire) Request(infoHash []byte, ip string, port int) {
-	if len(infoHash) != 20 || port < 1 || port > 65535 || wire.blackList.in(ip, port) {
+	if len(infoHash) != 20 || port < 1 || port > 65535 {
 		return
 	}
-	key := string(infoHash) + ":" + genAddress(ip, port)
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil || parsedIP.IsUnspecified() || parsedIP.IsMulticast() ||
+		parsedIP.IsLinkLocalUnicast() {
+		return
+	}
+	ip = parsedIP.String()
+	if wire.blackList.in(ip, port) {
+		return
+	}
+	hashKey := string(infoHash)
+	key := hashKey + ":" + genAddress(ip, port)
 	wire.queue.Lock()
 	defer wire.queue.Unlock()
+	if wire.infoHashes[hashKey] >= maxRequestsPerInfoHash {
+		return
+	}
 	if _, exists := wire.queue.data[key]; exists {
 		return
 	}
 	wire.queue.data[key] = struct{}{}
+	wire.infoHashes[hashKey]++
 	select {
 	case wire.requests <- Request{InfoHash: bytes.Clone(infoHash), IP: ip, Port: port}:
 	default:
 		delete(wire.queue.data, key)
+		wire.infoHashes[hashKey]--
+		if wire.infoHashes[hashKey] == 0 {
+			delete(wire.infoHashes, hashKey)
+		}
+	}
+}
+
+// releaseRequest forgets an endpoint and its hash reservation after completion or discard.
+func (wire *Wire) releaseRequest(r Request) {
+	hashKey := string(r.InfoHash)
+	key := hashKey + ":" + genAddress(r.IP, r.Port)
+	wire.queue.Lock()
+	defer wire.queue.Unlock()
+	if _, exists := wire.queue.data[key]; !exists {
+		return
+	}
+	delete(wire.queue.data, key)
+	wire.infoHashes[hashKey]--
+	if wire.infoHashes[hashKey] == 0 {
+		delete(wire.infoHashes, hashKey)
 	}
 }
 
@@ -441,18 +477,17 @@ func (wire *Wire) Run() {
 	go wire.blackList.clear()
 
 	for r := range wire.requests {
-		key := string(r.InfoHash) + ":" + genAddress(r.IP, r.Port)
 		if wire.blackList.in(r.IP, r.Port) {
-			wire.queue.Delete(key)
+			wire.releaseRequest(r)
 			continue
 		}
 		wire.workerTokens <- struct{}{}
-		go func(r Request, key string) {
+		go func(r Request) {
 			defer func() {
-				wire.queue.Delete(key)
+				wire.releaseRequest(r)
 				<-wire.workerTokens
 			}()
 			wire.fetchMetadata(r)
-		}(r, key)
+		}(r)
 	}
 }

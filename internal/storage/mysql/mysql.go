@@ -3,7 +3,10 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +21,7 @@ import (
 type Data struct {
 	Name     string    `gorm:"column:name;type:varchar(512);not null" json:"name"`
 	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey" json:"infohash"`
-	Time     time.Time `gorm:"column:time;not null" json:"time"`
+	Time     time.Time `gorm:"column:time;not null;index" json:"time"`
 	Length   int64     `gorm:"column:length;default:0" json:"length"`
 	Count    int64     `gorm:"column:count;default:1" json:"count"`
 }
@@ -35,13 +38,11 @@ const (
 
 var (
 	db     *gorm.DB
-	dbMu   sync.Mutex
+	dbMu   sync.RWMutex
 	initDB = openDB
 )
 
-func getCfg() *config.Config {
-	return config.GetConfig()
-}
+var getCfg = config.GetConfig
 
 func mysqlDSN(c *config.Config) string {
 	dsn := mysqlDriver.NewConfig()
@@ -60,6 +61,12 @@ func mysqlDSN(c *config.Config) string {
 }
 
 func GetDB() (*gorm.DB, error) {
+	dbMu.RLock()
+	cached := db
+	dbMu.RUnlock()
+	if cached != nil {
+		return cached, nil
+	}
 	dbMu.Lock()
 	defer dbMu.Unlock()
 	if db != nil {
@@ -103,37 +110,106 @@ func openDB() (*gorm.DB, error) {
 }
 
 func Write(d *Data) error {
-	db, err := GetDB()
+	return WriteBatch([]Data{*d})
+}
+
+func aggregateWrites(items []Data) ([]Data, error) {
+	grouped := make(map[string]Data, len(items))
+	for _, item := range items {
+		var hash [20]byte
+		if len(item.InfoHash) != 40 {
+			return nil, fmt.Errorf("infohash must be 40 hexadecimal characters")
+		}
+		if _, err := hex.Decode(hash[:], []byte(item.InfoHash)); err != nil {
+			return nil, fmt.Errorf("infohash must be 40 hexadecimal characters")
+		}
+		item.InfoHash = strings.ToLower(item.InfoHash)
+		if existing, ok := grouped[item.InfoHash]; ok {
+			existing.Count++
+			grouped[item.InfoHash] = existing
+			continue
+		}
+		item.Name = strings.ToValidUTF8(item.Name, "")
+		characters := 0
+		for offset := range item.Name {
+			if characters == 512 {
+				item.Name = item.Name[:offset]
+				break
+			}
+			characters++
+		}
+		item.Count = 1
+		grouped[item.InfoHash] = item
+	}
+	rows := make([]Data, 0, len(grouped))
+	for _, item := range grouped {
+		rows = append(rows, item)
+	}
+	// Consistent primary-key lock order reduces deadlocks between concurrent batches.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].InfoHash < rows[j].InfoHash })
+	return rows, nil
+}
+
+func retryUncommitted(ctx context.Context, write func() (bool, error)) error {
+	for attempt := 0; ; attempt++ {
+		retryable, err := write()
+		if err == nil || !retryable || attempt == 2 {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
+func WriteBatch(items []Data) error {
+	if len(items) == 0 {
+		return nil
+	}
+	rows, err := aggregateWrites(items)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
 	defer cancel()
-	d.Name = strings.ToValidUTF8(d.Name, "")
-	return db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "infohash"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("`count` + 1")}),
-	}).Create(d).Error
+	return retryUncommitted(ctx, func() (bool, error) {
+		db, err := GetDB()
+		if err != nil {
+			return true, err
+		}
+		err = db.WithContext(ctx).Session(&gorm.Session{SkipDefaultTransaction: true}).Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "infohash"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)")}),
+		}).Create(&rows).Error
+		var mysqlErr *mysqlDriver.MySQLError
+		return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213, err
+	})
 }
 
-func Search(name string) ([]Data, int64, error) {
-	var results []Data
-	var total int64
+func Search(parent context.Context, name string) ([]Data, int64, error) {
+	results := make([]Data, 0, 50)
 
 	db, err := GetDB()
 	if err != nil {
 		return nil, 0, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
 	defer cancel()
 	escaped := escapeLike(name)
 	query := db.WithContext(ctx).Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
 
-	if err := query.Count(&total).Error; err != nil {
+	if err := query.Session(&gorm.Session{}).Order("`time` DESC, `infohash` DESC").Limit(50).Find(&results).Error; err != nil {
 		return nil, 0, err
 	}
-	if err := query.Order("`time` DESC").Limit(50).Find(&results).Error; err != nil {
-		return nil, 0, err
+	total := int64(len(results))
+	if len(results) == 50 {
+		if err := query.Count(&total).Error; err != nil {
+			return nil, 0, err
+		}
 	}
 	return results, total, nil
 }

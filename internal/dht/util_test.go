@@ -114,10 +114,17 @@ func TestDecodeCompactIPPortInfoInvalidLength(t *testing.T) {
 }
 
 func TestGenAddress(t *testing.T) {
-	got := genAddress("192.168.1.1", 6881)
-	want := "192.168.1.1:6881"
-	if got != want {
-		t.Errorf("genAddress = %v, want %v", got, want)
+	for _, tc := range []struct {
+		ip   string
+		want string
+	}{
+		{"192.168.1.1", "192.168.1.1:6881"},
+		{"::1", "[::1]:6881"},
+		{"2001:db8::1", "[2001:db8::1]:6881"},
+	} {
+		if got := genAddress(tc.ip, 6881); got != tc.want {
+			t.Errorf("genAddress(%q) = %q, want %q", tc.ip, got, tc.want)
+		}
 	}
 }
 

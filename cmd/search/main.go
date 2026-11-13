@@ -65,7 +65,7 @@ func main() {
 		}
 
 		start := time.Now()
-		results, total, err := mysql.Search(name)
+		results, total, err := mysql.Search(c.Request.Context(), name)
 		duration := time.Since(start)
 		metrics.RecordMySQLQuery("search", duration, err)
 

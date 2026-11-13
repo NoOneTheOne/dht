@@ -128,6 +128,9 @@ func makeError(t string, errCode int, errMsg string) map[string]interface{} {
 
 // send data to the udp.
 func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
+	if dht.reachability != nil {
+		dht.reachability.recordSend(addr)
+	}
 	dht.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err := dht.conn.WriteToUDP([]byte(Encode(data)), addr)
 	if err == nil {
@@ -455,6 +458,12 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 
 	q := response["q"].(string)
 	a := response["a"].(map[string]interface{})
+	unsolicited := dht.reachability != nil && dht.reachability.unsolicited(addr)
+	defer func() {
+		if success && unsolicited {
+			dht.reachability.recordInbound(addr)
+		}
+	}()
 
 	if err := ParseKey(a, "id", "string"); err != nil {
 		send(dht, addr, makeError(t, protocolError, err.Error()))
@@ -488,17 +497,16 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			"id": dht.id(id),
 		}))
 	case findNodeType:
+		if err := ParseKey(a, "target", "string"); err != nil {
+			send(dht, addr, makeError(t, protocolError, err.Error()))
+			return
+		}
+		target := a["target"].(string)
+		if len(target) != 20 {
+			send(dht, addr, makeError(t, protocolError, "invalid target"))
+			return
+		}
 		if dht.IsStandardMode() {
-			if err := ParseKey(a, "target", "string"); err != nil {
-				send(dht, addr, makeError(t, protocolError, err.Error()))
-				return
-			}
-
-			target := a["target"].(string)
-			if len(target) != 20 {
-				send(dht, addr, makeError(t, protocolError, "invalid target"))
-				return
-			}
 
 			var nodes string
 			targetID := newBitmapFromString(target)
@@ -694,6 +702,12 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	a := trans.data["a"].(map[string]interface{})
 	r := response["r"].(map[string]interface{})
 
+	if q == findNodeType {
+		if err := ParseKey(a, "target", "string"); err != nil || len(a["target"].(string)) != 20 {
+			return
+		}
+	}
+
 	if err := ParseKey(r, "id", "string"); err != nil {
 		return
 	}
@@ -763,6 +777,9 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	default:
 	}
 
+	if dht.reachability != nil {
+		dht.reachability.recordResponse()
+	}
 	dht.blackList.delete(addr.IP.String(), addr.Port)
 	dht.routingTable.Insert(node)
 

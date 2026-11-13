@@ -12,6 +12,73 @@ import (
 	"time"
 )
 
+type discardWireConn struct {
+	net.Conn
+}
+
+func (discardWireConn) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (discardWireConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func BenchmarkSendMessage(b *testing.B) {
+	for _, size := range []int{32, BLOCK} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			payload := make([]byte, size)
+			conn := discardWireConn{}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := sendMessage(conn, payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type shortWireConn struct {
+	discardWireConn
+}
+
+func (shortWireConn) Write(data []byte) (int, error) {
+	return len(data) - 1, nil
+}
+
+func TestSendMessageShortWrite(t *testing.T) {
+	if err := sendMessage(shortWireConn{}, []byte("payload")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short write = %v", err)
+	}
+}
+
+func TestSendMessageFrame(t *testing.T) {
+	for _, size := range []int{0, 32, BLOCK} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			client, peer := net.Pipe()
+			defer client.Close()
+			defer peer.Close()
+			payload := bytes.Repeat([]byte{'x'}, size)
+			done := make(chan error, 1)
+			go func() { done <- sendMessage(client, payload) }()
+			if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			frame := make([]byte, 4+size)
+			if _, err := io.ReadFull(peer, frame); err != nil {
+				t.Fatal(err)
+			}
+			if binary.BigEndian.Uint32(frame[:4]) != uint32(size) || !bytes.Equal(frame[4:], payload) {
+				t.Fatal("wire frame changed")
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestPeerWireMetadataBounds(t *testing.T) {
 	for _, tc := range []struct{ id, size int }{
 		{0, 1}, {-1, 1}, {256, 1}, {1, 0}, {1, -1}, {1, MaxMetadataSize + 1},
@@ -119,6 +186,63 @@ func TestPeerWireRequestCopiesHash(t *testing.T) {
 	request := <-wire.requests
 	if request.InfoHash[0] != 'h' {
 		t.Fatal("queued request aliases caller memory")
+	}
+}
+
+func TestPeerWireRequestValidatesIP(t *testing.T) {
+	for _, ip := range []string{
+		"", "localhost", "example.com", "127.0.0.1:6881", "[::1]", "fe80::1%lo0",
+		"999.1.1.1", "2001:db8:::1", "0.0.0.0", "::", "::ffff:0.0.0.0",
+		"224.0.0.1", "239.255.255.250", "ff02::1", "169.254.1.1", "fe80::1",
+	} {
+		t.Run(ip, func(t *testing.T) {
+			wire := NewWire(8, 1, 1)
+			wire.Request(make([]byte, 20), ip, 6881)
+			if len(wire.requests) != 0 || wire.queue.Len() != 0 || len(wire.infoHashes) != 0 {
+				t.Fatal("invalid IP reserved request capacity")
+			}
+		})
+	}
+	for _, ip := range []string{"127.0.0.1", "::1", "192.168.1.1", "10.0.0.1", "172.16.0.1", "fd00::1", "2001:4860:4860::8888"} {
+		t.Run(ip, func(t *testing.T) {
+			wire := NewWire(8, 1, 1)
+			wire.Request(make([]byte, 20), ip, 6881)
+			if len(wire.requests) != 1 {
+				t.Fatal("valid local or global IP rejected")
+			}
+			if r := <-wire.requests; r.IP != net.ParseIP(ip).String() {
+				t.Fatalf("queued IP = %q", r.IP)
+			}
+		})
+	}
+}
+
+func TestPeerWireRequestCanonicalizesIP(t *testing.T) {
+	for _, tc := range []struct {
+		first, second, want string
+	}{
+		{"::ffff:127.0.0.1", "127.0.0.1", "127.0.0.1"},
+		{"2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::1", "2001:db8::1"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			wire := NewWire(8, 8, 1)
+			hash := make([]byte, 20)
+			wire.Request(hash, tc.first, 6881)
+			wire.Request(hash, tc.second, 6881)
+			if len(wire.requests) != 1 || wire.queue.Len() != 1 || wire.infoHashes[string(hash)] != 1 {
+				t.Fatal("equivalent IP spellings were not deduplicated")
+			}
+			r := <-wire.requests
+			if r.IP != tc.want {
+				t.Fatalf("queued IP = %q, want %q", r.IP, tc.want)
+			}
+			wire.releaseRequest(r)
+			wire.blackList.insert(tc.want, 6881)
+			wire.Request(hash, tc.first, 6881)
+			if len(wire.requests) != 0 || wire.queue.Len() != 0 || len(wire.infoHashes) != 0 {
+				t.Fatal("noncanonical IP spelling bypassed blacklist")
+			}
+		})
 	}
 }
 
