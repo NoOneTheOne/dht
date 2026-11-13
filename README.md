@@ -6,7 +6,7 @@
 
 项目遵循语义化版本规范（Semantic Versioning），版本格式为 `vMAJOR.MINOR.PATCH`。
 
-当前稳定版本为 **`v1.0.2`**，作为后续版本变更的基线。
+当前稳定版本为 **`v1.0.3`**，作为后续版本变更的基线。
 
 ### 版本号变更规则
 
@@ -117,7 +117,7 @@ docker compose down
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `DHT_PORT` | `6881` | Spider UDP 监听端口 |
-| `DHT_IMAGE_TAG` | 必填 | Docker 镜像不可变版本标签，必须与项目 Git 标签一致，例如 `v1.0.2` |
+| `DHT_IMAGE_TAG` | 必填 | Docker 镜像不可变版本标签，必须与项目 Git 标签一致，例如 `v1.0.3` |
 | `DHT_QUERY_WORKERS` | `64` | DHT 并发查询数 |
 | `DHT_QUERY_TIMEOUT` | `5s` | 单次 DHT 查询超时 |
 | `DHT_METADATA_WORKERS` | `64` | 元数据并发抓取数 |
@@ -129,7 +129,7 @@ docker compose down
 Docker 镜像使用与项目 Git 标签完全一致的不可变版本标签，格式为 `vMAJOR.MINOR.PATCH`，禁止使用 `latest` 或其他浮动标签。
 
 - `main` 分支只执行 CI 验证，不执行部署。
-- 只有正式版本标签（例如 `v1.0.2`）可以触发部署。
+- 只有正式版本标签（例如 `v1.0.3`）可以触发部署。
 - Compose 启动必须提供 `DHT_IMAGE_TAG`，未设置时直接失败，避免生成无版本镜像。
 - 每次发布必须使用新的版本号和新的镜像标签，不覆盖已发布标签。
 - CI/CD 在自托管 Runner 本地构建并保留镜像；同名镜像仅在版本和 Git 提交标签均一致时复用，否则拒绝部署，不推送镜像仓库。
@@ -301,7 +301,7 @@ go run api/search/search.go
 docker compose build
 
 # 构建单个服务
-DHT_IMAGE_TAG=v1.0.2 docker compose build
+DHT_IMAGE_TAG=v1.0.3 docker compose build
 ```
 
 ### 项目结构
@@ -340,6 +340,8 @@ DHT_IMAGE_TAG=v1.0.2 docker compose build
 5. 构建缺失的版本镜像；已存在的同版本同提交镜像直接复用，拒绝覆盖冲突镜像。
 6. 构建成功后执行 `up --no-build --pull never --wait`，不提前停止旧服务。
 7. 检查两个服务的运行状态、Search `/health` 和容器实际镜像 ID；保留历史版本镜像，不自动清理或回滚。
+
+`v1.0.3` 发布内容：修复 Tracker announce URL 被当作 DHT 引导节点的问题，启动时校验并跳过无效地址，避免重试时重复报错，修正配置模板并移除 DNS 失败的默认节点。
 
 `v1.0.2` 发布内容：统一 Git 与镜像版本，增加防覆盖检查和版本/提交镜像标签，修复部署成功判定，避免构建失败造成提前停机。
 
