@@ -20,6 +20,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-search ./cmd/search
 
 FROM alpine:3.21 AS spider
 
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.version=$VERSION \
+      org.opencontainers.image.revision=$REVISION
+
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 1000 appuser
 
@@ -33,6 +38,11 @@ CMD ["./dht-spider"]
 
 FROM alpine:3.21 AS getpeers
 
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.version=$VERSION \
+      org.opencontainers.image.revision=$REVISION
+
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 1000 appuser
 
@@ -43,6 +53,11 @@ USER appuser
 CMD ["./dht-getpeers"]
 
 FROM alpine:3.21 AS search
+
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.version=$VERSION \
+      org.opencontainers.image.revision=$REVISION
 
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 1000 appuser

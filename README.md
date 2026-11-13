@@ -6,7 +6,7 @@
 
 项目遵循语义化版本规范（Semantic Versioning），版本格式为 `vMAJOR.MINOR.PATCH`。
 
-当前稳定版本为 **`v1.0.1`**，作为后续版本变更的基线。
+当前稳定版本为 **`v1.0.2`**，作为后续版本变更的基线。
 
 ### 版本号变更规则
 
@@ -68,6 +68,7 @@ cd dht
 
 ```bash
 cp config/config.yml.example config/config.yml
+cp .env.example .env
 vim config/config.yml
 ```
 
@@ -116,8 +117,24 @@ docker compose down
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `DHT_PORT` | `6881` | Spider UDP 监听端口 |
+| `DHT_IMAGE_TAG` | 必填 | Docker 镜像不可变版本标签，必须与项目 Git 标签一致，例如 `v1.0.2` |
+| `DHT_QUERY_WORKERS` | `64` | DHT 并发查询数 |
+| `DHT_QUERY_TIMEOUT` | `5s` | 单次 DHT 查询超时 |
+| `DHT_METADATA_WORKERS` | `64` | 元数据并发抓取数 |
 | `SEARCH_PORT` | `30080` | Search API HTTP 端口 |
 | `CONFIG_FILE_PATH` | `./config.yml` | 配置文件路径（容器内） |
+
+### 镜像版本控制
+
+Docker 镜像使用与项目 Git 标签完全一致的不可变版本标签，格式为 `vMAJOR.MINOR.PATCH`，禁止使用 `latest` 或其他浮动标签。
+
+- `main` 分支只执行 CI 验证，不执行部署。
+- 只有正式版本标签（例如 `v1.0.2`）可以触发部署。
+- Compose 启动必须提供 `DHT_IMAGE_TAG`，未设置时直接失败，避免生成无版本镜像。
+- 每次发布必须使用新的版本号和新的镜像标签，不覆盖已发布标签。
+- CI/CD 在自托管 Runner 本地构建并保留镜像；同名镜像仅在版本和 Git 提交标签均一致时复用，否则拒绝部署，不推送镜像仓库。
+- 部署串行执行，并拒绝用低于当前运行镜像的版本覆盖服务，避免较慢的旧发布任务倒序部署。
+- 不可变检查由本项目部署流程执行；手动 Docker 操作仍可覆盖标签，已发布镜像不得手动重建或重新标记。
 
 ### 配置文件
 
@@ -282,8 +299,7 @@ go run api/search/search.go
 docker compose build
 
 # 构建单个服务
-docker build --target spider -t dht-spider .
-docker build --target search -t dht-search .
+DHT_IMAGE_TAG=v1.0.2 docker compose build
 ```
 
 ### 项目结构
@@ -315,18 +331,25 @@ docker build --target search -t dht-search .
 项目使用 GitHub Actions 自动部署到自托管 Runner。
 
 **工作流**：
-1. Push 到 `main` 分支触发
-2. 从 Runner 本地 `/volume/dht/config.yml` 复制配置
-3. 构建 Docker 镜像
-4. 启动服务
-5. 验证服务状态
-6. 清理旧镜像
+1. `main` 推送和 PR 运行格式、静态检查、竞态测试、二进制及 Docker 各目标构建验证，不部署。
+2. 推送 `vX.Y.Z` 正式标签后，通过相同验证再串行进入自托管 Runner 部署。
+3. 校验 Git 标签与 `.env.example` 中的项目版本一致，且发布提交属于 `main`。
+4. 从 Runner 本地 `/volume/dht/config.yml` 复制配置，并校验 Compose 配置。
+5. 构建缺失的版本镜像；已存在的同版本同提交镜像直接复用，拒绝覆盖冲突镜像。
+6. 构建成功后执行 `up --no-build --pull never --wait`，不提前停止旧服务。
+7. 检查两个服务的运行状态、Search `/health` 和容器实际镜像 ID；保留历史版本镜像，不自动清理或回滚。
+
+`v1.0.2` 发布内容：统一 Git 与镜像版本，增加防覆盖检查和版本/提交镜像标签，修复部署成功判定，避免构建失败造成提前停机。
+
+Runner 需安装支持 `up --wait` 的 Docker Compose v2，并能读取 `/volume/dht/config.yml`、访问外部 MySQL 和拉取基础镜像；配置副本所在目录仅 Runner 用户可访问，文件允许容器内 UID 1000 读取。
 
 **Runner 配置**：
 ```bash
 # 在 Runner 机器上放置配置文件
 sudo mkdir -p /volume/dht
 sudo cp config.yml /volume/dht/config.yml
+# 将 runner-user 替换为实际运行 GitHub Actions Runner 的账户
+sudo chown runner-user /volume/dht/config.yml
 sudo chmod 600 /volume/dht/config.yml
 ```
 

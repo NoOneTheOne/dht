@@ -7,35 +7,40 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
       - name: gofmt
         run: |
-          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
-            echo "The following files are not formatted correctly:"
-            gofmt -l .
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
             exit 1
           fi
       - name: go vet
         run: go vet ./...
-      - name: build
-        run: go build ./...
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
       - name: Run tests
         run: go test -race -count=1 -coverprofile=coverage.out ./...
       - name: Upload coverage
@@ -46,7 +51,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint, test]
     strategy:
       matrix:
@@ -55,57 +60,106 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
-      - name: Build
+          go-version-file: go.mod
+      - name: Build binary
         run: go build -ldflags "-s -w" -o build/dht-${{ matrix.binary }} ./cmd/${{ matrix.binary }}
+      - name: Validate Docker target
+        env:
+          TARGET: ${{ matrix.binary }}
+          REVISION: ${{ github.sha }}
+        run: |
+          version=""
+          while IFS='=' read -r key value; do
+            if [[ "$key" == DHT_IMAGE_TAG ]]; then version="$value"; fi
+          done < .env.example
+          [[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          docker build --target "$TARGET" --build-arg VERSION="$version" --build-arg REVISION="$REVISION" .
 
   deploy:
     name: Deploy
     runs-on: self-hosted
     needs: [build]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref_type == 'tag' && github.event_name == 'push'
+    concurrency:
+      group: dht-production
+      cancel-in-progress: false
+    env:
+      DHT_IMAGE_TAG: ${{ github.ref_name }}
+      DHT_IMAGE_REVISION: ${{ github.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up config.yml from runner-local path
+      - name: Validate release version and main ancestry
         run: |
-          mkdir -p config
-          if [ -f /volume/dht/config.yml ]; then
-            cp /volume/dht/config.yml config/config.yml
-            echo "config.yml copied from /volume/dht/"
-          else
-            echo "ERROR: /volume/dht/config.yml not found on runner."
+          [[ "$DHT_IMAGE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "ERROR: deployment requires a formal vX.Y.Z version"
             exit 1
-          fi
+          }
+          expected=""
+          while IFS='=' read -r key value; do
+            if [[ "$key" == DHT_IMAGE_TAG ]]; then expected="$value"; fi
+          done < .env.example
+          [[ "$DHT_IMAGE_TAG" == "$expected" ]] || {
+            echo "ERROR: Git tag does not match the project image version"
+            exit 1
+          }
+          git merge-base --is-ancestor "$DHT_IMAGE_REVISION" origin/main
 
-      - name: Stop existing services
-        run: docker compose down --remove-orphans || true
-
-      - name: Build and start services
+      - name: Prepare configuration
         run: |
-          docker compose build
-          docker compose up -d
+          test -r /volume/dht/config.yml || {
+            echo "ERROR: /volume/dht/config.yml is not readable on runner"
+            exit 1
+          }
+          install -d -m 700 config
+          install -m 644 /volume/dht/config.yml config/config.yml
+          docker compose config --quiet
 
-      - name: Verify services are running
+      - name: Build missing images without overwriting released tags
         run: |
-          echo "Waiting for services to start..."
-          for i in $(seq 1 12); do
-            if docker compose ps --format json | grep -q '"running"'; then
-              echo "Services are up!"
-              break
+          docker info > /dev/null
+          for service in dht-spider dht-search; do
+            running=$(docker ps --filter "name=^/$service$" --format '{{.ID}}')
+            if [[ -n "$running" ]]; then
+              current=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$running")
+              if [[ "$current" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                newest=$(printf '%s\n' "$current" "$DHT_IMAGE_TAG" | sort -V | tail -n 1)
+                [[ "$newest" == "$DHT_IMAGE_TAG" ]] || {
+                  echo "ERROR: refusing to replace $current with older release $DHT_IMAGE_TAG"
+                  exit 1
+                }
+              fi
             fi
-            if [ "$i" -eq 12 ]; then
-              echo "ERROR: Services failed to start within 60 seconds"
-              docker compose ps
-              docker compose logs --tail=50
-              exit 1
+            image="$service:$DHT_IMAGE_TAG"
+            if docker image inspect "$image" > /dev/null 2>&1; then
+              version=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")
+              revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")
+              if [[ "$version" != "$DHT_IMAGE_TAG" || "$revision" != "$DHT_IMAGE_REVISION" ]]; then
+                echo "ERROR: existing image $image belongs to another release; use a new version"
+                exit 1
+              fi
+              echo "Reusing immutable image $image"
+            else
+              docker compose build "$service"
             fi
-            sleep 5
           done
-          echo "=== Docker Compose Status ==="
+
+      - name: Start and verify services
+        run: |
+          docker compose up -d --no-build --pull never --wait --wait-timeout 90
+          for service in dht-spider dht-search; do
+            container=$(docker compose ps -q "$service")
+            test -n "$container"
+            [[ "$(docker inspect --format '{{.State.Status}}' "$container")" == running ]]
+            expected=$(docker image inspect --format '{{.Id}}' "$service:$DHT_IMAGE_TAG")
+            actual=$(docker inspect --format '{{.Image}}' "$container")
+            [[ "$actual" == "$expected" ]]
+          done
           docker compose ps
 
-      - name: Cleanup unused images
-        if: always()
-        run: docker image prune -f
+      - name: Report deployment failure
+        if: failure()
+        run: docker compose ps --all
