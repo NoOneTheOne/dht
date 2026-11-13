@@ -80,14 +80,14 @@ func TestTorrentFiles(t *testing.T) {
 		{"empty single", map[string]interface{}{"name": "empty", "length": 0}, 0, 1, true},
 		{"multiple", map[string]interface{}{"name": "multi", "files": []interface{}{entry(2), entry(3)}}, 5, 2, true},
 		{"missing", map[string]interface{}{}, 0, 0, false},
-		{"negative single", map[string]interface{}{"length": -1}, 0, 0, false},
-		{"negative file", map[string]interface{}{"files": []interface{}{entry(-1)}}, 0, 0, false},
-		{"overflow", map[string]interface{}{"files": []interface{}{entry(int(math.MaxInt64)), entry(1)}}, 0, 0, false},
-		{"bad length", map[string]interface{}{"files": []interface{}{entry("2")}}, 0, 0, false},
-		{"bad files", map[string]interface{}{"files": "invalid"}, 0, 0, false},
-		{"bad file", map[string]interface{}{"files": []interface{}{2}}, 0, 0, false},
-		{"bad path", map[string]interface{}{"files": []interface{}{map[string]interface{}{"length": 2, "path": []interface{}{2}}}}, 0, 0, false},
-		{"conflicting", map[string]interface{}{"length": 5, "files": []interface{}{entry(5)}}, 0, 0, false},
+		{"negative single", map[string]interface{}{"name": "single", "length": -1}, 0, 0, false},
+		{"negative file", map[string]interface{}{"name": "multi", "files": []interface{}{entry(-1)}}, 0, 0, false},
+		{"overflow", map[string]interface{}{"name": "multi", "files": []interface{}{entry(int64(math.MaxInt64)), entry(1)}}, 0, 0, false},
+		{"bad length", map[string]interface{}{"name": "multi", "files": []interface{}{entry("2")}}, 0, 0, false},
+		{"bad files", map[string]interface{}{"name": "multi", "files": "invalid"}, 0, 0, false},
+		{"bad file", map[string]interface{}{"name": "multi", "files": []interface{}{2}}, 0, 0, false},
+		{"bad path", map[string]interface{}{"name": "multi", "files": []interface{}{map[string]interface{}{"length": 2, "path": []interface{}{2}}}}, 0, 0, false},
+		{"conflicting", map[string]interface{}{"name": "multi", "length": 5, "files": []interface{}{entry(5)}}, 0, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files, length, valid := torrentFiles(tc.info)
