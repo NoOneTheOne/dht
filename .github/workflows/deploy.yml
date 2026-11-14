@@ -74,6 +74,134 @@ jobs:
           [[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           docker build --target "$TARGET" --build-arg VERSION="$version" --build-arg REVISION="$REVISION" .
 
+  frontend:
+    name: Build release frontend
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm install
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-frontend
+          path: web/dist/
+          if-no-files-found: error
+
+  package:
+    name: Package ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: [frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [linux, windows, darwin]
+        arch: [amd64, arm64]
+        exclude:
+          - os: darwin
+            arch: amd64
+    env:
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.arch }}
+      CGO_ENABLED: '0'
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-frontend
+          path: frontend-dist
+      - name: Build and package binaries
+        run: |
+          version=""
+          while IFS='=' read -r key value; do
+            if [[ "$key" == DHT_IMAGE_TAG ]]; then version="$value"; fi
+          done < .env.example
+          [[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            [[ "$RELEASE_TAG" == "$version" ]]
+          fi
+          extension=""
+          if [[ "$GOOS" == windows ]]; then extension=".exe"; fi
+          mkdir -p dist
+          for binary in spider search getpeers; do
+            name="dht-${binary}_${version}_${GOOS}_${GOARCH}"
+            directory="packages/$name"
+            mkdir -p "$directory"
+            go build -trimpath -ldflags "-s -w" -o "$directory/dht-${binary}${extension}" "./cmd/$binary"
+            cp config/config.yml.example "$directory/config.yml.example"
+            cp LICENSE "$directory/LICENSE"
+            if [[ "$binary" == search ]]; then
+              mkdir -p "$directory/web"
+              cp -R frontend-dist/. "$directory/web/"
+            fi
+            if [[ "$GOOS" == windows ]]; then
+              (cd packages && zip -qr "../dist/$name.zip" "$name")
+            else
+              tar -czf "dist/$name.tar.gz" -C packages "$name"
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [build, package]
+    if: github.ref_type == 'tag' && github.event_name == 'push'
+    permissions:
+      contents: write
+    concurrency:
+      group: dht-release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate release version and main ancestry
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          expected=""
+          while IFS='=' read -r key value; do
+            if [[ "$key" == DHT_IMAGE_TAG ]]; then expected="$value"; fi
+          done < .env.example
+          [[ "$RELEASE_TAG" == "$expected" ]]
+          git merge-base --is-ancestor "$RELEASE_REVISION" origin/main
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-package-*
+          path: dist
+          merge-multiple: true
+      - name: Publish archives and checksums without overwriting a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.tar.gz dist/*.zip)
+          [[ "${#archives[@]}" == 15 ]] || {
+            echo "ERROR: expected 15 release archives"
+            exit 1
+          }
+          (cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
+          gh release create "$RELEASE_TAG" "${archives[@]}" dist/SHA256SUMS \
+            --verify-tag --title "$RELEASE_TAG" --generate-notes
+
   deploy:
     name: Deploy
     runs-on: self-hosted

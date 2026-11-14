@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"log/slog"
 	"math"
 	"net"
-	"os"
 	"strconv"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/basic"
 	"github.com/NoOneTheOne/dht/internal/config"
 	"github.com/NoOneTheOne/dht/internal/dht"
+	"github.com/NoOneTheOne/dht/internal/logging"
 	"github.com/NoOneTheOne/dht/internal/metrics"
 	"github.com/NoOneTheOne/dht/internal/nat"
 	"github.com/NoOneTheOne/dht/internal/storage/es"
@@ -102,9 +103,7 @@ func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write fu
 			return
 		}
 		if err := write(batch); err != nil {
-			log.Printf("[mysql] batch write failed for %d observations after safe retries; not replayed because commit outcome may be unknown: %v", len(batch), err)
-		} else {
-			log.Printf("[mysql] persisted %d metadata observations", len(batch))
+			slog.Error("MySQL batch write failed; not replayed because commit outcome may be unknown", "component", "mysql", "observations", len(batch), "error", err)
 		}
 		batch = batch[:0]
 	}
@@ -126,6 +125,8 @@ func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write fu
 }
 
 func main() {
+	defer logging.Init("dht-spider")()
+	flag.CommandLine.SetOutput(logging.Writer(slog.LevelError))
 	port := flag.Int("port", 6881, "DHT UDP listen port; forward the same public UDP port to this node")
 	autoNAT := flag.Bool("nat", false, "automatically map UDP port using UPnP/NAT-PMP (disable for manual forwarding or Docker bridge)")
 	queryWorkers := flag.Int("query-workers", 64, "maximum concurrent outbound DHT queries")
@@ -133,18 +134,9 @@ func main() {
 	metadataWorkers := flag.Int("metadata-workers", 64, "maximum concurrent metadata TCP connections")
 	flag.Parse()
 	if *port < 1 || *port > 65535 || *queryWorkers < 1 || *metadataWorkers < 1 || *queryTimeout <= 0 {
-		log.Fatal("port must be 1..65535, worker limits and query timeout must be positive")
+		logging.Fatal("port must be 1..65535, worker limits and query timeout must be positive")
 	}
 	var c = config.GetConfig()
-
-	if logPath := os.Getenv("LOG_FILE_PATH"); logPath != "" {
-		logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-		if err != nil {
-			log.Fatalf("failed to open log file %s: %v", logPath, err)
-		}
-		log.SetOutput(logFile)
-	}
-	log.SetFlags(log.LstdFlags)
 
 	if *autoNAT {
 		go setupNAT(*port)
@@ -206,15 +198,15 @@ func main() {
 				if data, err := json.Marshal(bt); err != nil {
 					basic.CheckError(err)
 				} else {
-					if res, err := es.Write(c.Elasticsearch.Index, "_doc", data); err != nil {
+					if _, err := es.Write(c.Elasticsearch.Index, "_doc", data); err != nil {
 						basic.CheckError(err)
 					} else {
-						log.Printf("[es] %s\n%s\n", data, res)
+						slog.Info("Elasticsearch metadata persisted", "component", "elasticsearch", "infohash", infoHash, "length", length)
 					}
 				}
 
 			default:
-				log.Fatalf("unknown storage type: %s", c.Storage.Type)
+				logging.Fatalf("unknown storage type: %s", c.Storage.Type)
 			}
 		}
 	}()

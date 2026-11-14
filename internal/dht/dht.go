@@ -5,7 +5,6 @@ package dht
 import (
 	"encoding/hex"
 	"errors"
-	"log"
 	"math"
 	"net"
 	"sync"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
+	"github.com/NoOneTheOne/dht/internal/logging"
 )
 
 var udpBufPool = sync.Pool{
@@ -160,7 +160,7 @@ func New(initParam *InitParam) *DHT {
 
 	node, err := newNode(nodeID, initParam.Network, initParam.Address)
 	if err != nil {
-		log.Fatalln(err)
+		logging.Fatalln(err)
 	}
 
 	d := &DHT{
@@ -203,7 +203,7 @@ func (dht *DHT) IsCrawlMode() bool {
 func (dht *DHT) init() {
 	listener, err := net.ListenPacket(dht.Network, dht.Address)
 	if err != nil {
-		log.Fatalln(err)
+		logging.Fatalln(err)
 	}
 
 	dht.conn = listener.(*net.UDPConn)

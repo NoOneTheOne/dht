@@ -1,16 +1,102 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
+	"log"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+func TestSearchHandlerInvalidParameters(t *testing.T) {
+	router := gin.New()
+	router.GET("/search", searchHandler)
+	queries := []string{
+		"", "name=" + strings.Repeat("a", maxQueryLen+1),
+		"name=test&page=", "name=test&page=0", "name=test&page=-1",
+		"name=test&page=abc", "name=test&page=1.5", "name=test&page=%2B1",
+		"name=test&page=%201", "name=test&page=4294967296",
+		"name=test&page=18446744073709551616",
+		"name=test&page=" + strconv.FormatUint(uint64(int(^uint(0)>>1)/50)+1, 10),
+	}
+	for _, query := range queries {
+		t.Run(query, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/search?"+query, nil))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+			var body map[string]interface{}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body["error"] == nil {
+				t.Fatalf("invalid error response: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestHTTPJSONLogs(t *testing.T) {
+	previous := slog.Default()
+	output, flags, prefix := log.Writer(), log.Flags(), log.Prefix()
+	mode := gin.Mode()
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+		log.SetOutput(output)
+		log.SetFlags(flags)
+		log.SetPrefix(prefix)
+		gin.SetMode(mode)
+	})
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(accessLog(), recoveryLog())
+	router.GET("/quoted\"path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.GET("/panic", func(*gin.Context) { panic("private-panic-value") })
+	router.GET("/bad", func(c *gin.Context) { c.Status(http.StatusBadRequest) })
+	for _, path := range []string{"/quoted%22path?token=private-query", "/panic", "/bad"} {
+		request := httptest.NewRequest(http.MethodGet, path, strings.NewReader("private-body"))
+		request.Header.Set("Authorization", "private-auth")
+		request.Header.Set("User-Agent", "private-agent")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if path == "/panic" && response.Code != http.StatusInternalServerError {
+			t.Fatalf("panic status = %d", response.Code)
+		}
+	}
+	var records []map[string]interface{}
+	for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte{'\n'}) {
+		var record map[string]interface{}
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("invalid log JSON: %v", err)
+		}
+		records = append(records, record)
+	}
+	if len(records) != 4 || records[0]["path"] != "/quoted\"path" || records[0]["status"] != float64(204) ||
+		records[1]["level"] != "ERROR" || records[1]["stack"] == nil || records[1]["stack"] == "" ||
+		records[2]["status"] != float64(500) || records[3]["level"] != "WARN" {
+		t.Fatalf("unexpected HTTP logs: %v", records)
+	}
+	if _, ok := records[0]["duration_ms"].(float64); !ok {
+		t.Fatal("duration must be numeric")
+	}
+	for _, secret := range []string{"private-query", "private-body", "private-auth", "private-agent", "private-panic-value"} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("HTTP logs exposed %s", secret)
+		}
+	}
+}
 
 func TestMySQLInitializationFailure(t *testing.T) {
 	getDB := func() (*gorm.DB, error) {

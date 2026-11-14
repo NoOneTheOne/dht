@@ -95,7 +95,7 @@ func TestOperationsPropagateInitializationError(t *testing.T) {
 	if err := Write(&Data{Name: "test", InfoHash: strings.Repeat("a", 40)}); !errors.Is(err, failure) {
 		t.Fatalf("Write error = %v, want initialization failure", err)
 	}
-	if results, total, err := Search(context.Background(), "test"); results != nil || total != 0 || !errors.Is(err, failure) {
+	if results, total, err := Search(context.Background(), "test", 1); results != nil || total != 0 || !errors.Is(err, failure) {
 		t.Fatalf("Search = (%v, %d, %v), want nil, zero and initialization failure", results, total, err)
 	}
 }
@@ -221,8 +221,12 @@ func BenchmarkAggregateWrites(b *testing.B) {
 }
 
 func TestSearchQueries(t *testing.T) {
-	for _, n := range []int{0, 1, 49, 50} {
-		t.Run(fmt.Sprint(n), func(t *testing.T) {
+	for _, tt := range []struct{ page, rows int }{
+		{1, 0}, {1, 1}, {1, 49}, {1, 50},
+		{2, 50}, {3, 23}, {4, 0},
+	} {
+		t.Run(fmt.Sprintf("page_%d_rows_%d", tt.page, tt.rows), func(t *testing.T) {
+			n := tt.rows
 			cfg := &config.Config{}
 			cfg.MySQL.Table = "torrent_test"
 			original := getCfg
@@ -254,9 +258,20 @@ func TestSearchQueries(t *testing.T) {
 					if !strings.Contains(sql, "ORDER BY `time` DESC, `infohash` DESC LIMIT ?") {
 						t.Fatalf("missing bounded deterministic sort: %s", sql)
 					}
+					vars := tx.Statement.Vars
+					if len(vars) < 2 || vars[1] != SearchPageSize {
+						t.Fatalf("incorrect page limit: %v", vars)
+					}
+					if tt.page > 1 {
+						if !strings.Contains(sql, "OFFSET ?") || len(vars) != 3 || vars[2] != (tt.page-1)*SearchPageSize {
+							t.Fatalf("incorrect page offset: %s %v", sql, vars)
+						}
+					} else if strings.Contains(sql, "OFFSET") {
+						t.Fatalf("first page has offset: %s", sql)
+					}
 					*dest = make([]Data, n)
 				case *int64:
-					if strings.Contains(sql, "LIMIT") || strings.Contains(sql, "ORDER BY") {
+					if strings.Contains(sql, "LIMIT") || strings.Contains(sql, "OFFSET") || strings.Contains(sql, "ORDER BY") {
 						t.Fatalf("count inherited page clauses: %s", sql)
 					}
 					*dest = 123
@@ -268,9 +283,9 @@ func TestSearchQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 			stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
-			rows, total, err := Search(parent, "a%_|")
+			rows, total, err := Search(parent, "a%_|", tt.page)
 			wantTotal, wantQueries := int64(n), 1
-			if n == 50 {
+			if tt.page > 1 || n == SearchPageSize {
 				wantTotal, wantQueries = 123, 2
 			}
 			if err != nil || len(rows) != n || total != wantTotal || queries != wantQueries {
@@ -310,7 +325,7 @@ func TestSearchCanceledRequest(t *testing.T) {
 	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	rows, total, err := Search(ctx, "test")
+	rows, total, err := Search(ctx, "test", 1)
 	if !errors.Is(err, context.Canceled) || rows != nil || total != 0 || calls != 1 {
 		t.Fatalf("canceled search = %v, %d, %v; queries=%d", rows, total, err, calls)
 	}

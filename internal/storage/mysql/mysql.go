@@ -96,7 +96,7 @@ func openDB() (*gorm.DB, error) {
 	pool.SetMaxOpenConns(100)
 	pool.SetConnMaxLifetime(time.Hour)
 
-	candidate, err := gorm.Open(mysql.New(mysql.Config{Conn: pool}), &gorm.Config{})
+	candidate, err := gorm.Open(mysql.New(mysql.Config{Conn: pool}), &gorm.Config{Logger: newGORMLogger()})
 	if err != nil {
 		return nil, fmt.Errorf("connect MySQL: %w", err)
 	}
@@ -190,8 +190,13 @@ func WriteBatch(items []Data) error {
 	})
 }
 
-func Search(parent context.Context, name string) ([]Data, int64, error) {
-	results := make([]Data, 0, 50)
+const SearchPageSize = 50
+
+func Search(parent context.Context, name string, page int) ([]Data, int64, error) {
+	if page < 1 || page > int(^uint(0)>>1)/SearchPageSize {
+		return nil, 0, fmt.Errorf("invalid search page")
+	}
+	results := make([]Data, 0, SearchPageSize)
 
 	db, err := GetDB()
 	if err != nil {
@@ -202,11 +207,11 @@ func Search(parent context.Context, name string) ([]Data, int64, error) {
 	escaped := escapeLike(name)
 	query := db.WithContext(ctx).Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
 
-	if err := query.Session(&gorm.Session{}).Order("`time` DESC, `infohash` DESC").Limit(50).Find(&results).Error; err != nil {
+	if err := query.Session(&gorm.Session{}).Order("`time` DESC, `infohash` DESC").Limit(SearchPageSize).Offset((page - 1) * SearchPageSize).Find(&results).Error; err != nil {
 		return nil, 0, err
 	}
 	total := int64(len(results))
-	if len(results) == 50 {
+	if page > 1 || len(results) == SearchPageSize {
 		if err := query.Count(&total).Error; err != nil {
 			return nil, 0, err
 		}

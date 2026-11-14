@@ -1,10 +1,10 @@
 package config
 
 import (
-	"log"
 	"os"
 	"sync"
 
+	"github.com/NoOneTheOne/dht/internal/logging"
 	"gopkg.in/yaml.v3"
 )
 
@@ -46,11 +46,11 @@ func GetConfig() *Config {
 
 		configFile, err := os.ReadFile(configPath)
 		if err != nil {
-			log.Fatalf("failed to read config file %s: %v", configPath, err)
+			logging.Fatalf("failed to read config file %s: %v", configPath, err)
 		}
 		err = yaml.Unmarshal(configFile, &c)
 		if err != nil {
-			log.Fatalf("failed to parse config file: %v", err)
+			logging.Fatalf("failed to parse config file: %v", err)
 		}
 		cachedConfig = &c
 	})

@@ -7,12 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
+	"github.com/NoOneTheOne/dht/internal/logging"
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
 )
@@ -34,7 +35,7 @@ func getClient() *elasticsearch.Client {
 			DisableRetry: true,
 		})
 		if err != nil {
-			log.Fatalf("failed to create elasticsearch client: %v", err)
+			logging.Fatalf("failed to create elasticsearch client: %v", err)
 		}
 	})
 	return client
@@ -117,7 +118,7 @@ func Search(q string) map[string]interface{} {
 		},
 	}
 	if err := json.NewEncoder(&buf).Encode(query); err != nil {
-		log.Printf("error encoding query: %v", err)
+		slog.Error("error encoding query", "error", err, "component", "elasticsearch")
 		return nil
 	}
 
@@ -133,19 +134,19 @@ func Search(q string) map[string]interface{} {
 		getClient().Search.WithPretty(),
 	)
 	if err != nil {
-		log.Printf("error searching elasticsearch: %v", err)
+		slog.Error("error searching elasticsearch", "error", err, "component", "elasticsearch")
 		return nil
 	}
 	defer res.Body.Close()
 
 	if res.IsError() {
-		log.Printf("elasticsearch search error: status=%d", res.StatusCode)
+		slog.Error("elasticsearch search error", "status", res.StatusCode, "component", "elasticsearch")
 		return nil
 	}
 
 	var r map[string]interface{}
 	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
-		log.Printf("error parsing search response: %v", err)
+		slog.Error("error parsing search response", "error", err, "component", "elasticsearch")
 		return nil
 	}
 	return r

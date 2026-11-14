@@ -1,41 +1,35 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
-	"log"
-	"os"
+	"log/slog"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/dht"
+	"github.com/NoOneTheOne/dht/internal/logging"
 )
 
 func main() {
+	defer logging.Init("dht-getpeers")()
+	flag.CommandLine.SetOutput(logging.Writer(slog.LevelError))
 	infoHash := flag.String("infohash", "", "torrent infohash (40-char hex string)")
 	flag.Parse()
 
 	if *infoHash == "" {
-		log.Fatal("--infohash is required")
+		logging.Fatal("--infohash is required")
 	}
-
-	if logPath := os.Getenv("LOG_FILE_PATH"); logPath != "" {
-		logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-		if err != nil {
-			log.Fatalf("failed to open log file %s: %v", logPath, err)
-		}
-		log.SetOutput(logFile)
-	}
-	log.SetFlags(log.LstdFlags)
 
 	d := dht.New(dht.NewStandardConfig())
 	d.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
-		log.Printf("got peer: %s:%d\n", peer.IP, peer.Port)
+		slog.Info("peer discovered", "component", "dht", "infohash", hex.EncodeToString([]byte(infoHash)), "peer_ip", peer.IP.String(), "peer_port", peer.Port)
 	}
 
 	go func() {
 		for {
 			err := d.GetPeers(*infoHash)
 			if err != nil && err != dht.ErrNotReady {
-				log.Fatal(err)
+				logging.Fatal(err)
 			}
 			if err == dht.ErrNotReady {
 				time.Sleep(time.Second * 1)

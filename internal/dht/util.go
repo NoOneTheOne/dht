@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -12,13 +11,14 @@ import (
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/basic"
+	"github.com/NoOneTheOne/dht/internal/logging"
 )
 
 // randomString generates a size-length string randomly.
 func randomString(size int) string {
 	buff := make([]byte, size)
 	if _, err := rand.Read(buff); err != nil {
-		log.Fatalf("failed to generate random string: %v", err)
+		logging.Fatalf("failed to generate random string: %v", err)
 	}
 	return string(buff)
 }

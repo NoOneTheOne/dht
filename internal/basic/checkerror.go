@@ -1,11 +1,11 @@
 package basic
 
 import (
-	"log"
+	"log/slog"
 )
 
 func CheckError(err error) {
 	if err != nil {
-		log.Printf("%s\n", err)
+		slog.Error("operation failed", "error", err)
 	}
 }

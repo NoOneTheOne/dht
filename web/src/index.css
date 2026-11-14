@@ -16,7 +16,7 @@ button, a { transition: color .15s, background-color .15s, border-color .15s; }
 .app-shell { max-width: 1248px; min-height: 100vh; margin: auto; padding: 0 40px; display: flex; flex-direction: column; }
 .site-header { height: 88px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #ffffff0e; }
 .brand { display: inline-flex; align-items: center; gap: 11px; font-weight: 750; font-size: 17px; letter-spacing: .04em; }
-.brand-mark { display: grid; place-items: center; width: 33px; height: 33px; border: 1px solid #8095ff66; background: #7289fc1a; color: #b2c0ff; border-radius: 9px; font-size: 20px; }
+.brand-mark { display: block; width: 33px; height: 33px; flex-shrink: 0; border-radius: 9px; }
 .brand-light { color: #9aa8be; font-size: 12px; font-weight: 500; letter-spacing: .12em; }
 .header-note { color: #8997af; font-size: 12px; }
 main { flex: 1; }
@@ -80,6 +80,13 @@ h1 span { color: #a7b7ff; }
 .magnet-button { border: 1px solid #465879; border-radius: 7px; padding: 10px 12px; color: #b7c7ef; white-space: nowrap; font-size: 11px; min-height: 44px; }
 .magnet-button:hover { background: #304166; border-color: #859cce; }
 .action-cell, .action-heading { text-align: right; }
+.pagination { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-top: 22px; }
+.pagination-summary { margin: 0; color: #9aa8be; font-size: 12px; font-variant-numeric: tabular-nums; }
+.pagination-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.page-button { min-width: 44px; min-height: 44px; padding: 8px 12px; border: 1px solid #354560; border-radius: 7px; background: #172132; color: #b7c7ef; font-size: 12px; font-variant-numeric: tabular-nums; }
+.page-button:hover:not(:disabled) { background: #304166; border-color: #859cce; }
+.page-button[aria-current="page"] { background: #b3c1ff; color: #121b35; border-color: #b3c1ff; opacity: 1; }
+.page-ellipsis { color: #8191ad; padding: 0 3px; }
 .results-footnote { margin: 16px 0 0; color: #8191ad; font-size: 11px; line-height: 1.8; }
 .copy-notice:not(:empty) { position: fixed; z-index: 10; bottom: 24px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 32px); padding: 14px 22px; border: 1px solid #677fa6; border-radius: 10px; background: #263650; color: #e9efff; box-shadow: 0 8px 30px #0006; font-size: 13px; }
 .mobile-sort, .mobile-only { display: none; }

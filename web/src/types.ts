@@ -9,4 +9,6 @@ export interface TorrentItem {
 export interface SearchResponse {
   total: number;
   items: TorrentItem[];
+  page: number;
+  page_size: number;
 }
