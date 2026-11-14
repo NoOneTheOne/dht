@@ -37,7 +37,7 @@ func TestBootstrapAddressesFilterInvalid(t *testing.T) {
 		{
 			name: "tracker URLs use defaults",
 			configured: []string{
-				"udp://tracker.openbittorrent.com:6969/announce",
+				"udp://tracker.example.com:6969/announce",
 				"https://tracker.example.com:443/announce",
 				"http://tracker.example.com:80/announce",
 			},

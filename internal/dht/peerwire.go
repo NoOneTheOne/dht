@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -202,6 +203,12 @@ type Wire struct {
 	requests     chan Request
 	responses    chan Response
 	workerTokens chan struct{}
+	stopOnce     sync.Once
+	stop         chan struct{}
+	stopped      chan struct{}
+	workers      sync.WaitGroup
+	connMu       sync.Mutex
+	connections  map[net.Conn]struct{}
 }
 
 // NewWire returns a Wire pointer.
@@ -216,43 +223,49 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 		requests:     make(chan Request, requestQueueSize),
 		responses:    make(chan Response, 1024),
 		workerTokens: make(chan struct{}, workerQueueSize),
+		stop:         make(chan struct{}),
+		stopped:      make(chan struct{}),
+		connections:  make(map[net.Conn]struct{}),
 	}
 }
 
 // Request pushes the request to the queue.
-func (wire *Wire) Request(infoHash []byte, ip string, port int) {
+func (wire *Wire) Request(infoHash []byte, ip string, port int) bool {
 	if len(infoHash) != 20 || port < 1 || port > 65535 {
-		return
+		return false
 	}
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil || parsedIP.IsUnspecified() || parsedIP.IsMulticast() ||
 		parsedIP.IsLinkLocalUnicast() {
-		return
+		return false
 	}
 	ip = parsedIP.String()
 	if wire.blackList.in(ip, port) {
-		return
+		return false
 	}
 	hashKey := string(infoHash)
 	key := hashKey + ":" + genAddress(ip, port)
 	wire.queue.Lock()
 	defer wire.queue.Unlock()
 	if wire.infoHashes[hashKey] >= maxRequestsPerInfoHash {
-		return
+		return false
 	}
 	if _, exists := wire.queue.data[key]; exists {
-		return
+		return false
 	}
 	wire.queue.data[key] = struct{}{}
 	wire.infoHashes[hashKey]++
 	select {
 	case wire.requests <- Request{InfoHash: bytes.Clone(infoHash), IP: ip, Port: port}:
+		return true
 	default:
 		delete(wire.queue.data, key)
 		wire.infoHashes[hashKey]--
 		if wire.infoHashes[hashKey] == 0 {
 			delete(wire.infoHashes, hashKey)
 		}
+		RecordMetadataRequestDropped()
+		return false
 	}
 }
 
@@ -309,8 +322,16 @@ func (wire *Wire) fetchMetadata(r Request) {
 		wire.blackList.insert(r.IP, r.Port)
 		return
 	}
+	wire.connMu.Lock()
+	wire.connections[conn] = struct{}{}
+	wire.connMu.Unlock()
+	defer func() {
+		wire.connMu.Lock()
+		delete(wire.connections, conn)
+		wire.connMu.Unlock()
+		_ = conn.Close()
+	}()
 	conn.(*net.TCPConn).SetLinger(0)
-	defer conn.Close()
 	wire.fetchMetadataConn(conn, r, deadline)
 }
 
@@ -345,10 +366,8 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 	}
 
 	for {
-		select {
-		case <-timer.C:
+		if !time.Now().Before(deadline) {
 			return
-		default:
 		}
 		length, err = readMessage(conn, data)
 		if err != nil {
@@ -463,6 +482,9 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 					MetadataInfo: metadataInfo,
 				}:
 				case <-timer.C:
+					RecordMetadataResponseDropped()
+				case <-wire.stop:
+					RecordMetadataResponseDropped()
 				}
 				return
 			}
@@ -475,19 +497,51 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 // Run starts the peer wire protocol.
 func (wire *Wire) Run() {
 	go wire.blackList.clear()
-
-	for r := range wire.requests {
-		if wire.blackList.in(r.IP, r.Port) {
-			wire.releaseRequest(r)
-			continue
-		}
-		wire.workerTokens <- struct{}{}
-		go func(r Request) {
-			defer func() {
+	defer func() {
+		wire.workers.Wait()
+		close(wire.responses)
+		close(wire.stopped)
+	}()
+	for {
+		select {
+		case <-wire.stop:
+			return
+		case r, ok := <-wire.requests:
+			if !ok {
+				return
+			}
+			if wire.blackList.in(r.IP, r.Port) {
 				wire.releaseRequest(r)
-				<-wire.workerTokens
-			}()
-			wire.fetchMetadata(r)
-		}(r)
+				continue
+			}
+			select {
+			case wire.workerTokens <- struct{}{}:
+			case <-wire.stop:
+				RecordMetadataRequestDropped()
+				wire.releaseRequest(r)
+				return
+			}
+			wire.workers.Add(1)
+			go func(r Request) {
+				defer wire.workers.Done()
+				defer func() {
+					wire.releaseRequest(r)
+					<-wire.workerTokens
+				}()
+				wire.fetchMetadata(r)
+			}(r)
+		}
 	}
+}
+
+func (wire *Wire) Stop() {
+	wire.stopOnce.Do(func() {
+		close(wire.stop)
+		wire.connMu.Lock()
+		for conn := range wire.connections {
+			_ = conn.Close()
+		}
+		wire.connMu.Unlock()
+	})
+	<-wire.stopped
 }

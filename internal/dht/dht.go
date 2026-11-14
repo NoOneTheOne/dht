@@ -3,6 +3,7 @@
 package dht
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"math"
@@ -146,6 +147,9 @@ type DHT struct {
 	ready              atomic.Bool
 	packets            chan packet
 	workerTokens       chan struct{}
+	stopOnce           sync.Once
+	stop               chan struct{}
+	stopped            chan struct{}
 }
 
 // New returns a DHT pointer. If config is nil, then config will be set to
@@ -169,6 +173,8 @@ func New(initParam *InitParam) *DHT {
 		blackList:    newBlackList(initParam.BlackListMaxSize),
 		packets:      make(chan packet, initParam.PacketJobLimit),
 		workerTokens: make(chan struct{}, initParam.PacketWorkerLimit),
+		stop:         make(chan struct{}),
+		stopped:      make(chan struct{}),
 	}
 
 	for _, ip := range initParam.BlockedIPs {
@@ -244,13 +250,19 @@ func (dht *DHT) join() {
 // listen receives message from udp.
 func (dht *DHT) listen() {
 	go func() {
+		defer close(dht.stopped)
 		for {
 			bufp := udpBufPool.Get().(*[]byte)
 			buff := *bufp
 			n, RealAddress, err := dht.conn.ReadFromUDP(buff)
 			if err != nil {
 				udpBufPool.Put(bufp)
-				continue
+				select {
+				case <-dht.stop:
+					return
+				default:
+					continue
+				}
 			}
 
 			RecordPacketReceived()
@@ -258,7 +270,11 @@ func (dht *DHT) listen() {
 			data := make([]byte, n)
 			copy(data, buff[:n])
 			udpBufPool.Put(bufp)
-			dht.packets <- packet{data, RealAddress}
+			select {
+			case dht.packets <- packet{data, RealAddress}:
+			case <-dht.stop:
+				return
+			}
 		}
 	}()
 }
@@ -306,6 +322,11 @@ func (dht *DHT) GetPeers(infoHash string) error {
 
 // Run starts the dht.
 func (dht *DHT) Run() {
+	dht.RunContext(context.Background())
+}
+
+// RunContext starts the dht until ctx is canceled.
+func (dht *DHT) RunContext(ctx context.Context) {
 	dht.init()
 	dht.listen()
 	go dht.reachability.logStartup(dht.conn.LocalAddr().(*net.UDPAddr).Port)
@@ -317,9 +338,14 @@ func (dht *DHT) Run() {
 	defer kBucketTicker.Stop()
 	evictTicker := time.NewTicker(10 * time.Minute)
 	defer evictTicker.Stop()
+	defer dht.closeResources()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
+		case <-dht.stop:
+			return
 		case pkt = <-dht.packets:
 			handle(dht, pkt)
 		case <-kBucketTicker.C:
@@ -335,6 +361,25 @@ func (dht *DHT) Run() {
 			go dht.routingTable.EvictStaleNodes(15 * time.Minute)
 		}
 	}
+}
+
+func (dht *DHT) closeResources() {
+	dht.ready.Store(false)
+	dht.stopOnce.Do(func() { close(dht.stop) })
+	if dht.conn != nil {
+		_ = dht.conn.Close()
+	}
+}
+
+// Stop stops the DHT and closes its UDP listener.
+func (dht *DHT) Stop() {
+	dht.stopOnce.Do(func() {
+		close(dht.stop)
+		if dht.conn != nil {
+			_ = dht.conn.Close()
+		}
+	})
+	<-dht.stopped
 }
 
 // DHTStats holds DHT statistics for external monitoring

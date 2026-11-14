@@ -278,6 +278,34 @@ var (
 		},
 	)
 
+	dhtPacketsDropped = promauto.NewCounterFunc(
+		prometheus.CounterOpts{Name: "dht_packets_dropped_total", Help: "Total number of dropped DHT packets"},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().PacketsDropped)
+			}
+			return 0
+		},
+	)
+	dhtMetadataRequestsDropped = promauto.NewCounterFunc(
+		prometheus.CounterOpts{Name: "dht_metadata_requests_dropped_total", Help: "Total number of dropped metadata requests"},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().MetadataRequestsDropped)
+			}
+			return 0
+		},
+	)
+	dhtMetadataResponsesDropped = promauto.NewCounterFunc(
+		prometheus.CounterOpts{Name: "dht_metadata_responses_dropped_total", Help: "Total number of dropped metadata responses"},
+		func() float64 {
+			if dhtStatsGetter != nil {
+				return float64(dhtStatsGetter().MetadataResponsesDropped)
+			}
+			return 0
+		},
+	)
+
 	dhtTorrentsDiscovered = promauto.NewCounterFunc(
 		prometheus.CounterOpts{
 			Name: "dht_torrents_discovered_total",
@@ -312,6 +340,9 @@ var (
 	_ = dhtActiveTransactions
 	_ = dhtBlacklistedNodes
 	_ = dhtTorrentsDiscovered
+	_ = dhtPacketsDropped
+	_ = dhtMetadataRequestsDropped
+	_ = dhtMetadataResponsesDropped
 	_ = getMySQLOpenConnections
 	_ = getMySQLInUseConnections
 	_ = getMySQLIdleConnections
@@ -325,13 +356,16 @@ var (
 
 // DHTStats holds DHT network statistics
 type DHTStats struct {
-	RoutingTableNodes  int
-	BootstrapCount     int
-	PacketsReceived    int
-	PacketsSent        int
-	ActiveTransactions int
-	BlacklistedNodes   int
-	TorrentsDiscovered int
+	RoutingTableNodes        int
+	BootstrapCount           int
+	PacketsReceived          int
+	PacketsSent              int
+	ActiveTransactions       int
+	BlacklistedNodes         int
+	TorrentsDiscovered       int
+	PacketsDropped           int
+	MetadataRequestsDropped  int
+	MetadataResponsesDropped int
 }
 
 // SetMySQLStatsGetter sets the function to get MySQL connection stats

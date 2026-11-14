@@ -822,6 +822,7 @@ func handle(dht *DHT, pkt packet) {
 	select {
 	case dht.workerTokens <- struct{}{}:
 	default:
+		RecordPacketDropped()
 		return
 	}
 

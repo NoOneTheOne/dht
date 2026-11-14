@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -17,6 +18,21 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+type Observation struct {
+	BatchID  string    `gorm:"column:batch_id;type:char(32);primaryKey"`
+	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey"`
+	Name     string    `gorm:"column:name;type:varchar(512);not null"`
+	Time     time.Time `gorm:"column:time;not null"`
+	Length   int64     `gorm:"column:length;default:0"`
+	Count    int64     `gorm:"column:count;default:1"`
+	Files    []File    `gorm:"column:files;type:json;serializer:json"`
+	Applied  bool      `gorm:"column:applied;default:false;index"`
+}
+
+func (Observation) TableName() string {
+	return getCfg().MySQL.Table + "_observations"
+}
 
 type File struct {
 	Path   []string `json:"path"`
@@ -109,7 +125,7 @@ func openDB() (*gorm.DB, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
 	defer cancel()
-	if err := candidate.WithContext(ctx).AutoMigrate(&Data{}); err != nil {
+	if err := candidate.WithContext(ctx).AutoMigrate(&Data{}, &Observation{}); err != nil {
 		return nil, fmt.Errorf("migrate MySQL: %w", err)
 	}
 	initialized = true
@@ -176,7 +192,23 @@ func retryUncommitted(ctx context.Context, write func() (bool, error)) error {
 	}
 }
 
+func NewBatchID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
+}
+
 func WriteBatch(items []Data) error {
+	batchID, err := NewBatchID()
+	if err != nil {
+		return err
+	}
+	return WriteBatchWithID(batchID, items)
+}
+
+func WriteBatchWithID(batchID string, items []Data) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -191,13 +223,36 @@ func WriteBatch(items []Data) error {
 		if err != nil {
 			return true, err
 		}
-		err = db.WithContext(ctx).Session(&gorm.Session{SkipDefaultTransaction: true}).Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "infohash"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
-				"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
-			}),
-		}).Create(&rows).Error
+		err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			observations := make([]Observation, len(rows))
+			for i, row := range rows {
+				observations[i] = Observation{BatchID: batchID, InfoHash: row.InfoHash, Name: row.Name, Time: row.Time, Length: row.Length, Count: row.Count, Files: row.Files}
+			}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&observations).Error; err != nil {
+				return err
+			}
+			var pending []Observation
+			if err := tx.Where("batch_id = ? AND applied = ?", batchID, false).Find(&pending).Error; err != nil {
+				return err
+			}
+			pendingRows := make([]Data, len(pending))
+			for i, observation := range pending {
+				pendingRows[i] = Data{Name: observation.Name, InfoHash: observation.InfoHash, Time: observation.Time, Length: observation.Length, Count: observation.Count, Files: observation.Files}
+			}
+			if len(pendingRows) == 0 {
+				return nil
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "infohash"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
+					"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
+				}),
+			}).Create(&pendingRows).Error; err != nil {
+				return err
+			}
+			return tx.Model(&Observation{}).Where("batch_id = ? AND applied = ?", batchID, false).Update("applied", true).Error
+		})
 		var mysqlErr *mysqlDriver.MySQLError
 		return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213, err
 	})

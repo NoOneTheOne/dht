@@ -8,7 +8,11 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/basic"
@@ -94,15 +98,30 @@ func torrentFiles(info map[string]interface{}) ([]mysql.File, int64, bool) {
 	return []mysql.File{{Path: []string{name}, Length: length}}, length, true
 }
 
-func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
+func writeMySQLBatchesUntil(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
+	writeMySQLBatchesWithRecovery(input, ticks, stop, write)
+}
+
+func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
 	batch := make([]mysql.Data, 0, 100)
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
 		start := time.Now()
-		if err := write(batch); err != nil {
-			slog.Error("MySQL batch write failed; not replayed because commit outcome may be unknown", "component", "mysql", "event", "mysql_batch_failed", "operation", "write_batch", "observations", len(batch), "duration_ms", float64(time.Since(start))/float64(time.Millisecond), "error", err)
+		batchID, idErr := mysql.NewBatchID()
+		if idErr != nil {
+			slog.Error("MySQL batch ID generation failed", "component", "mysql", "event", "mysql_batch_id_failed", "error", idErr)
+			return
+		}
+		if err := write(batchID, batch); err != nil {
+			store := mysql.NewRecoveryStore(filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl"))
+			if store != nil {
+				if spoolErr := store.Append(mysql.RecoveryBatch{ID: batchID, Items: append([]mysql.Data(nil), batch...)}); spoolErr != nil {
+					slog.Error("MySQL recovery spool failed", "component", "mysql", "event", "mysql_recovery_spool_failed", "error", spoolErr)
+				}
+			}
+			slog.Error("MySQL batch write failed; recovery is required", "component", "mysql", "event", "mysql_batch_failed", "operation", "write_batch", "observations", len(batch), "duration_ms", float64(time.Since(start))/float64(time.Millisecond), "error", err)
 		}
 		batch = batch[:0]
 	}
@@ -119,6 +138,9 @@ func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write fu
 			}
 		case <-ticks:
 			flush()
+		case <-stop:
+			flush()
+			return
 		}
 	}
 }
@@ -145,14 +167,28 @@ func main() {
 
 	w := dht.NewWire(65536, 4096, *metadataWorkers)
 	mysqlWrites := make(chan mysql.Data, 100)
+	responseDone := make(chan struct{})
+	writeDone := make(chan struct{})
 	if c.Storage.Type == "mysql" {
 		go func() {
+			defer close(writeDone)
+			store := mysql.NewRecoveryStore(filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl"))
+			if store != nil {
+				if err := store.Replay(func(id string, items []mysql.Data) error { return mysql.WriteBatchWithID(id, items) }); err != nil {
+					slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
+				}
+			}
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
-			writeMySQLBatches(mysqlWrites, ticker.C, mysql.WriteBatch)
+			writeMySQLBatchesUntil(mysqlWrites, ticker.C, nil, func(id string, items []mysql.Data) error {
+				return mysql.WriteBatchWithID(id, items)
+			})
 		}()
+	} else {
+		close(writeDone)
 	}
 	go func() {
+		defer close(responseDone)
 		defer close(mysqlWrites)
 		for resp := range w.Response() {
 			metadata, err := dht.Decode(resp.MetadataInfo)
@@ -223,7 +259,9 @@ func main() {
 			return
 		}
 		dht.RecordTorrentDiscovered()
-		w.Request([]byte(infoHash), ip, peerPort)
+		if !w.Request([]byte(infoHash), ip, peerPort) {
+			dht.RecordMetadataRequestDropped()
+		}
 	}
 	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
 		queuePeer(infoHash, ip, port)
@@ -240,17 +278,32 @@ func main() {
 		stats := dht.GetStats()
 		dhtStats := d.GetDHTStats()
 		return metrics.DHTStats{
-			RoutingTableNodes:  dhtStats.RoutingTableNodes,
-			BootstrapCount:     dhtStats.BootstrapCount,
-			PacketsReceived:    int(stats.PacketsReceived),
-			PacketsSent:        int(stats.PacketsSent),
-			ActiveTransactions: dhtStats.ActiveTransactions,
-			BlacklistedNodes:   dhtStats.BlacklistedNodes,
-			TorrentsDiscovered: int(stats.TorrentsDiscovered),
+			RoutingTableNodes:        dhtStats.RoutingTableNodes,
+			BootstrapCount:           dhtStats.BootstrapCount,
+			PacketsReceived:          int(stats.PacketsReceived),
+			PacketsSent:              int(stats.PacketsSent),
+			ActiveTransactions:       dhtStats.ActiveTransactions,
+			BlacklistedNodes:         dhtStats.BlacklistedNodes,
+			TorrentsDiscovered:       int(stats.TorrentsDiscovered),
+			PacketsDropped:           int(stats.PacketsDropped),
+			MetadataRequestsDropped:  int(stats.MetadataRequestsDropped),
+			MetadataResponsesDropped: int(stats.MetadataResponsesDropped),
 		}
 	})
 
+	stopSignal := make(chan os.Signal, 1)
+	shutdownDone := make(chan struct{})
+	signal.Notify(stopSignal, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		defer close(shutdownDone)
+		<-stopSignal
+		d.Stop()
+		w.Stop()
+		<-responseDone
+		<-writeDone
+	}()
 	d.Run()
+	<-shutdownDone
 }
 
 func setupNAT(port int) {
