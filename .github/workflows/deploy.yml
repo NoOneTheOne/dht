@@ -66,13 +66,14 @@ jobs:
         env:
           TARGET: ${{ matrix.binary }}
           REVISION: ${{ github.sha }}
+          BUILD_ENV: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'prod' || 'unknown' }}
         run: |
           version=""
           while IFS='=' read -r key value; do
             if [[ "$key" == DHT_IMAGE_TAG ]]; then version="$value"; fi
           done < .env.example
           [[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          docker build --target "$TARGET" --build-arg VERSION="$version" --build-arg REVISION="$REVISION" .
+          docker build --target "$TARGET" --build-arg VERSION="$version" --build-arg REVISION="$REVISION" --build-arg APP_ENV="$BUILD_ENV" .
 
   frontend:
     name: Build release frontend
@@ -111,6 +112,7 @@ jobs:
       GOARCH: ${{ matrix.arch }}
       CGO_ENABLED: '0'
       RELEASE_TAG: ${{ github.ref_name }}
+      BUILD_ENV: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'prod' || 'unknown' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -137,7 +139,7 @@ jobs:
             name="dht-${binary}_${version}_${GOOS}_${GOARCH}"
             directory="packages/$name"
             mkdir -p "$directory"
-            go build -trimpath -ldflags "-s -w" -o "$directory/dht-${binary}${extension}" "./cmd/$binary"
+            go build -trimpath -ldflags "-s -w -X github.com/NoOneTheOne/dht/internal/logging.Version=$version -X github.com/NoOneTheOne/dht/internal/logging.Revision=$GITHUB_SHA -X github.com/NoOneTheOne/dht/internal/logging.Environment=$BUILD_ENV" -o "$directory/dht-${binary}${extension}" "./cmd/$binary"
             cp config/config.yml.example "$directory/config.yml.example"
             cp LICENSE "$directory/LICENSE"
             if [[ "$binary" == search ]]; then

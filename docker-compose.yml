@@ -7,10 +7,12 @@ services:
       args:
         VERSION: ${DHT_IMAGE_TAG:?DHT_IMAGE_TAG must be set}
         REVISION: ${DHT_IMAGE_REVISION:-local}
+        APP_ENV: prod
       target: spider
     container_name: dht-spider
     environment:
       CONFIG_FILE_PATH: "/app/config.yml"
+      APP_ENV: prod
     command:
       - ./dht-spider
       - -port=${DHT_PORT:-6881}
@@ -31,11 +33,13 @@ services:
       args:
         VERSION: ${DHT_IMAGE_TAG:?DHT_IMAGE_TAG must be set}
         REVISION: ${DHT_IMAGE_REVISION:-local}
+        APP_ENV: prod
       target: search
     container_name: dht-search
     environment:
       SEARCH_API_PORT: "30080"
       CONFIG_FILE_PATH: "/app/config.yml"
+      APP_ENV: prod
     healthcheck:
       test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:30080/health"]
       interval: 5s

@@ -55,12 +55,12 @@ func (l *gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (stri
 
 	duration := time.Since(begin)
 	var level slog.Level
-	var message string
+	var message, event string
 	switch {
 	case err != nil && l.level >= logger.Error:
-		level, message = slog.LevelError, "MySQL query failed"
+		level, message, event = slog.LevelError, "MySQL query failed", "mysql_query_failed"
 	case duration > slowQueryThreshold && l.level >= logger.Warn:
-		level, message = slog.LevelWarn, "MySQL slow query"
+		level, message, event = slog.LevelWarn, "MySQL slow query", "mysql_slow_query"
 	default:
 		// Even Info mode does not log successful, fast queries.
 		return
@@ -73,7 +73,7 @@ func (l *gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (stri
 	// The callback also returns SQL, which is deliberately discarded.
 	_, rows := fc()
 	log.Log(ctx, level, message,
-		"component", "mysql",
+		"component", "mysql", "event", event,
 		"duration_ms", float64(duration)/float64(time.Millisecond),
 		"rows", rows,
 		"error", err,

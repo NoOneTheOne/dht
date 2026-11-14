@@ -102,8 +102,9 @@ func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write fu
 		if len(batch) == 0 {
 			return
 		}
+		start := time.Now()
 		if err := write(batch); err != nil {
-			slog.Error("MySQL batch write failed; not replayed because commit outcome may be unknown", "component", "mysql", "observations", len(batch), "error", err)
+			slog.Error("MySQL batch write failed; not replayed because commit outcome may be unknown", "component", "mysql", "event", "mysql_batch_failed", "operation", "write_batch", "observations", len(batch), "duration_ms", float64(time.Since(start))/float64(time.Millisecond), "error", err)
 		}
 		batch = batch[:0]
 	}

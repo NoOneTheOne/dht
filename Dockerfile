@@ -7,6 +7,10 @@ RUN npm run build
 
 FROM golang:1.26-alpine AS builder
 
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG APP_ENV=unknown
+
 WORKDIR /build
 
 COPY go.mod go.sum ./
@@ -14,9 +18,9 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-spider ./cmd/spider
-RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-getpeers ./cmd/getpeers
-RUN CGO_ENABLED=0 GOOS=linux go build -o /build/dht-search ./cmd/search
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X github.com/NoOneTheOne/dht/internal/logging.Version=${VERSION} -X github.com/NoOneTheOne/dht/internal/logging.Revision=${REVISION} -X github.com/NoOneTheOne/dht/internal/logging.Environment=${APP_ENV}" -o /build/dht-spider ./cmd/spider
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X github.com/NoOneTheOne/dht/internal/logging.Version=${VERSION} -X github.com/NoOneTheOne/dht/internal/logging.Revision=${REVISION} -X github.com/NoOneTheOne/dht/internal/logging.Environment=${APP_ENV}" -o /build/dht-getpeers ./cmd/getpeers
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X github.com/NoOneTheOne/dht/internal/logging.Version=${VERSION} -X github.com/NoOneTheOne/dht/internal/logging.Revision=${REVISION} -X github.com/NoOneTheOne/dht/internal/logging.Environment=${APP_ENV}" -o /build/dht-search ./cmd/search
 
 FROM alpine:3.21 AS spider
 

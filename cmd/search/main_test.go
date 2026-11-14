@@ -11,11 +11,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/NoOneTheOne/dht/internal/logging"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -65,12 +68,24 @@ func TestHTTPJSONLogs(t *testing.T) {
 	router.GET("/quoted\"path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	router.GET("/panic", func(*gin.Context) { panic("private-panic-value") })
 	router.GET("/bad", func(c *gin.Context) { c.Status(http.StatusBadRequest) })
+	var requestIDs []string
 	for _, path := range []string{"/quoted%22path?token=private-query", "/panic", "/bad"} {
 		request := httptest.NewRequest(http.MethodGet, path, strings.NewReader("private-body"))
 		request.Header.Set("Authorization", "private-auth")
 		request.Header.Set("User-Agent", "private-agent")
+		request.Header.Set("X-Request-ID", "untrusted-request-id")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
+		requestID := response.Header().Get("X-Request-ID")
+		if requestID == "" || requestID == "untrusted-request-id" {
+			t.Fatalf("invalid generated request ID: %q", requestID)
+		}
+		for _, previousID := range requestIDs {
+			if previousID == requestID {
+				t.Fatal("request IDs must be unique")
+			}
+		}
+		requestIDs = append(requestIDs, requestID)
 		if path == "/panic" && response.Code != http.StatusInternalServerError {
 			t.Fatalf("panic status = %d", response.Code)
 		}
@@ -88,12 +103,59 @@ func TestHTTPJSONLogs(t *testing.T) {
 		records[2]["status"] != float64(500) || records[3]["level"] != "WARN" {
 		t.Fatalf("unexpected HTTP logs: %v", records)
 	}
+	if records[0]["event"] != "http_request" || records[0]["route"] != "/quoted\"path" ||
+		records[0]["protocol"] != "HTTP/1.1" || records[0]["request_bytes"] != float64(len("private-body")) {
+		t.Fatalf("missing HTTP fields: %v", records[0])
+	}
 	if _, ok := records[0]["duration_ms"].(float64); !ok {
 		t.Fatal("duration must be numeric")
 	}
 	for _, secret := range []string{"private-query", "private-body", "private-auth", "private-agent", "private-panic-value"} {
 		if strings.Contains(logs.String(), secret) {
 			t.Fatalf("HTTP logs exposed %s", secret)
+		}
+	}
+}
+
+func TestHTTPRequestLogCorrelation(t *testing.T) {
+	previous := slog.Default()
+	output, flags, prefix := log.Writer(), log.Flags(), log.Prefix()
+	mode := gin.Mode()
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+		log.SetOutput(output)
+		log.SetFlags(flags)
+		log.SetPrefix(prefix)
+		gin.SetMode(mode)
+	})
+	path := filepath.Join(t.TempDir(), "requests.jsonl")
+	t.Setenv("LOG_FILE_PATH", path)
+	closeLog := logging.Init("dht-search")
+	t.Cleanup(closeLog)
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(accessLog(), recoveryLog())
+	router.GET("/failure", func(c *gin.Context) {
+		slog.ErrorContext(c.Request.Context(), "database failure", "component", "mysql")
+		panic("private-value")
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/failure", nil))
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimSpace(content), []byte{'\n'})
+	if len(lines) != 3 || response.Code != http.StatusInternalServerError {
+		t.Fatalf("unexpected response/logs: %d %s", response.Code, content)
+	}
+	for _, line := range lines {
+		var record map[string]interface{}
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record["request_id"] != response.Header().Get("X-Request-ID") || record["request_id"] == "" {
+			t.Fatalf("request ID lost: %v", record)
 		}
 	}
 }

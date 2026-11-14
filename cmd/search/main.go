@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"log/slog"
 	"net/http"
 	"os"
@@ -145,7 +146,7 @@ func searchHandler(c *gin.Context) {
 	metrics.RecordMySQLQuery("search", time.Since(start), err)
 	if err != nil {
 		metrics.RecordSearchError("mysql_error")
-		slog.ErrorContext(c.Request.Context(), "search failed", "component", "mysql", "error", err)
+		slog.ErrorContext(c.Request.Context(), "search failed", "component", "mysql", "event", "search_failed", "operation", "search", "page", page, "page_size", mysql.SearchPageSize, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
@@ -158,7 +159,7 @@ func searchHandler(c *gin.Context) {
 
 func recoveryLog() gin.HandlerFunc {
 	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, _ interface{}) {
-		slog.ErrorContext(c.Request.Context(), "HTTP handler panic", "component", "http",
+		slog.ErrorContext(c.Request.Context(), "HTTP handler panic", "component", "http", "event", "http_panic",
 			"method", c.Request.Method, "path", c.Request.URL.Path, "stack", string(debug.Stack()))
 		c.AbortWithStatus(http.StatusInternalServerError)
 	})
@@ -167,6 +168,9 @@ func recoveryLog() gin.HandlerFunc {
 func accessLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
+		requestID := rand.Text()
+		c.Request = c.Request.WithContext(logging.WithRequestID(c.Request.Context(), requestID))
+		c.Header("X-Request-ID", requestID)
 		c.Next()
 		status := c.Writer.Status()
 		level := slog.LevelInfo
@@ -175,8 +179,9 @@ func accessLog() gin.HandlerFunc {
 		} else if status >= http.StatusBadRequest {
 			level = slog.LevelWarn
 		}
-		slog.Log(c.Request.Context(), level, "HTTP request", "component", "http",
-			"method", c.Request.Method, "path", c.Request.URL.Path,
+		slog.Log(c.Request.Context(), level, "HTTP request", "component", "http", "event", "http_request",
+			"method", c.Request.Method, "path", c.Request.URL.Path, "route", c.FullPath(),
+			"protocol", c.Request.Proto, "request_bytes", c.Request.ContentLength,
 			"status", status, "duration_ms", float64(time.Since(start))/float64(time.Millisecond),
 			"response_bytes", c.Writer.Size(), "client_ip", c.ClientIP())
 	}

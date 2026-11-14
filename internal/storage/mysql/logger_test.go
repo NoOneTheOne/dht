@@ -97,6 +97,13 @@ func TestGORMLoggerTrace(t *testing.T) {
 			if record["level"] != tt.wantLevel || record["component"] != "mysql" || record["request_id"] != "trace-request" {
 				t.Fatalf("incorrect level, component or context: %v", record)
 			}
+			wantEvent := "mysql_slow_query"
+			if tt.err != nil {
+				wantEvent = "mysql_query_failed"
+			}
+			if record["event"] != wantEvent {
+				t.Fatalf("event=%v, want %s", record["event"], wantEvent)
+			}
 			duration, ok := record["duration_ms"].(float64)
 			if !ok || duration < float64(tt.elapsed)/float64(time.Millisecond) {
 				t.Fatalf("duration_ms=%v, want elapsed milliseconds", record["duration_ms"])
