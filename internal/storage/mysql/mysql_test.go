@@ -2,6 +2,8 @@ package mysql
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -98,6 +100,9 @@ func TestOperationsPropagateInitializationError(t *testing.T) {
 	if results, total, err := Search(context.Background(), "test", 1); results != nil || total != 0 || !errors.Is(err, failure) {
 		t.Fatalf("Search = (%v, %d, %v), want nil, zero and initialization failure", results, total, err)
 	}
+	if result, err := Detail(context.Background(), strings.Repeat("a", 40)); result != nil || !errors.Is(err, failure) {
+		t.Fatalf("Detail = (%v, %v), want nil and initialization failure", result, err)
+	}
 }
 
 func TestRetryUncommitted(t *testing.T) {
@@ -136,9 +141,10 @@ func TestRetryUncommitted(t *testing.T) {
 
 func TestAggregateWrites(t *testing.T) {
 	first := time.Unix(100, 0)
+	files := []File{{Path: []string{"folder", "file"}, Length: 7}}
 	items := []Data{
 		{InfoHash: strings.Repeat("B", 40), Name: "first\xff", Time: first, Length: 7, Count: 999},
-		{InfoHash: strings.Repeat("b", 40), Name: "later", Time: first.Add(time.Hour), Length: 8},
+		{InfoHash: strings.Repeat("b", 40), Name: "later", Time: first.Add(time.Hour), Length: 8, Files: files},
 		{InfoHash: strings.Repeat("a", 40), Name: "other"},
 	}
 	rows, err := aggregateWrites(items)
@@ -149,6 +155,16 @@ func TestAggregateWrites(t *testing.T) {
 		rows[1].InfoHash != strings.Repeat("b", 40) || rows[1].Count != 2 ||
 		rows[1].Name != "first" || rows[1].Time != first || rows[1].Length != 7 {
 		t.Fatalf("incorrect grouped counts or first metadata: %+v", rows)
+	}
+	if len(rows[1].Files) != 1 || rows[1].Files[0].Length != 7 || len(items[0].Files) != 0 {
+		t.Fatal("duplicate file-list enrichment lost data or mutated the caller")
+	}
+	preserved, err := aggregateWrites([]Data{
+		{InfoHash: strings.Repeat("a", 40), Files: files},
+		{InfoHash: strings.Repeat("a", 40), Files: []File{{Path: []string{"later"}, Length: 8}}},
+	})
+	if err != nil || len(preserved[0].Files) != 1 || preserved[0].Files[0].Length != 7 {
+		t.Fatal("duplicate overwrote the first file list")
 	}
 	if items[0].Count != 999 || items[0].Name != "first\xff" {
 		t.Fatal("write mutated caller data")
@@ -189,14 +205,30 @@ func TestWriteBatchAtomicCountSQL(t *testing.T) {
 	}
 	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
 	hash := strings.Repeat("a", 40)
-	if err := WriteBatch([]Data{{InfoHash: hash, Name: "first"}, {InfoHash: hash, Name: "second"}}); err != nil {
+	if err := WriteBatch([]Data{{InfoHash: hash, Name: "first", Files: []File{{Path: []string{"folder", "file"}, Length: 7}}}, {InfoHash: hash, Name: "second"}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE `count`=COALESCE(`count`, 0) + VALUES(`count`)") {
 		t.Fatalf("count must be incremented atomically by grouped delta: %s", query)
 	}
-	if len(values) != 5 || values[4] != int64(2) {
+	if len(values) != 6 || values[4] != int64(2) {
 		t.Fatalf("expected one row with delta 2, got %v", values)
+	}
+	serialized, ok := values[5].(driver.Valuer)
+	if !ok {
+		t.Fatalf("files insert value is not serialized: %T", values[5])
+	}
+	value, err := serialized.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, ok := value.(string)
+	var stored []File
+	if !ok || json.Unmarshal([]byte(text), &stored) != nil || len(stored) != 1 || stored[0].Length != 7 {
+		t.Fatalf("invalid stored file list: %v", value)
+	}
+	if !strings.Contains(query, "`files`=IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)") {
+		t.Fatalf("duplicate must fill only missing file lists: %s", query)
 	}
 	if strings.Contains(query, "`name`=") || strings.Contains(query, "`time`=") {
 		t.Fatalf("duplicate overwrites original metadata: %s", query)
@@ -255,6 +287,9 @@ func TestSearchQueries(t *testing.T) {
 				sql := tx.Statement.SQL.String()
 				switch dest := tx.Statement.Dest.(type) {
 				case *[]Data:
+					if strings.Contains(sql, "SELECT *") || !strings.Contains(sql, "AS has_files") {
+						t.Fatalf("search must return availability without the file list: %s", sql)
+					}
 					if !strings.Contains(sql, "ORDER BY `time` DESC, `infohash` DESC LIMIT ?") {
 						t.Fatalf("missing bounded deterministic sort: %s", sql)
 					}
@@ -295,6 +330,14 @@ func TestSearchQueries(t *testing.T) {
 			if err := statement.Parse(&Data{}); err != nil {
 				t.Fatal(err)
 			}
+			hasFiles := statement.Schema.LookUpField("has_files")
+			if hasFiles == nil || !hasFiles.IgnoreMigration || hasFiles.Creatable || hasFiles.Updatable || !hasFiles.Readable {
+				t.Fatal("availability must be a read-only projection, not a physical column")
+			}
+			files := statement.Schema.LookUpField("files")
+			if files == nil || files.Serializer == nil || string(files.DataType) != "json" {
+				t.Fatal("file lists require a JSON serializer and JSON column")
+			}
 			indexes := statement.Schema.ParseIndexes()
 			if len(indexes) != 1 || len(indexes[0].Fields) != 1 || indexes[0].Fields[0].DBName != "time" {
 				t.Fatalf("missing time index: %+v", indexes)
@@ -328,6 +371,79 @@ func TestSearchCanceledRequest(t *testing.T) {
 	rows, total, err := Search(ctx, "test", 1)
 	if !errors.Is(err, context.Canceled) || rows != nil || total != 0 || calls != 1 {
 		t.Fatalf("canceled search = %v, %d, %v; queries=%d", rows, total, err, calls)
+	}
+}
+
+func TestSearchItemJSON(t *testing.T) {
+	for _, available := range []bool{false, true} {
+		encoded, err := json.Marshal(Data{Name: "resource", HasFiles: available})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := fields["files"]; exists || string(fields["has_files"]) != fmt.Sprint(available) {
+			t.Fatalf("search JSON must expose availability without a file payload: %s", encoded)
+		}
+	}
+}
+
+func TestDetailQuery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		files    []File
+		queryErr error
+		wantErr  error
+	}{
+		{"files", []File{{Path: []string{"folder", "file"}, Length: 7}}, nil, nil},
+		{"missing", nil, gorm.ErrRecordNotFound, gorm.ErrRecordNotFound},
+		{"empty", nil, nil, gorm.ErrRecordNotFound},
+		{"canceled", nil, context.Canceled, context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.MySQL.Table = "torrent_test"
+			original := getCfg
+			getCfg = func() *config.Config { return cfg }
+			t.Cleanup(func() { getCfg = original })
+			candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			type contextKey struct{}
+			parent := context.WithValue(context.Background(), contextKey{}, "request")
+			hash := strings.Repeat("a", 40)
+			if err := candidate.Callback().Query().After("gorm:query").Register("capture_detail", func(tx *gorm.DB) {
+				sql := tx.Statement.SQL.String()
+				if !strings.Contains(sql, "infohash = ? AND JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0") || !strings.Contains(sql, "LIMIT ?") || tx.Statement.Vars[0] != hash {
+					t.Fatalf("unbounded or unfiltered detail lookup: %s", sql)
+				}
+				if _, ok := tx.Statement.Context.Deadline(); !ok || tx.Statement.Context.Value(contextKey{}) != "request" {
+					t.Fatal("request context or deadline lost")
+				}
+				if tc.queryErr != nil {
+					tx.AddError(tc.queryErr)
+					return
+				}
+				result := tx.Statement.Dest.(*Data)
+				result.InfoHash, result.Files = hash, tc.files
+			}); err != nil {
+				t.Fatal(err)
+			}
+			stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+			result, err := Detail(parent, hash)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("detail error=%v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr == nil && (result == nil || !result.HasFiles || len(result.Files) != 1) {
+				t.Fatalf("invalid detail: %+v", result)
+			}
+			if tc.wantErr != nil && result != nil {
+				t.Fatal("returned detail on error")
+			}
+		})
 	}
 }
 

@@ -21,17 +21,12 @@ import (
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
 
-type file struct {
-	Path   []interface{} `json:"path"`
-	Length int64         `json:"length"`
-}
-
 type bitTorrent struct {
-	Time     time.Time `json:"@timestamp"`
-	InfoHash string    `json:"infohash"`
-	Name     string    `json:"name"`
-	Files    []file    `json:"files,omitempty"`
-	Length   int64     `json:"length,omitempty"`
+	Time     time.Time    `json:"@timestamp"`
+	InfoHash string       `json:"infohash"`
+	Name     string       `json:"name"`
+	Files    []mysql.File `json:"files,omitempty"`
+	Length   int64        `json:"length,omitempty"`
 }
 
 func metadataLength(value interface{}) (int64, bool) {
@@ -51,7 +46,7 @@ func metadataLength(value interface{}) (int64, bool) {
 	}
 }
 
-func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
+func torrentFiles(info map[string]interface{}) ([]mysql.File, int64, bool) {
 	name, nameOK := info["name"].(string)
 	if !nameOK || name == "" {
 		return nil, 0, false
@@ -64,7 +59,7 @@ func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
 		if !ok || len(items) == 0 {
 			return nil, 0, false
 		}
-		files := make([]file, 0, len(items))
+		files := make([]mysql.File, 0, len(items))
 		var total int64
 		for _, item := range items {
 			entry, ok := item.(map[string]interface{})
@@ -79,12 +74,15 @@ func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
 			if !ok || len(path) == 0 {
 				return nil, 0, false
 			}
-			for _, part := range path {
-				if value, ok := part.(string); !ok || value == "" {
+			segments := make([]string, len(path))
+			for i, part := range path {
+				value, ok := part.(string)
+				if !ok || value == "" {
 					return nil, 0, false
 				}
+				segments[i] = value
 			}
-			files = append(files, file{Path: path, Length: length})
+			files = append(files, mysql.File{Path: segments, Length: length})
 			total += length
 		}
 		return files, total, true
@@ -93,7 +91,7 @@ func torrentFiles(info map[string]interface{}) ([]file, int64, bool) {
 	if !ok {
 		return nil, 0, false
 	}
-	return []file{{Path: []interface{}{name}, Length: length}}, length, true
+	return []mysql.File{{Path: []string{name}, Length: length}}, length, true
 }
 
 func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
@@ -185,6 +183,7 @@ func main() {
 					InfoHash: infoHash,
 					Time:     time.Now(),
 					Length:   length,
+					Files:    files,
 				}
 
 			case "elasticsearch":

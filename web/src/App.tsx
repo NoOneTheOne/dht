@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import SearchBar from './components/SearchBar';
 import ResultsTable from './components/ResultsTable';
+import ResourceDetail from './components/ResourceDetail';
 import { TorrentItem, SearchResponse } from './types';
 
 function isSearchResponse(value: unknown): value is SearchResponse {
@@ -12,7 +13,7 @@ function isSearchResponse(value: unknown): value is SearchResponse {
     data.items.every(item => item && typeof item.name === 'string' &&
       typeof item.infohash === 'string' && /^[a-f\d]{40}$/i.test(item.infohash) &&
       typeof item.time === 'string' && Number.isFinite(item.length) && item.length >= 0 &&
-      Number.isFinite(item.count) && item.count >= 0);
+      Number.isFinite(item.count) && item.count >= 0 && typeof item.has_files === 'boolean');
 }
 
 function App() {
@@ -25,6 +26,13 @@ function App() {
   const [error, setError] = useState('');
   const activeRequest = useRef<AbortController | null>(null);
 
+  const [route, setRoute] = useState(() => window.location.hash);
+  const detailHash = /^#\/torrent\/([a-f\d]{40})$/i.exec(route)?.[1];
+  useEffect(() => {
+    const onHashChange = () => setRoute(window.location.hash);
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
   useEffect(() => () => activeRequest.current?.abort(), []);
 
   const handleSearch = async (searchQuery: string, requestedPage = 1): Promise<void> => {
@@ -74,12 +82,13 @@ function App() {
 
   return (
     <div className="app-shell">
-      <a className="skip-link" href="#search-input">跳到搜索</a>
+      <a className="skip-link" href="#main-content" onClick={event => { event.preventDefault(); document.getElementById('main-content')?.focus(); }}>跳到主要内容</a>
       <header className="site-header">
         <a className="brand" href="/" aria-label="DHT Search 首页"><img className="brand-mark" src="/search-icon.svg" alt="" width="33" height="33" /><span>DHT<span className="brand-light"> / SEARCH</span></span></a>
         <span className="header-note">BitTorrent 元数据检索</span>
       </header>
-      <main>
+      <main id="main-content" tabIndex={-1}>
+        {detailHash ? <ResourceDetail key={detailHash} infohash={detailHash} /> : <>
         <section className="hero" aria-labelledby="page-title">
           <span className="eyebrow">DISCOVER THE DISTRIBUTED WEB</span>
           <h1 id="page-title">从关键词，找到<span>你的下一份发现。</span></h1>
@@ -94,6 +103,7 @@ function App() {
             <button className="secondary-button" onClick={() => void handleSearch(query, page)}>重试第 {page} 页</button>
           </section>
         ) : <ResultsTable items={items} total={total} query={query} loading={loading} page={page} pageSize={pageSize} onPageChange={nextPage => void handleSearch(query, nextPage)} />}
+        </>}
       </main>
       <footer className="site-footer"><span>DHT SEARCH <span className="footer-divider">/</span> 基于分布式网络</span><span>请遵守当地法律，仅获取有权访问的内容。</span></footer>
     </div>

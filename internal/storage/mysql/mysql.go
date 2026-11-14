@@ -18,12 +18,19 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type File struct {
+	Path   []string `json:"path"`
+	Length int64    `json:"length"`
+}
+
 type Data struct {
 	Name     string    `gorm:"column:name;type:varchar(512);not null" json:"name"`
 	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey" json:"infohash"`
 	Time     time.Time `gorm:"column:time;not null;index" json:"time"`
 	Length   int64     `gorm:"column:length;default:0" json:"length"`
 	Count    int64     `gorm:"column:count;default:1" json:"count"`
+	Files    []File    `gorm:"column:files;type:json;serializer:json" json:"files,omitempty"`
+	HasFiles bool      `gorm:"column:has_files;->;-:migration" json:"has_files"`
 }
 
 func (Data) TableName() string {
@@ -126,6 +133,9 @@ func aggregateWrites(items []Data) ([]Data, error) {
 		item.InfoHash = strings.ToLower(item.InfoHash)
 		if existing, ok := grouped[item.InfoHash]; ok {
 			existing.Count++
+			if len(existing.Files) == 0 {
+				existing.Files = item.Files
+			}
 			grouped[item.InfoHash] = existing
 			continue
 		}
@@ -182,8 +192,11 @@ func WriteBatch(items []Data) error {
 			return true, err
 		}
 		err = db.WithContext(ctx).Session(&gorm.Session{SkipDefaultTransaction: true}).Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "infohash"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)")}),
+			Columns: []clause.Column{{Name: "infohash"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
+				"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
+			}),
 		}).Create(&rows).Error
 		var mysqlErr *mysqlDriver.MySQLError
 		return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213, err
@@ -207,7 +220,7 @@ func Search(parent context.Context, name string, page int) ([]Data, int64, error
 	escaped := escapeLike(name)
 	query := db.WithContext(ctx).Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
 
-	if err := query.Session(&gorm.Session{}).Order("`time` DESC, `infohash` DESC").Limit(SearchPageSize).Offset((page - 1) * SearchPageSize).Find(&results).Error; err != nil {
+	if err := query.Session(&gorm.Session{}).Select("`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files").Order("`time` DESC, `infohash` DESC").Limit(SearchPageSize).Offset((page - 1) * SearchPageSize).Find(&results).Error; err != nil {
 		return nil, 0, err
 	}
 	total := int64(len(results))
@@ -217,6 +230,24 @@ func Search(parent context.Context, name string, page int) ([]Data, int64, error
 		}
 	}
 	return results, total, nil
+}
+
+func Detail(parent context.Context, infoHash string) (*Data, error) {
+	db, err := GetDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	var result Data
+	if err := db.WithContext(ctx).Where("infohash = ? AND JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0", infoHash).Take(&result).Error; err != nil {
+		return nil, err
+	}
+	if len(result.Files) == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	result.HasFiles = true
+	return &result, nil
 }
 
 // escapeLike escapes special LIKE pattern characters (%, _, |)

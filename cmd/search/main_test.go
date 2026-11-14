@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/logging"
+	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -44,6 +45,55 @@ func TestSearchHandlerInvalidParameters(t *testing.T) {
 			var body map[string]interface{}
 			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body["error"] == nil {
 				t.Fatalf("invalid error response: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestDetailHandler(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		hash   string
+		data   *mysql.Data
+		err    error
+		status int
+	}{
+		{"invalid", "invalid", nil, nil, http.StatusBadRequest},
+		{"invalid hex", strings.Repeat("z", 40), nil, nil, http.StatusBadRequest},
+		{"missing", strings.Repeat("a", 40), nil, gorm.ErrRecordNotFound, http.StatusNotFound},
+		{"no files", strings.Repeat("a", 40), &mysql.Data{Name: "legacy"}, nil, http.StatusNotFound},
+		{"database failure", strings.Repeat("a", 40), nil, errors.New("backend unavailable"), http.StatusInternalServerError},
+		{"files", strings.Repeat("A", 40), &mysql.Data{InfoHash: strings.Repeat("a", 40), Name: "resource", Files: []mysql.File{{Path: []string{"folder", "empty.txt"}, Length: 0}}}, nil, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			type contextKey struct{}
+			router := gin.New()
+			router.GET("/api/torrents/:infohash", detailHandler(func(ctx context.Context, hash string) (*mysql.Data, error) {
+				calls++
+				if hash != strings.ToLower(tc.hash) || ctx.Value(contextKey{}) != "request" {
+					t.Fatal("lookup lost hash normalization or request context")
+				}
+				return tc.data, tc.err
+			}))
+			request := httptest.NewRequest(http.MethodGet, "/api/torrents/"+tc.hash, nil)
+			request = request.WithContext(context.WithValue(request.Context(), contextKey{}, "request"))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			wantCalls := 1
+			if tc.status == http.StatusBadRequest {
+				wantCalls = 0
+			}
+			if response.Code != tc.status || calls != wantCalls {
+				t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+			}
+			if tc.status == http.StatusOK {
+				var body mysql.Data
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Files) != 1 || strings.Join(body.Files[0].Path, "/") != "folder/empty.txt" {
+					t.Fatalf("invalid detail response: %s", response.Body.String())
+				}
+			} else if strings.Contains(response.Body.String(), "backend unavailable") || strings.Contains(response.Body.String(), "legacy") {
+				t.Fatal("error response exposed metadata or backend error")
 			}
 		})
 	}

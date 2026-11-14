@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
@@ -44,6 +47,7 @@ func main() {
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	router.GET("/search", searchHandler)
+	router.GET("/api/torrents/:infohash", detailHandler(mysql.Detail))
 
 	router.GET("/health", func(c *gin.Context) {
 		health := gin.H{
@@ -155,6 +159,30 @@ func searchHandler(c *gin.Context) {
 		"total": total, "items": results,
 		"page": page, "page_size": mysql.SearchPageSize,
 	})
+}
+
+func detailHandler(lookup func(context.Context, string) (*mysql.Data, error)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		hash := c.Param("infohash")
+		decoded, err := hex.DecodeString(hash)
+		if err != nil || len(decoded) != 20 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid infohash"})
+			return
+		}
+		start := time.Now()
+		result, err := lookup(c.Request.Context(), strings.ToLower(hash))
+		metrics.RecordMySQLQuery("detail", time.Since(start), err)
+		if errors.Is(err, gorm.ErrRecordNotFound) || err == nil && (result == nil || len(result.Files) == 0) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "file list not found"})
+			return
+		}
+		if err != nil {
+			slog.ErrorContext(c.Request.Context(), "detail lookup failed", "component", "mysql", "event", "detail_failed", "operation", "detail", "infohash", hash, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	}
 }
 
 func recoveryLog() gin.HandlerFunc {
