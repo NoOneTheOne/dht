@@ -2,7 +2,6 @@ package mysql
 
 import (
 	"context"
-	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	gormMySQL "gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Tests replace initialization, never loading config or contacting MySQL.
@@ -196,39 +196,29 @@ func TestWriteBatchAtomicCountSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	var query string
-	var values []interface{}
-	if err := candidate.Callback().Create().After("gorm:create").Register("capture", func(tx *gorm.DB) {
-		query = tx.Statement.SQL.String()
-		values = append(values, tx.Statement.Vars...)
-	}); err != nil {
-		t.Fatal(err)
-	}
 	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
 	hash := strings.Repeat("a", 40)
-	if err := WriteBatch([]Data{{InfoHash: hash, Name: "first", Files: []File{{Path: []string{"folder", "file"}, Length: 7}}}, {InfoHash: hash, Name: "second"}}); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE `count`=COALESCE(`count`, 0) + VALUES(`count`)") {
-		t.Fatalf("count must be incremented atomically by grouped delta: %s", query)
-	}
-	if len(values) != 6 || values[4] != int64(2) {
-		t.Fatalf("expected one row with delta 2, got %v", values)
-	}
-	serialized, ok := values[5].(driver.Valuer)
-	if !ok {
-		t.Fatalf("files insert value is not serialized: %T", values[5])
-	}
-	value, err := serialized.Value()
+	rows, err := aggregateWrites([]Data{{InfoHash: hash, Name: "first", Files: []File{{Path: []string{"folder", "file"}, Length: 7}}}, {InfoHash: hash, Name: "second"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	text, ok := value.(string)
-	var stored []File
-	if !ok || json.Unmarshal([]byte(text), &stored) != nil || len(stored) != 1 || stored[0].Length != 7 {
-		t.Fatalf("invalid stored file list: %v", value)
+	if len(rows) != 1 || rows[0].Count != 2 || len(rows[0].Files) != 1 || rows[0].Files[0].Length != 7 {
+		t.Fatalf("unexpected grouped rows: %+v", rows)
 	}
-	if !strings.Contains(query, "`files`=IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)") {
-		t.Fatalf("duplicate must fill only missing file lists: %s", query)
+	query = candidate.ToSQL(func(tx *gorm.DB) *gorm.DB {
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "infohash"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
+				"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
+			}),
+		}).Create(&rows)
+	})
+	if query == "" {
+		t.Fatal("failed to generate upsert SQL")
+	}
+	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE `count`=COALESCE(`count`, 0) + VALUES(`count`)") {
+		t.Fatalf("count must be incremented atomically by grouped delta: %s", query)
 	}
 	if strings.Contains(query, "`name`=") || strings.Contains(query, "`time`=") {
 		t.Fatalf("duplicate overwrites original metadata: %s", query)

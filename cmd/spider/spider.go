@@ -98,6 +98,12 @@ func torrentFiles(info map[string]interface{}) ([]mysql.File, int64, bool) {
 	return []mysql.File{{Path: []string{name}, Length: length}}, length, true
 }
 
+func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
+	writeMySQLBatchesWithRecovery(input, ticks, nil, func(_ string, items []mysql.Data) error {
+		return write(items)
+	})
+}
+
 func writeMySQLBatchesUntil(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
 	writeMySQLBatchesWithRecovery(input, ticks, stop, write)
 }

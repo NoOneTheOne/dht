@@ -208,6 +208,16 @@ func WriteBatch(items []Data) error {
 	return WriteBatchWithID(batchID, items)
 }
 
+func upsertRows(tx *gorm.DB, values []Data) error {
+	return tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "infohash"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
+			"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
+		}),
+	}).Create(&values).Error
+}
+
 func WriteBatchWithID(batchID string, items []Data) error {
 	if len(items) == 0 {
 		return nil
@@ -242,13 +252,7 @@ func WriteBatchWithID(batchID string, items []Data) error {
 			if len(pendingRows) == 0 {
 				return nil
 			}
-			if err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "infohash"}},
-				DoUpdates: clause.Assignments(map[string]interface{}{
-					"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
-					"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
-				}),
-			}).Create(&pendingRows).Error; err != nil {
+			if err := upsertRows(tx, pendingRows); err != nil {
 				return err
 			}
 			return tx.Model(&Observation{}).Where("batch_id = ? AND applied = ?", batchID, false).Update("applied", true).Error
