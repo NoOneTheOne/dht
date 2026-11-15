@@ -3,6 +3,7 @@ import SearchBar from './components/SearchBar';
 import ResultsTable from './components/ResultsTable';
 import Trending from './components/Trending';
 import ResourceDetail from './components/ResourceDetail';
+import SystemStatus from './components/SystemStatus';
 import { TorrentItem, SearchResponse } from './types';
 
 function isSearchResponse(value: unknown): value is SearchResponse {
@@ -18,6 +19,12 @@ function isSearchResponse(value: unknown): value is SearchResponse {
 }
 
 function App() {
+  const [theme, setTheme] = useState(() => document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light');
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#0b1b18' : '#e2f8ed');
+    try { localStorage.setItem('dht-theme', theme); } catch {}
+  }, [theme]);
   const [items, setItems] = useState<TorrentItem[]>([]);
   const [total, setTotal] = useState(0);
   const [query, setQuery] = useState('');
@@ -86,10 +93,10 @@ function App() {
       <a className="skip-link" href="#main-content" onClick={event => { event.preventDefault(); document.getElementById('main-content')?.focus(); }}>跳到主要内容</a>
       <header className="site-header">
         <a className="brand" href="/" aria-label="DHT Search 首页"><img className="brand-mark" src="/search-icon.svg" alt="" width="33" height="33" /><span>DHT<span className="brand-light"> / SEARCH</span></span></a>
-        <nav className="header-nav" aria-label="主要导航"><a href="#" aria-current={!detailHash && route !== '#/trending' ? 'page' : undefined}>搜索</a><a href="#/trending" aria-current={route === '#/trending' ? 'page' : undefined}>资源热榜 ↗</a></nav>
+        <nav className="header-nav" aria-label="主要导航"><a href="#" aria-current={!detailHash && !['#/trending', '#/status'].includes(route) ? 'page' : undefined}>搜索</a><a href="#/trending" aria-current={route === '#/trending' ? 'page' : undefined}>资源热榜 ↗</a><a href="#/status" aria-current={route === '#/status' ? 'page' : undefined}><span className="nav-status-dot" />Status</a><button className="theme-toggle" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? '切换到日间模式' : '切换到夜间模式'} title={theme === 'dark' ? '日间模式' : '夜间模式'}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">{theme === 'dark' ? <><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></> : <path d="M20.5 13A8.5 8.5 0 0 1 11 3.5 8.5 8.5 0 1 0 20.5 13Z"/>}</svg></button></nav>
       </header>
       <main id="main-content" tabIndex={-1}>
-        {detailHash ? <ResourceDetail key={detailHash} infohash={detailHash} /> : route === '#/trending' ? <Trending /> : <>
+        {route === '#/status' ? <SystemStatus /> : detailHash ? <ResourceDetail key={detailHash} infohash={detailHash} /> : route === '#/trending' ? <Trending /> : <>
         <section className="hero" aria-labelledby="page-title">
           <span className="eyebrow">DISCOVER THE DISTRIBUTED WEB</span>
           <h1 id="page-title">从关键词，找到<span>你的下一份发现。</span></h1>

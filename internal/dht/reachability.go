@@ -15,6 +15,7 @@ type reachabilityCheck struct {
 	inbound   chan *net.UDPAddr
 	responses bool
 	stopped   atomic.Bool
+	reachable atomic.Bool
 }
 
 func newReachabilityCheck() *reachabilityCheck {
@@ -47,6 +48,7 @@ func (check *reachabilityCheck) unsolicited(addr *net.UDPAddr) bool {
 }
 
 func (check *reachabilityCheck) recordInbound(addr *net.UDPAddr) {
+	check.reachable.Store(true)
 	select {
 	case check.inbound <- addr:
 	default:

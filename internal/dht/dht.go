@@ -418,7 +418,19 @@ type DHTStats struct {
 	PacketWorkers      int
 }
 
-// GetDHTStats returns current DHT statistics
+func (dht *DHT) Reachability() string {
+	if !dht.ready.Load() {
+		return "checking"
+	}
+	if dht.reachability.reachable.Load() {
+		return "reachable"
+	}
+	if dht.reachability.stopped.Load() {
+		return "unknown"
+	}
+	return "checking"
+}
+
 func (dht *DHT) GetDHTStats() DHTStats {
 	if !dht.ready.Load() {
 		return DHTStats{}

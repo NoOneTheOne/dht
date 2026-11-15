@@ -26,6 +26,28 @@ func (discardWireConn) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
+func TestConnectedPeers(t *testing.T) {
+	wire := NewWire(10, 10, 2)
+	if wire.ConnectedPeers() != 0 {
+		t.Fatal("new wire has connections")
+	}
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	wire.connMu.Lock()
+	wire.connections[local] = struct{}{}
+	wire.connMu.Unlock()
+	if wire.ConnectedPeers() != 1 {
+		t.Fatal("established connection not counted")
+	}
+	wire.connMu.Lock()
+	delete(wire.connections, local)
+	wire.connMu.Unlock()
+	if wire.ConnectedPeers() != 0 {
+		t.Fatal("closed connection still counted")
+	}
+}
+
 func BenchmarkSendMessage(b *testing.B) {
 	for _, size := range []int{32, BLOCK} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {

@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -182,6 +184,11 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 	}
 }
 
+var crawlerStartedAt = time.Now().UTC()
+var natStatus atomic.Value
+
+func init() { natStatus.Store("manual") }
+
 func main() {
 	defer logging.Init("dht-spider")()
 	flag.CommandLine.SetOutput(logging.Writer(slog.LevelError))
@@ -199,6 +206,7 @@ func main() {
 	natStop := make(chan struct{})
 	defer close(natStop)
 	if *autoNAT {
+		natStatus.Store("discovering")
 		go setupNAT(*port, natStop)
 	} else {
 		log.Printf("[NAT] Manual forwarding: public UDP %d -> node UDP %d; preserve the source port for outbound UDP", *port, *port)
@@ -341,6 +349,45 @@ func main() {
 		}
 	})
 
+	statusMux := http.NewServeMux()
+	statusMux.HandleFunc("GET /status", func(wr http.ResponseWriter, r *http.Request) {
+		stats := d.GetDHTStats()
+		_, _, active := w.QueueStats()
+		events := dht.GetProtocolEvents()
+		protocolEvents := make([]metrics.ProtocolEvent, len(events))
+		var rejected int64
+		for i, event := range events {
+			protocolEvents[i] = metrics.ProtocolEvent{Stage: event.Stage, Reason: event.Reason, Count: event.Count}
+			if event.Stage == "metadata" && event.Reason == "rejected" {
+				rejected += event.Count
+			}
+		}
+		metadata := metrics.OutcomeRate(protocolEvents, "metadata")
+		status := metrics.CrawlerStatus{
+			StartedAt: crawlerStartedAt, UptimeSeconds: int64(time.Since(crawlerStartedAt).Seconds()),
+			Collected: metadata.Succeeded, ConnectedPeers: w.ConnectedPeers(), RejectedPeers: rejected,
+			DroppedPeers: dht.GetStats().MetadataRequestsDropped,
+			Workers:      map[string]int{"packet": stats.PacketWorkers, "query": stats.ActiveTransactions, "metadata": active},
+			WorkerLimits: map[string]int{"packet": initConfig.PacketWorkerLimit, "query": *queryWorkers, "metadata": *metadataWorkers},
+			DHTQuery:     metrics.OutcomeRate(protocolEvents, "query"), MetadataFetch: metadata,
+			NAT: natStatus.Load().(string), Reachability: d.Reachability(), Ready: stats.RoutingTableNodes > 0,
+		}
+		wr.Header().Set("Content-Type", "application/json")
+		wr.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(wr).Encode(status)
+	})
+	statusAddr := os.Getenv("SPIDER_STATUS_ADDR")
+	if statusAddr == "" {
+		statusAddr = "127.0.0.1:30081"
+	}
+	statusServer := &http.Server{Addr: statusAddr, Handler: statusMux, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	defer statusServer.Close()
+	go func() {
+		if err := statusServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Crawler status server unavailable", "error", err)
+		}
+	}()
+
 	stopSignal := make(chan os.Signal, 1)
 	shutdownDone := make(chan struct{})
 	go func() {
@@ -378,6 +425,7 @@ func setupNAT(port int, stop <-chan struct{}) {
 	natDevice, err := nat.Discover()
 	if err != nil {
 		log.Printf("[NAT] No NAT device found, skipping port mapping")
+		natStatus.Store("unavailable")
 		return
 	}
 
@@ -390,9 +438,11 @@ func setupNAT(port int, stop <-chan struct{}) {
 	mapping, err := autoMap.Map("udp", port, port, "DHT Protocol")
 	if err != nil {
 		log.Printf("[NAT] Failed to map port %d: %v", port, err)
+		natStatus.Store("mapping_failed")
 		return
 	}
 
+	natStatus.Store("mapped")
 	log.Printf("[NAT] Successfully mapped %s:%d -> :%d", mapping.ExternalIP, mapping.External, mapping.Internal)
 
 	<-stop

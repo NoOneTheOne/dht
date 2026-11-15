@@ -13,6 +13,7 @@ services:
     environment:
       CONFIG_FILE_PATH: "/app/config.yml"
       APP_ENV: prod
+      SPIDER_STATUS_ADDR: ":30081"
     command:
       - ./dht-spider
       - -port=${DHT_PORT:-6881}
@@ -40,6 +41,7 @@ services:
     container_name: dht-search
     environment:
       SEARCH_API_PORT: "30080"
+      SPIDER_STATUS_URL: "http://dht-spider:30081/status"
       CONFIG_FILE_PATH: "/app/config.yml"
       APP_ENV: prod
     healthcheck:

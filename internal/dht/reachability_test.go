@@ -11,6 +11,27 @@ import (
 	"time"
 )
 
+func TestReachabilityStatus(t *testing.T) {
+	d := &DHT{}
+	if d.Reachability() != "checking" {
+		t.Fatal("uninitialized DHT must remain checking")
+	}
+	d.reachability = newReachabilityCheck()
+	d.ready.Store(true)
+	if d.Reachability() != "checking" {
+		t.Fatal("new check must remain checking")
+	}
+	d.reachability.recordResponse()
+	d.reachability.stopped.Store(true)
+	if d.Reachability() != "unknown" {
+		t.Fatal("outbound responses do not prove ingress")
+	}
+	d.reachability.reachable.Store(true)
+	if d.Reachability() != "reachable" {
+		t.Fatal("public ingress evidence was lost")
+	}
+}
+
 func TestReachabilityUnsolicited(t *testing.T) {
 	check := newReachabilityCheck()
 	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.0.1", "100.64.0.1", "169.254.1.1", "224.0.0.1", "0.0.0.0", "::1", "fc00::1", "fe80::1", "ff02::1"} {

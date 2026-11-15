@@ -318,6 +318,12 @@ func (wire *Wire) releaseRequest(r Request) {
 	}
 }
 
+func (wire *Wire) ConnectedPeers() int {
+	wire.connMu.Lock()
+	defer wire.connMu.Unlock()
+	return len(wire.connections)
+}
+
 func (wire *Wire) QueueStats() (requests, responses, active int) {
 	return len(wire.requests), len(wire.responses), len(wire.workerTokens)
 }
