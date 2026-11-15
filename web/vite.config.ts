@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': 'http://localhost:30080',
-      '/search': 'http://localhost:30080',
+      '^/search(?:\\?|$)': 'http://localhost:30080',
       '/health': 'http://localhost:30080'
     }
   },

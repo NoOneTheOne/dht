@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import SearchBar from './components/SearchBar';
 import ResultsTable from './components/ResultsTable';
+import Trending from './components/Trending';
 import ResourceDetail from './components/ResourceDetail';
 import { TorrentItem, SearchResponse } from './types';
 
@@ -85,10 +86,10 @@ function App() {
       <a className="skip-link" href="#main-content" onClick={event => { event.preventDefault(); document.getElementById('main-content')?.focus(); }}>跳到主要内容</a>
       <header className="site-header">
         <a className="brand" href="/" aria-label="DHT Search 首页"><img className="brand-mark" src="/search-icon.svg" alt="" width="33" height="33" /><span>DHT<span className="brand-light"> / SEARCH</span></span></a>
-        <span className="header-note">BitTorrent 元数据检索</span>
+        <nav className="header-nav" aria-label="主要导航"><a href="#" aria-current={!detailHash && route !== '#/trending' ? 'page' : undefined}>搜索</a><a href="#/trending" aria-current={route === '#/trending' ? 'page' : undefined}>资源热榜 ↗</a></nav>
       </header>
       <main id="main-content" tabIndex={-1}>
-        {detailHash ? <ResourceDetail key={detailHash} infohash={detailHash} /> : <>
+        {detailHash ? <ResourceDetail key={detailHash} infohash={detailHash} /> : route === '#/trending' ? <Trending /> : <>
         <section className="hero" aria-labelledby="page-title">
           <span className="eyebrow">DISCOVER THE DISTRIBUTED WEB</span>
           <h1 id="page-title">从关键词，找到<span>你的下一份发现。</span></h1>

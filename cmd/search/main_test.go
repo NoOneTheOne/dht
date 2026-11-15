@@ -50,6 +50,52 @@ func TestSearchHandlerInvalidParameters(t *testing.T) {
 	}
 }
 
+func TestTrendingHandler(t *testing.T) {
+	for _, tc := range []struct {
+		query         string
+		window        time.Duration
+		limit, status int
+	}{
+		{"", 24 * time.Hour, 10, 200}, {"window=1h&limit=1", time.Hour, 1, 200}, {"window=7d&limit=100", 7 * 24 * time.Hour, 100, 200},
+		{"window=2h", 0, 0, 400}, {"window=", 0, 0, 400}, {"limit=0", 0, 0, 400}, {"limit=101", 0, 0, 400}, {"limit=1.5", 0, 0, 400}, {"limit=", 0, 0, 400}, {"limit=-1", 0, 0, 400},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			calls := 0
+			router := gin.New()
+			router.GET("/api/trending", trendingHandler(func(ctx context.Context, window time.Duration, limit int, until time.Time) ([]mysql.Data, error) {
+				calls++
+				if window != tc.window || limit != tc.limit || time.Since(until) > time.Second {
+					t.Fatal("invalid ranking bounds")
+				}
+				return nil, nil
+			}))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest("GET", "/api/trending?"+tc.query, nil))
+			if response.Code != tc.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if tc.status == 400 && calls != 0 {
+				t.Fatal("invalid parameters queried storage")
+			}
+			if tc.status == 200 && !strings.Contains(response.Body.String(), `"items":[]`) {
+				t.Fatal("empty ranking must be JSON array")
+			}
+		})
+	}
+}
+
+func TestTrendingHandlerFailure(t *testing.T) {
+	router := gin.New()
+	router.GET("/api/trending", trendingHandler(func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error) {
+		return nil, errors.New("secret backend error")
+	}))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest("GET", "/api/trending", nil))
+	if response.Code != 500 || strings.Contains(response.Body.String(), "secret") {
+		t.Fatal("backend failure exposed")
+	}
+}
+
 func TestDetailHandler(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

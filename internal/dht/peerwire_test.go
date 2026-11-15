@@ -2,12 +2,14 @@ package dht
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,6 +47,253 @@ type shortWireConn struct {
 
 func (shortWireConn) Write(data []byte) (int, error) {
 	return len(data) - 1, nil
+}
+
+func TestPeerWireHandshakeShortWrite(t *testing.T) {
+	if err := sendHandshake(shortWireConn{}, make([]byte, 20), make([]byte, 20)); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("handshake short write = %v", err)
+	}
+}
+
+func TestPeerWirePipelineWindow(t *testing.T) {
+	metadata := bytes.Repeat([]byte{'x'}, BLOCK*11+7)
+	hash := sha1.Sum(metadata)
+	client, peer := net.Pipe()
+	defer peer.Close()
+	wire := NewWire(8, 1, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- wire.fetchMetadataConn(client, Request{InfoHash: hash[:]}, time.Now().Add(3*time.Second))
+	}()
+	if err := peerWireTestHandshake(peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendMessage(peer, append([]byte{EXTENDED, 0}, Encode(map[string]interface{}{
+		"m": map[string]interface{}{"ut_metadata": 7}, "metadata_size": len(metadata),
+	})...)); err != nil {
+		t.Fatal(err)
+	}
+	readRequest := func(want int) {
+		t.Helper()
+		buffer := new(bytes.Buffer)
+		if _, err := readMessage(peer, buffer); err != nil {
+			t.Fatal(err)
+		}
+		wantBytes := append([]byte{EXTENDED, 7}, Encode(map[string]interface{}{"msg_type": REQUEST, "piece": want})...)
+		if !bytes.Equal(buffer.Bytes(), wantBytes) {
+			t.Fatalf("request = %q, want piece %d", buffer.Bytes(), want)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		readRequest(i)
+	}
+	peer.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	var prefix [4]byte
+	if _, err := peer.Read(prefix[:]); err == nil {
+		t.Fatal("pipeline exceeded 8 requests")
+	}
+	peer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	pieces := (len(metadata) + BLOCK - 1) / BLOCK
+	for piece := 0; piece < pieces; piece++ {
+		payload := append([]byte{EXTENDED, 1}, Encode(map[string]interface{}{"msg_type": DATA, "piece": piece, "total_size": len(metadata)})...)
+		payload = append(payload, metadata[piece*BLOCK:min((piece+1)*BLOCK, len(metadata))]...)
+		if err := sendMessage(peer, payload); err != nil {
+			t.Fatal(err)
+		}
+		if piece+8 < pieces {
+			readRequest(piece + 8)
+		}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pipeline stalled")
+	}
+	if !bytes.Equal((<-wire.responses).MetadataInfo, metadata) {
+		t.Fatal("metadata changed")
+	}
+}
+
+func TestPeerWireBlockedWriterStopsWithReader(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	wire := NewWire(8, 1, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- wire.fetchMetadataConn(client, Request{InfoHash: make([]byte, 20)}, time.Now().Add(time.Second))
+	}()
+	if err := peerWireTestHandshake(peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendMessage(peer, append([]byte{EXTENDED, 0}, Encode(map[string]interface{}{
+		"m": map[string]interface{}{"ut_metadata": 7}, "metadata_size": BLOCK * 10,
+	})...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendMessage(peer, []byte{EXTENDED}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errMetadataProtocol) {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("blocked request writer leaked")
+	}
+}
+
+func TestWireStopReleasesReservations(t *testing.T) {
+	wire := NewWire(8, 16, 1)
+	for i := 0; i < 10; i++ {
+		hash := bytes.Repeat([]byte{byte(i)}, 20)
+		wire.Request(hash, "127.0.0.1", 1)
+	}
+	go wire.Run()
+	done := make(chan struct{})
+	go func() { wire.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wire did not stop")
+	}
+	if wire.queue.Len() != 0 || len(wire.infoHashes) != 0 || len(wire.requests) != 0 || len(wire.workerTokens) != 0 {
+		t.Fatal("stop leaked reservations")
+	}
+	if wire.Request(make([]byte, 20), "127.0.0.1", 6881) {
+		t.Fatal("stopped wire accepted work")
+	}
+}
+
+func protocolCount(stage, reason string) int64 {
+	for _, event := range GetProtocolEvents() {
+		if event.Stage == stage && event.Reason == reason {
+			return event.Count
+		}
+	}
+	return 0
+}
+
+func TestMetadataOutcomeReasons(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		reason string
+	}{
+		{nil, "success"}, {context.DeadlineExceeded, "timeout"}, {context.Canceled, "stopped"},
+		{errMetadataProtocol, "protocol_error"}, {errWireMessageTooLarge, "protocol_error"},
+		{errMetadataRejected, "rejected"}, {errMetadataHashMismatch, "hash_mismatch"}, {io.EOF, "io_error"},
+		{errMetadataResponseDropped, "response_backpressure"},
+	} {
+		before := protocolCount("metadata", tc.reason)
+		recordMetadataError(tc.err)
+		if protocolCount("metadata", tc.reason) != before+1 {
+			t.Fatalf("missing reason %s", tc.reason)
+		}
+	}
+}
+
+func TestWireQueueDropCountedOnce(t *testing.T) {
+	wire := NewWire(8, 1, 1)
+	before := GetStats().MetadataRequestsDropped
+	full := protocolCount("metadata_queue", "full")
+	wire.Request(bytes.Repeat([]byte{'a'}, 20), "127.0.0.1", 1)
+	if wire.Request(bytes.Repeat([]byte{'b'}, 20), "127.0.0.1", 2) {
+		t.Fatal("full queue accepted work")
+	}
+	if GetStats().MetadataRequestsDropped != before+1 || protocolCount("metadata_queue", "full") != full+1 {
+		t.Fatal("queue rejection counted incorrectly")
+	}
+}
+
+func TestPeerWireConflictingDuplicate(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	wire := NewWire(8, 1, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- wire.fetchMetadataConn(client, Request{InfoHash: make([]byte, 20)}, time.Now().Add(time.Second))
+	}()
+	if err := peerWireTestHandshake(peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendMessage(peer, append([]byte{EXTENDED, 0}, Encode(map[string]interface{}{"m": map[string]interface{}{"ut_metadata": 7}, "metadata_size": BLOCK * 2})...)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := readMessage(peer, new(bytes.Buffer)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, value := range []byte{'a', 'b'} {
+		payload := append([]byte{EXTENDED, 1}, Encode(map[string]interface{}{"msg_type": DATA, "piece": 0, "total_size": BLOCK * 2})...)
+		payload = append(payload, bytes.Repeat([]byte{value}, BLOCK)...)
+		if err := sendMessage(peer, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errMetadataProtocol) {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("conflicting duplicate did not stop download")
+	}
+}
+
+func TestPeerWireResponseBackpressure(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	wire := NewWire(8, 1, 1)
+	wire.responses = make(chan Response)
+	metadata := []byte("metadata")
+	hash := sha1.Sum(metadata)
+	done := make(chan error, 1)
+	go func() {
+		done <- wire.fetchMetadataConn(client, Request{InfoHash: hash[:]}, time.Now().Add(150*time.Millisecond))
+	}()
+	if err := peerWireTestHandshake(peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendMessage(peer, append([]byte{EXTENDED, 0}, Encode(map[string]interface{}{"m": map[string]interface{}{"ut_metadata": 7}, "metadata_size": len(metadata)})...)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readMessage(peer, new(bytes.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	payload := append([]byte{EXTENDED, 1}, Encode(map[string]interface{}{"msg_type": DATA, "piece": 0})...)
+	if err := sendMessage(peer, append(payload, metadata...)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errMetadataResponseDropped) {
+			t.Fatalf("backpressure error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backpressure ignored deadline")
+	}
+}
+
+func TestWireConcurrentRequestAndStop(t *testing.T) {
+	wire := NewWire(8, 64, 2)
+	go wire.Run()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Go(func() {
+			for j := 0; j < 50; j++ {
+				wire.Request(bytes.Repeat([]byte{byte(j)}, 20), "127.0.0.1", 1)
+			}
+		})
+	}
+	wire.Stop()
+	wg.Wait()
+	if wire.queue.Len() != 0 || len(wire.infoHashes) != 0 || len(wire.requests) != 0 || len(wire.connections) != 0 {
+		t.Fatal("concurrent stop leaked state")
+	}
 }
 
 func TestSendMessageShortWrite(t *testing.T) {

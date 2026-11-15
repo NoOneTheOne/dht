@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,11 +35,18 @@ func (s *RecoveryStore) Append(batch RecoveryBatch) error {
 		return fmt.Errorf("open recovery spool: %w", err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		return errors.Join(cause, file.Truncate(info.Size()), file.Sync())
+	}
 	if err := json.NewEncoder(file).Encode(batch); err != nil {
-		return fmt.Errorf("write recovery spool: %w", err)
+		return rollback(fmt.Errorf("write recovery spool: %w", err))
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync recovery spool: %w", err)
+		return rollback(fmt.Errorf("sync recovery spool: %w", err))
 	}
 	return nil
 }
@@ -62,6 +70,23 @@ func (s *RecoveryStore) Replay(write func(string, []Data) error) error {
 		err := decoder.Decode(&batch)
 		if err == io.EOF {
 			break
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			backup, backupErr := os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-damaged-*")
+			if backupErr != nil {
+				return backupErr
+			}
+			if _, backupErr = file.Seek(0, io.SeekStart); backupErr == nil {
+				_, backupErr = io.Copy(backup, file)
+			}
+			backupErr = errors.Join(backupErr, backup.Sync(), backup.Close())
+			if backupErr != nil {
+				return backupErr
+			}
+			if err := s.rewrite(remaining); err != nil {
+				return err
+			}
+			return fmt.Errorf("incomplete recovery tail preserved in %s", backup.Name())
 		}
 		if err != nil {
 			return fmt.Errorf("decode recovery spool: %w", err)

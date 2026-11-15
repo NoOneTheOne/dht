@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"sync"
 	"sync/atomic"
 )
 
@@ -42,6 +43,33 @@ func RecordMetadataRequestDropped() {
 
 func RecordMetadataResponseDropped() {
 	atomic.AddInt64(&globalStats.MetadataResponsesDropped, 1)
+}
+
+type ProtocolEvent struct {
+	Stage  string `json:"stage"`
+	Reason string `json:"reason"`
+	Count  int64  `json:"count"`
+}
+
+var protocolEvents = struct {
+	sync.Mutex
+	counts map[[2]string]int64
+}{counts: make(map[[2]string]int64)}
+
+func RecordProtocolEvent(stage, reason string) {
+	protocolEvents.Lock()
+	protocolEvents.counts[[2]string{stage, reason}]++
+	protocolEvents.Unlock()
+}
+
+func GetProtocolEvents() []ProtocolEvent {
+	protocolEvents.Lock()
+	defer protocolEvents.Unlock()
+	events := make([]ProtocolEvent, 0, len(protocolEvents.counts))
+	for key, count := range protocolEvents.counts {
+		events = append(events, ProtocolEvent{Stage: key[0], Reason: key[1], Count: count})
+	}
+	return events
 }
 
 // GetStats returns current statistics

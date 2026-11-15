@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -40,6 +41,7 @@ func TestWriteMySQLBatches(t *testing.T) {
 }
 
 func TestWriteMySQLBatchTickAndFailure(t *testing.T) {
+	t.Setenv("RECOVERY_FILE_PATH", filepath.Join(t.TempDir(), "recovery.jsonl"))
 	input := make(chan mysql.Data)
 	ticks := make(chan time.Time)
 	written := make(chan int, 2)
@@ -62,6 +64,44 @@ func TestWriteMySQLBatchTickAndFailure(t *testing.T) {
 	wg.Wait()
 	if n := <-written; n != 1 || len(written) != 0 {
 		t.Fatal("failed write retried or prevented subsequent flush")
+	}
+}
+
+func TestFailedBatchRetainsIDAndContents(t *testing.T) {
+	input := make(chan mysql.Data, 100)
+	for i := 0; i < 100; i++ {
+		input <- mysql.Data{Length: int64(i)}
+	}
+	close(input)
+	ticks := make(chan time.Time)
+	calls := make(chan string, 2)
+	done := make(chan struct{})
+	store := mysql.NewRecoveryStore(filepath.Join(t.TempDir(), "missing", "recovery.jsonl"))
+	go func() {
+		defer close(done)
+		attempt := 0
+		writeMySQLBatchesToStore(input, ticks, nil, func(id string, items []mysql.Data) error {
+			attempt++
+			calls <- id
+			if len(items) != 100 || items[99].Length != 99 {
+				t.Error("retained batch changed")
+			}
+			if attempt == 1 {
+				return errors.New("unavailable")
+			}
+			return nil
+		}, store)
+	}()
+	first := <-calls
+	ticks <- time.Now()
+	second := <-calls
+	if first != second {
+		t.Fatal("retry changed idempotency key")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retained batch did not drain")
 	}
 }
 

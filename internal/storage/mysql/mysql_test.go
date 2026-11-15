@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,75 @@ func stubInitialization(t *testing.T, init func() (*gorm.DB, error)) {
 	t.Cleanup(func() {
 		db, initDB = previousDB, previousInit
 	})
+}
+
+func TestWriteBatchSQLUsesProductionUpsert(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var query string
+	candidate.Callback().Create().After("gorm:create").Register("capture_production_upsert", func(tx *gorm.DB) { query = tx.Statement.SQL.String() })
+	rows := []Data{{InfoHash: strings.Repeat("a", 40), Count: 2, Files: []File{{Path: []string{"file"}, Length: 7}}}}
+	if err := upsertRows(candidate.Session(&gorm.Session{SkipDefaultTransaction: true}), rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"COALESCE(`count`, 0) + VALUES(`count`)", "`files`=IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"} {
+		if !strings.Contains(query, fragment) {
+			t.Fatalf("missing %s in %s", fragment, query)
+		}
+	}
+}
+
+func TestRecoveryReplayRetainsFailuresAndDamagedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.jsonl")
+	store := NewRecoveryStore(path)
+	for _, id := range []string{"first", "second"} {
+		if err := store.Append(RecoveryBatch{ID: id, Items: []Data{{Name: id}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.WriteString(`{"id":"partial`)
+	file.Close()
+	calls := 0
+	if err := store.Replay(func(id string, _ []Data) error {
+		calls++
+		if id == "second" {
+			return errors.New("offline")
+		}
+		return nil
+	}); err == nil {
+		t.Fatal("damaged tail not reported")
+	}
+	if calls != 2 {
+		t.Fatal("valid prefix not replayed")
+	}
+	backups, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".dht-recovery-damaged-*"))
+	if len(backups) != 1 {
+		t.Fatal("damaged original not preserved")
+	}
+	if err := store.Append(RecoveryBatch{ID: "third"}); err != nil {
+		t.Fatal(err)
+	}
+	var replayed []string
+	if err := store.Replay(func(id string, _ []Data) error { replayed = append(replayed, id); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(replayed, ",") != "second,third" {
+		t.Fatalf("replayed %v", replayed)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("completed spool not removed")
+	}
 }
 
 func TestGetDBRetriesFailureAndCachesSuccess(t *testing.T) {
@@ -239,6 +310,68 @@ func BenchmarkAggregateWrites(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestTrendingQuery(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	if err := candidate.Callback().Query().After("gorm:query").Register("capture_trending", func(tx *gorm.DB) {
+		calls++
+		sql := tx.Statement.SQL.String()
+		if !strings.Contains(sql, "JOIN (") {
+			calls--
+			return
+		}
+		for _, fragment := range []string{"SUM(`count`) AS hits", "JOIN (SELECT", "GROUP BY `infohash`", "applied = ? AND time >= ? AND time < ?", "ranked.hits AS count", "ORDER BY hits DESC, infohash ASC LIMIT ?", "ranked.hits DESC, resources.infohash ASC", "AS has_files"} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("missing %q in %s", fragment, sql)
+			}
+		}
+		vars := tx.Statement.Vars
+		if len(vars) != 4 || vars[0] != true || vars[1] != until.Add(-time.Hour) || vars[2] != until || vars[3] != 10 {
+			t.Fatalf("unexpected window vars: %v", vars)
+		}
+		if _, ok := tx.Statement.Context.Deadline(); !ok {
+			t.Fatal("missing timeout")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+	items, err := Trending(context.Background(), time.Hour, 10, until)
+	if err != nil || items == nil || calls != 1 {
+		t.Fatalf("items=%v calls=%d err=%v", items, calls, err)
+	}
+	for _, tc := range []struct {
+		window time.Duration
+		limit  int
+	}{{2 * time.Hour, 10}, {time.Hour, 0}, {time.Hour, 101}} {
+		if _, err := Trending(context.Background(), tc.window, tc.limit, until); err == nil {
+			t.Fatal("invalid parameters accepted")
+		}
+	}
+	statement := &gorm.Statement{DB: candidate}
+	if err := statement.Parse(&Observation{}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, index := range statement.Schema.ParseIndexes() {
+		if index.Name == "idx_observation_window" && len(index.Fields) == 2 && index.Fields[0].DBName == "applied" && index.Fields[1].DBName == "time" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing observation window index")
 	}
 }
 

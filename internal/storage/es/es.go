@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
-	"github.com/NoOneTheOne/dht/internal/logging"
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
 )
@@ -21,24 +20,24 @@ import (
 var (
 	client     *elasticsearch.Client
 	clientOnce sync.Once
+	clientErr  error
 )
 
-func getClient() *elasticsearch.Client {
+func getClient() (*elasticsearch.Client, error) {
 	clientOnce.Do(func() {
 		c := config.GetConfig()
-		var err error
-		client, err = elasticsearch.NewClient(elasticsearch.Config{
+		client, clientErr = elasticsearch.NewClient(elasticsearch.Config{
 			Addresses: c.Elasticsearch.Addresses,
 			Username:  c.Elasticsearch.Username,
 			Password:  c.Elasticsearch.Password,
 			// A lost update response must not cause another count increment.
 			DisableRetry: true,
 		})
-		if err != nil {
-			logging.Fatalf("failed to create elasticsearch client: %v", err)
+		if clientErr != nil {
+			clientErr = fmt.Errorf("create elasticsearch client: %w", clientErr)
 		}
 	})
-	return client
+	return client, clientErr
 }
 
 // Write counts successful metadata writes, not DHT announces.
@@ -88,7 +87,10 @@ func write(c *elasticsearch.Client, i, t string, data []byte) (string, error) {
 	defer cancel()
 
 	if c == nil {
-		c = getClient()
+		c, err = getClient()
+		if err != nil {
+			return "", err
+		}
 	}
 	// Only Elasticsearch's bounded version-conflict retries are safe here.
 	res, err := req.Do(ctx, c)
@@ -126,12 +128,17 @@ func Search(q string) map[string]interface{} {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	res, err := getClient().Search(
-		getClient().Search.WithContext(ctx),
-		getClient().Search.WithIndex(c.Elasticsearch.Index),
-		getClient().Search.WithBody(&buf),
-		getClient().Search.WithTrackTotalHits(true),
-		getClient().Search.WithPretty(),
+	client, err := getClient()
+	if err != nil {
+		slog.Error("error creating elasticsearch client", "error", err, "component", "elasticsearch")
+		return nil
+	}
+	res, err := client.Search(
+		client.Search.WithContext(ctx),
+		client.Search.WithIndex(c.Elasticsearch.Index),
+		client.Search.WithBody(&buf),
+		client.Search.WithTrackTotalHits(true),
+		client.Search.WithPretty(),
 	)
 	if err != nil {
 		slog.Error("error searching elasticsearch", "error", err, "component", "elasticsearch")

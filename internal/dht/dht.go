@@ -148,8 +148,14 @@ type DHT struct {
 	packets            chan packet
 	workerTokens       chan struct{}
 	stopOnce           sync.Once
+	runOnce            sync.Once
 	stop               chan struct{}
 	stopped            chan struct{}
+	background         sync.WaitGroup
+	packetWorkers      sync.WaitGroup
+	listenerDone       chan struct{}
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // New returns a DHT pointer. If config is nil, then config will be set to
@@ -220,9 +226,9 @@ func (dht *DHT) init() {
 	dht.bootstrapMgr = newBootstrapManager(dht)
 	dht.reachability = newReachabilityCheck()
 
-	go dht.transactionManager.run()
-	go dht.tokenManager.clear()
-	go dht.blackList.clear()
+	dht.background.Go(dht.transactionManager.run)
+	dht.background.Go(dht.tokenManager.clear)
+	dht.background.Go(func() { dht.blackList.clear(dht.stop) })
 }
 
 // join makes current node join the dht network.
@@ -249,8 +255,9 @@ func (dht *DHT) join() {
 
 // listen receives message from udp.
 func (dht *DHT) listen() {
+	dht.listenerDone = make(chan struct{})
 	go func() {
-		defer close(dht.stopped)
+		defer close(dht.listenerDone)
 		for {
 			bufp := udpBufPool.Get().(*[]byte)
 			buff := *bufp
@@ -274,6 +281,9 @@ func (dht *DHT) listen() {
 			case dht.packets <- packet{data, RealAddress}:
 			case <-dht.stop:
 				return
+			default:
+				RecordPacketDropped()
+				RecordProtocolEvent("packet_queue", "full")
 			}
 		}
 	}()
@@ -327,18 +337,36 @@ func (dht *DHT) Run() {
 
 // RunContext starts the dht until ctx is canceled.
 func (dht *DHT) RunContext(ctx context.Context) {
+	started := false
+	dht.runOnce.Do(func() { started = true })
+	if !started {
+		return
+	}
+	select {
+	case <-dht.stop:
+		close(dht.stopped)
+		return
+	default:
+	}
+	dht.ctx, dht.cancel = context.WithCancel(ctx)
 	dht.init()
 	dht.listen()
-	go dht.reachability.logStartup(dht.conn.LocalAddr().(*net.UDPAddr).Port)
+	dht.background.Go(func() { dht.reachability.logStartupContext(dht.ctx, dht.conn.LocalAddr().(*net.UDPAddr).Port) })
 	dht.ready.Store(true)
-	go dht.join()
+	dht.background.Go(dht.join)
 
 	var pkt packet
 	kBucketTicker := time.NewTicker(dht.CheckKBucketPeriod)
 	defer kBucketTicker.Stop()
 	evictTicker := time.NewTicker(10 * time.Minute)
 	defer evictTicker.Stop()
-	defer dht.closeResources()
+	defer func() {
+		dht.closeResources()
+		<-dht.listenerDone
+		dht.packetWorkers.Wait()
+		dht.background.Wait()
+		close(dht.stopped)
+	}()
 
 	for {
 		select {
@@ -351,19 +379,20 @@ func (dht *DHT) RunContext(ctx context.Context) {
 		case <-kBucketTicker.C:
 			// Use bootstrap manager to check if re-bootstrap is needed
 			if dht.bootstrapMgr.needsRebootstrap() {
-				go dht.join()
+				dht.background.Go(dht.join)
 			} else if dht.transactionManager.len() == 0 {
 				// Use optimized refresh instead of regular Fresh
-				go dht.routingTable.OptimizedRefresh()
+				dht.background.Go(dht.routingTable.OptimizedRefresh)
 			}
 		case <-evictTicker.C:
 			// Periodically evict stale nodes (older than 15 minutes)
-			go dht.routingTable.EvictStaleNodes(15 * time.Minute)
+			dht.background.Go(func() { dht.routingTable.EvictStaleNodes(15 * time.Minute) })
 		}
 	}
 }
 
 func (dht *DHT) closeResources() {
+	dht.cancel()
 	dht.ready.Store(false)
 	dht.stopOnce.Do(func() { close(dht.stop) })
 	if dht.conn != nil {
@@ -373,12 +402,8 @@ func (dht *DHT) closeResources() {
 
 // Stop stops the DHT and closes its UDP listener.
 func (dht *DHT) Stop() {
-	dht.stopOnce.Do(func() {
-		close(dht.stop)
-		if dht.conn != nil {
-			_ = dht.conn.Close()
-		}
-	})
+	dht.stopOnce.Do(func() { close(dht.stop) })
+	dht.runOnce.Do(func() { close(dht.stopped) })
 	<-dht.stopped
 }
 
@@ -388,14 +413,23 @@ type DHTStats struct {
 	BootstrapCount     int
 	ActiveTransactions int
 	BlacklistedNodes   int
+	PacketQueueDepth   int
+	QueryQueueDepth    int
+	PacketWorkers      int
 }
 
 // GetDHTStats returns current DHT statistics
 func (dht *DHT) GetDHTStats() DHTStats {
+	if !dht.ready.Load() {
+		return DHTStats{}
+	}
 	stats := DHTStats{
 		RoutingTableNodes:  dht.routingTable.Len(),
 		ActiveTransactions: dht.transactionManager.len(),
 		BlacklistedNodes:   dht.blackList.len(),
+		PacketQueueDepth:   len(dht.packets),
+		QueryQueueDepth:    len(dht.transactionManager.queryChan),
+		PacketWorkers:      len(dht.workerTokens),
 	}
 	if dht.bootstrapMgr != nil {
 		count, _ := dht.bootstrapMgr.getBootstrapStats()

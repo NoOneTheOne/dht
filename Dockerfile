@@ -34,6 +34,8 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 WORKDIR /app
 COPY --from=builder /build/dht-spider .
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
+ENV RECOVERY_FILE_PATH=/app/data/recovery.jsonl
 USER appuser
 
 EXPOSE 6881/udp

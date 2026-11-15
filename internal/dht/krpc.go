@@ -53,7 +53,10 @@ func newTokenManager(expiredAfter time.Duration, dht *DHT) *tokenManager {
 // token returns a token. If it doesn't exist or is expired, it will add a
 // new token.
 func (tm *tokenManager) token(addr *net.UDPAddr) string {
-	v, ok := tm.Get(addr.IP.String())
+	tm.Lock()
+	defer tm.Unlock()
+	key := addr.IP.String()
+	v, ok := tm.data[key]
 	tk, _ := v.(token)
 
 	if !ok || time.Since(tk.createTime) > tm.expiredAfter {
@@ -62,7 +65,7 @@ func (tm *tokenManager) token(addr *net.UDPAddr) string {
 			createTime: time.Now(),
 		}
 
-		tm.Set(addr.IP.String(), tk)
+		tm.data[key] = tk
 	}
 
 	return tk.data
@@ -72,30 +75,37 @@ func (tm *tokenManager) token(addr *net.UDPAddr) string {
 func (tm *tokenManager) clear() {
 	ticker := time.NewTicker(time.Minute * 3)
 	defer ticker.Stop()
-	for range ticker.C {
-		keys := make([]interface{}, 0, 100)
-
-		for item := range tm.Iter() {
-			if time.Since(item.val.(token).createTime) > tm.expiredAfter {
-				keys = append(keys, item.key)
+	for {
+		select {
+		case <-tm.dht.stop:
+			return
+		case <-ticker.C:
+		}
+		tm.Lock()
+		for key, value := range tm.data {
+			if time.Since(value.(token).createTime) > tm.expiredAfter {
+				delete(tm.data, key)
 			}
 		}
-
-		tm.DeleteMulti(keys)
+		tm.Unlock()
 	}
 }
 
 // check returns whether the token is valid.
 func (tm *tokenManager) check(addr *net.UDPAddr, tokenString string) bool {
+	tm.Lock()
+	defer tm.Unlock()
 	key := addr.IP.String()
-	v, ok := tm.Get(key)
-	tk, _ := v.(token)
-
-	if ok {
-		tm.Delete(key)
+	v, ok := tm.data[key]
+	if !ok {
+		return false
 	}
-
-	return ok && tokenString == tk.data
+	tk := v.(token)
+	if time.Since(tk.createTime) > tm.expiredAfter {
+		delete(tm.data, key)
+		return false
+	}
+	return tokenString == tk.data
 }
 
 // makeQuery returns a query-formed data.
@@ -148,8 +158,11 @@ type query struct {
 // transaction implements transaction.
 type transaction struct {
 	*query
-	id       string
-	response chan struct{}
+	id          string
+	response    chan struct{}
+	mu          sync.Mutex
+	completed   bool
+	remoteError bool
 }
 
 // transactionManager represents the manager of transactions.
@@ -166,6 +179,9 @@ type transactionManager struct {
 
 // newTransactionManager returns new transactionManager pointer.
 func newTransactionManager(maxCursor uint64, dht *DHT) *transactionManager {
+	if maxCursor == 0 {
+		maxCursor = 1
+	}
 	return &transactionManager{
 		RWMutex:      &sync.RWMutex{},
 		transactions: newSyncedMap(),
@@ -212,7 +228,7 @@ func (tm *transactionManager) insert(trans *transaction) bool {
 	defer tm.Unlock()
 
 	key := tm.genIndexKeyByTrans(trans)
-	if tm.index.Has(key) {
+	if tm.index.Has(key) || tm.transactions.Has(trans.id) {
 		return false
 	}
 	tm.transactions.Set(trans.id, trans)
@@ -291,27 +307,54 @@ func (tm *transactionManager) query(q *query, try int) {
 	if !tm.insert(trans) {
 		return
 	}
-	defer tm.delete(trans.id)
-
-	success := false
-loop:
-	for i := 0; i < try; i++ {
-		if err := send(tm.dht, q.node.addr, q.data); err != nil {
-			break
+	outcome := "stopped"
+	defer func() {
+		trans.mu.Lock()
+		if outcome == "reply" {
+			outcome = "success"
+			if trans.remoteError {
+				outcome = "remote_error"
+			}
 		}
+		trans.completed = true
+		trans.mu.Unlock()
+		tm.delete(trans.id)
+		RecordProtocolEvent("query", outcome)
+	}()
 
+	for i := 0; i < try; i++ {
+		select {
+		case <-tm.dht.stop:
+			return
+		default:
+		}
+		if err := send(tm.dht, q.node.addr, q.data); err != nil {
+			outcome = "send_error"
+			return
+		}
+		timer := time.NewTimer(tm.dht.QueryTimeout)
 		select {
 		case <-trans.response:
-			success = true
-			break loop
-		case <-time.After(tm.dht.QueryTimeout):
+			outcome = "reply"
+			timer.Stop()
+			return
+		case <-tm.dht.stop:
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 
-	if !success && q.node.id != nil {
-		tm.dht.blackList.insert(q.node.addr.IP.String(), q.node.addr.Port)
-		tm.dht.routingTable.RemoveByAddr(q.node.addr.String())
+	trans.mu.Lock()
+	defer trans.mu.Unlock()
+	outcome = "timeout"
+	if trans.completed {
+		outcome = "reply"
 	}
+	if !trans.completed && q.node.id != nil {
+		tm.dht.routingTable.removeContact(q.node, false)
+	}
+	trans.completed = true
 }
 
 // run starts to listen and consume the query chan.
@@ -321,7 +364,22 @@ func (tm *transactionManager) run() {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for q := range tm.queryChan {
+			for {
+				select {
+				case <-tm.dht.stop:
+					return
+				default:
+				}
+				var q *query
+				select {
+				case <-tm.dht.stop:
+					return
+				case value, ok := <-tm.queryChan:
+					if !ok {
+						return
+					}
+					q = value
+				}
 				if !tm.dht.blackList.in(q.node.addr.IP.String(), q.node.addr.Port) {
 					tm.query(q, tm.dht.Try)
 				}
@@ -332,6 +390,20 @@ func (tm *transactionManager) run() {
 		}()
 	}
 	workers.Wait()
+	tm.Lock()
+	defer tm.Unlock()
+	clear(tm.pending)
+	for {
+		select {
+		case _, ok := <-tm.queryChan:
+			if !ok {
+				return
+			}
+			RecordProtocolEvent("query_queue", "stopped")
+		default:
+			return
+		}
+	}
 }
 
 // sendQuery send query-formed data to the chan.
@@ -354,6 +426,12 @@ func (tm *transactionManager) sendQuery(
 	key := tm.genIndexKey(queryType, no.addr.String())
 	tm.Lock()
 	defer tm.Unlock()
+	select {
+	case <-tm.dht.stop:
+		RecordProtocolEvent("query_queue", "stopped")
+		return
+	default:
+	}
 	if _, exists := tm.pending[key]; exists {
 		return
 	}
@@ -362,6 +440,7 @@ func (tm *transactionManager) sendQuery(
 	case tm.queryChan <- q:
 	default:
 		delete(tm.pending, key)
+		RecordProtocolEvent("query_queue", "full")
 	}
 }
 
@@ -692,8 +771,12 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	if trans == nil {
 		return
 	}
+	trans.mu.Lock()
+	defer trans.mu.Unlock()
+	if trans.completed {
+		return
+	}
 
-	// inform transManager to delete the transaction.
 	if err := ParseKey(response, "r", "map"); err != nil {
 		return
 	}
@@ -713,12 +796,13 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	}
 
 	id := r["id"].(string)
+	if len(id) != 20 || id == dht.node.id.RawString() {
+		return
+	}
 
-	// If response's node id is not the same with the node id in the
-	// transaction, raise error.
-	if trans.node.id != nil && trans.node.id.RawString() != r["id"].(string) {
-		dht.blackList.insert(addr.IP.String(), addr.Port)
-		dht.routingTable.RemoveByAddr(addr.String())
+	// A stale transaction must not evict a contact refreshed by another query.
+	if trans.node.id != nil && trans.node.id.RawString() != id {
+		dht.routingTable.failNode(trans.node)
 		return
 	}
 
@@ -743,10 +827,16 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 
+		if err := ParseKey(a, "info_hash", "string"); err != nil || len(a["info_hash"].(string)) != 20 {
+			return
+		}
 		token := r["token"].(string)
 		infoHash := a["info_hash"].(string)
 
-		if err := ParseKey(r, "values", "list"); err == nil {
+		if _, exists := r["values"]; exists {
+			if err := ParseKey(r, "values", "list"); err != nil {
+				return
+			}
 			values := r["values"].([]interface{})
 			for _, v := range values {
 				compactInfo, ok := v.(string)
@@ -771,7 +861,7 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
-	// A duplicate response must not block packet handling after notification.
+	trans.completed = true
 	select {
 	case trans.response <- struct{}{}:
 	default:
@@ -794,19 +884,32 @@ func handleError(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
-	if e := response["e"].([]interface{}); len(e) != 2 {
+	e := response["e"].([]interface{})
+	if len(e) != 2 {
+		return
+	}
+	if _, ok := e[0].(int); !ok {
+		return
+	}
+	if _, ok := e[1].(string); !ok {
 		return
 	}
 
-	if trans := dht.transactionManager.filterOne(
-		response["t"].(string), addr); trans != nil {
-
-		select {
-		case trans.response <- struct{}{}:
-		default:
-		}
+	trans := dht.transactionManager.filterOne(response["t"].(string), addr)
+	if trans == nil {
+		return
 	}
-
+	trans.mu.Lock()
+	defer trans.mu.Unlock()
+	if trans.completed {
+		return
+	}
+	trans.remoteError = true
+	trans.completed = true
+	select {
+	case trans.response <- struct{}{}:
+	default:
+	}
 	return true
 }
 
@@ -823,10 +926,13 @@ func handle(dht *DHT, pkt packet) {
 	case dht.workerTokens <- struct{}{}:
 	default:
 		RecordPacketDropped()
+		RecordProtocolEvent("packet_worker", "full")
 		return
 	}
 
+	dht.packetWorkers.Add(1)
 	go func() {
+		defer dht.packetWorkers.Done()
 		defer func() {
 			<-dht.workerTokens
 		}()
@@ -837,16 +943,22 @@ func handle(dht *DHT, pkt packet) {
 
 		data, err := Decode(pkt.data)
 		if err != nil {
+			RecordProtocolEvent("packet", "decode_error")
 			return
 		}
 
 		response, err := parseMessage(data)
 		if err != nil {
+			RecordProtocolEvent("packet", "invalid_envelope")
 			return
 		}
 
 		if f, ok := handlers[response["y"].(string)]; ok {
-			f(dht, pkt.RealAddress, response)
+			if !f(dht, pkt.RealAddress, response) {
+				RecordProtocolEvent("packet", "rejected")
+			}
+		} else {
+			RecordProtocolEvent("packet", "unknown_type")
 		}
 	}()
 }

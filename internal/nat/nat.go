@@ -216,6 +216,9 @@ type AutoMap struct {
 	mu        sync.RWMutex
 	stopCh    chan struct{}
 	refreshCh chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+	workers   sync.WaitGroup
 }
 
 // NewAutoMap creates a new AutoMap instance
@@ -233,9 +236,15 @@ func (am *AutoMap) Map(protocol string, externalPort, internalPort int, desc str
 	am.mu.Lock()
 	defer am.mu.Unlock()
 
+	select {
+	case <-am.stopCh:
+		return nil, errors.New("port mapping is stopped")
+	default:
+	}
 	key := mappingKey(protocol, externalPort, internalPort)
 	if m, ok := am.mappings[key]; ok {
-		return m, nil
+		copy := *m
+		return &copy, nil
 	}
 
 	// Get external IP
@@ -262,10 +271,16 @@ func (am *AutoMap) Map(protocol string, externalPort, internalPort int, desc str
 
 	am.mappings[key] = m
 
-	// Start refresh goroutine if not already running
-	go am.refreshLoop()
+	am.startOnce.Do(func() {
+		am.workers.Add(1)
+		go func() {
+			defer am.workers.Done()
+			am.refreshLoop()
+		}()
+	})
 
-	return m, nil
+	copy := *m
+	return &copy, nil
 }
 
 // Unmap removes a port mapping
@@ -294,7 +309,11 @@ func (am *AutoMap) GetMapping(protocol string, externalPort, internalPort int) (
 
 	key := mappingKey(protocol, externalPort, internalPort)
 	m, ok := am.mappings[key]
-	return m, ok
+	if !ok {
+		return nil, false
+	}
+	copy := *m
+	return &copy, true
 }
 
 // GetAllMappings returns all active mappings
@@ -304,18 +323,22 @@ func (am *AutoMap) GetAllMappings() []*Mapping {
 
 	mappings := make([]*Mapping, 0, len(am.mappings))
 	for _, m := range am.mappings {
-		mappings = append(mappings, m)
+		copy := *m
+		mappings = append(mappings, &copy)
 	}
 	return mappings
 }
 
 // Stop stops the auto-refresh loop
 func (am *AutoMap) Stop() {
-	close(am.stopCh)
+	am.mu.Lock()
+	am.stopOnce.Do(func() { close(am.stopCh) })
+	am.mu.Unlock()
+	am.workers.Wait()
 }
 
 func (am *AutoMap) refreshLoop() {
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -334,6 +357,11 @@ func (am *AutoMap) refreshMappings() {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 
+	select {
+	case <-am.stopCh:
+		return
+	default:
+	}
 	now := time.Now()
 	for key, m := range am.mappings {
 		// Refresh if expiring within 10 minutes
@@ -342,7 +370,6 @@ func (am *AutoMap) refreshMappings() {
 			err := am.nat.AddPortMapping(m.Protocol, m.External, m.Internal, m.Desc, timeout)
 			if err != nil {
 				log.Printf("[NAT] Failed to refresh mapping %s: %v", key, err)
-				delete(am.mappings, key)
 				continue
 			}
 			m.Expires = now.Add(timeout)

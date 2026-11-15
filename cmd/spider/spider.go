@@ -108,44 +108,75 @@ func writeMySQLBatchesUntil(input <-chan mysql.Data, ticks <-chan time.Time, sto
 	writeMySQLBatchesWithRecovery(input, ticks, stop, write)
 }
 
+func recoveryStore() *mysql.RecoveryStore {
+	path := os.Getenv("RECOVERY_FILE_PATH")
+	if path == "" {
+		path = filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl")
+	}
+	return mysql.NewRecoveryStore(path)
+}
+
 func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
+	writeMySQLBatchesToStore(input, ticks, stop, write, recoveryStore())
+}
+
+func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error, store *mysql.RecoveryStore) {
 	batch := make([]mysql.Data, 0, 100)
-	flush := func() {
+	batchID := ""
+	flush := func() bool {
 		if len(batch) == 0 {
-			return
+			return true
 		}
-		start := time.Now()
-		batchID, idErr := mysql.NewBatchID()
-		if idErr != nil {
-			slog.Error("MySQL batch ID generation failed", "component", "mysql", "event", "mysql_batch_id_failed", "error", idErr)
-			return
+		if batchID == "" {
+			var err error
+			batchID, err = mysql.NewBatchID()
+			if err != nil {
+				slog.Error("MySQL batch ID generation failed", "component", "mysql", "error", err)
+				return false
+			}
 		}
 		if err := write(batchID, batch); err != nil {
-			store := mysql.NewRecoveryStore(filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl"))
-			if store != nil {
-				if spoolErr := store.Append(mysql.RecoveryBatch{ID: batchID, Items: append([]mysql.Data(nil), batch...)}); spoolErr != nil {
-					slog.Error("MySQL recovery spool failed", "component", "mysql", "event", "mysql_recovery_spool_failed", "error", spoolErr)
-				}
+			if spoolErr := store.Append(mysql.RecoveryBatch{ID: batchID, Items: batch}); spoolErr != nil {
+				slog.Error("MySQL and recovery write failed; retaining batch with backpressure", "component", "mysql", "event", "mysql_recovery_spool_failed", "batch_id", batchID, "error", err, "spool_error", spoolErr)
+				return false
 			}
-			slog.Error("MySQL batch write failed; recovery is required", "component", "mysql", "event", "mysql_batch_failed", "operation", "write_batch", "observations", len(batch), "duration_ms", float64(time.Since(start))/float64(time.Millisecond), "error", err)
+			slog.Error("MySQL batch deferred for recovery", "component", "mysql", "event", "mysql_batch_failed", "batch_id", batchID, "observations", len(batch), "error", err)
 		}
 		batch = batch[:0]
+		batchID = ""
+		return true
 	}
+	finish := func() {
+		for !flush() {
+			timer := time.NewTimer(time.Second)
+			<-timer.C
+		}
+	}
+	replay := time.NewTicker(time.Minute)
+	defer replay.Stop()
 	for {
+		incoming := input
+		if len(batch) >= 100 || batchID != "" {
+			incoming = nil
+		}
 		select {
-		case item, ok := <-input:
+		case item, ok := <-incoming:
 			if !ok {
-				flush()
+				finish()
 				return
 			}
 			batch = append(batch, item)
-			if len(batch) == cap(batch) {
+			if len(batch) == 100 {
 				flush()
 			}
 		case <-ticks:
 			flush()
+		case <-replay.C:
+			if err := store.Replay(write); err != nil {
+				slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
+			}
 		case <-stop:
-			flush()
+			finish()
 			return
 		}
 	}
@@ -165,8 +196,10 @@ func main() {
 	}
 	var c = config.GetConfig()
 
+	natStop := make(chan struct{})
+	defer close(natStop)
 	if *autoNAT {
-		go setupNAT(*port)
+		go setupNAT(*port, natStop)
 	} else {
 		log.Printf("[NAT] Manual forwarding: public UDP %d -> node UDP %d; preserve the source port for outbound UDP", *port, *port)
 	}
@@ -178,7 +211,7 @@ func main() {
 	if c.Storage.Type == "mysql" {
 		go func() {
 			defer close(writeDone)
-			store := mysql.NewRecoveryStore(filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl"))
+			store := recoveryStore()
 			if store != nil {
 				if err := store.Replay(func(id string, items []mysql.Data) error { return mysql.WriteBatchWithID(id, items) }); err != nil {
 					slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
@@ -199,21 +232,25 @@ func main() {
 		for resp := range w.Response() {
 			metadata, err := dht.Decode(resp.MetadataInfo)
 			if err != nil {
+				dht.RecordProtocolEvent("metadata_decode", "decode_error")
 				continue
 			}
 
 			info, ok := metadata.(map[string]interface{})
 			if !ok {
+				dht.RecordProtocolEvent("metadata_decode", "invalid_info")
 				continue
 			}
 
 			name, ok := info["name"].(string)
 			if !ok || name == "" {
+				dht.RecordProtocolEvent("metadata_decode", "invalid_name")
 				continue
 			}
 
 			files, length, ok := torrentFiles(info)
 			if !ok {
+				dht.RecordProtocolEvent("metadata_decode", "invalid_files")
 				continue
 			}
 			infoHash := hex.EncodeToString(resp.InfoHash)
@@ -265,9 +302,7 @@ func main() {
 			return
 		}
 		dht.RecordTorrentDiscovered()
-		if !w.Request([]byte(infoHash), ip, peerPort) {
-			dht.RecordMetadataRequestDropped()
-		}
+		w.Request([]byte(infoHash), ip, peerPort)
 	}
 	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
 		queuePeer(infoHash, ip, port)
@@ -283,7 +318,16 @@ func main() {
 	metrics.SetDHTStatsGetter(func() metrics.DHTStats {
 		stats := dht.GetStats()
 		dhtStats := d.GetDHTStats()
+		requests, responses, active := w.QueueStats()
+		events := dht.GetProtocolEvents()
+		protocolEvents := make([]metrics.ProtocolEvent, len(events))
+		for i, event := range events {
+			protocolEvents[i] = metrics.ProtocolEvent{Stage: event.Stage, Reason: event.Reason, Count: event.Count}
+		}
 		return metrics.DHTStats{
+			ProtocolEvents:           protocolEvents,
+			QueueDepths:              map[string]int{"packet": dhtStats.PacketQueueDepth, "query": dhtStats.QueryQueueDepth, "metadata_request": requests, "metadata_response": responses, "mysql_write": len(mysqlWrites)},
+			ActiveWorkers:            map[string]int{"packet": dhtStats.PacketWorkers, "query": dhtStats.ActiveTransactions, "metadata": active},
 			RoutingTableNodes:        dhtStats.RoutingTableNodes,
 			BootstrapCount:           dhtStats.BootstrapCount,
 			PacketsReceived:          int(stats.PacketsReceived),
@@ -299,6 +343,24 @@ func main() {
 
 	stopSignal := make(chan os.Signal, 1)
 	shutdownDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-shutdownDone:
+				return
+			case <-ticker.C:
+				requests, responses, active := w.QueueStats()
+				stats := d.GetDHTStats()
+				slog.Info("DHT protocol summary", "component", "dht", "event", "dht_protocol_summary",
+					"protocol_events", dht.GetProtocolEvents(), "packet_queue", stats.PacketQueueDepth,
+					"query_queue", stats.QueryQueueDepth, "metadata_request_queue", requests,
+					"metadata_response_queue", responses, "mysql_write_queue", len(mysqlWrites),
+					"packet_workers", stats.PacketWorkers, "query_workers", stats.ActiveTransactions, "metadata_workers", active)
+			}
+		}
+	}()
 	signal.Notify(stopSignal, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		defer close(shutdownDone)
@@ -312,7 +374,7 @@ func main() {
 	<-shutdownDone
 }
 
-func setupNAT(port int) {
+func setupNAT(port int, stop <-chan struct{}) {
 	natDevice, err := nat.Discover()
 	if err != nil {
 		log.Printf("[NAT] No NAT device found, skipping port mapping")
@@ -333,8 +395,5 @@ func setupNAT(port int) {
 
 	log.Printf("[NAT] Successfully mapped %s:%d -> :%d", mapping.ExternalIP, mapping.External, mapping.Internal)
 
-	// Keep the mappings alive until process exits — use a blocking wait
-	// that can be interrupted by signals instead of select{}.
-	done := make(chan struct{})
-	<-done
+	<-stop
 }

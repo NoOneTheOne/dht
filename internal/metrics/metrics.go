@@ -354,6 +354,48 @@ var (
 	dhtStatsGetter   func() DHTStats
 )
 
+type ProtocolEvent struct {
+	Stage  string
+	Reason string
+	Count  int64
+}
+
+type protocolCollector struct {
+	events  *prometheus.Desc
+	queues  *prometheus.Desc
+	workers *prometheus.Desc
+}
+
+func (c *protocolCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.events
+	ch <- c.queues
+	ch <- c.workers
+}
+
+func (c *protocolCollector) Collect(ch chan<- prometheus.Metric) {
+	if dhtStatsGetter == nil {
+		return
+	}
+	stats := dhtStatsGetter()
+	for _, event := range stats.ProtocolEvents {
+		ch <- prometheus.MustNewConstMetric(c.events, prometheus.CounterValue, float64(event.Count), event.Stage, event.Reason)
+	}
+	for name, depth := range stats.QueueDepths {
+		ch <- prometheus.MustNewConstMetric(c.queues, prometheus.GaugeValue, float64(depth), name)
+	}
+	for name, active := range stats.ActiveWorkers {
+		ch <- prometheus.MustNewConstMetric(c.workers, prometheus.GaugeValue, float64(active), name)
+	}
+}
+
+func init() {
+	prometheus.MustRegister(&protocolCollector{
+		events:  prometheus.NewDesc("dht_protocol_events_total", "Protocol outcomes by bounded stage and reason", []string{"stage", "reason"}, nil),
+		queues:  prometheus.NewDesc("dht_queue_depth", "Current buffered jobs by queue", []string{"queue"}, nil),
+		workers: prometheus.NewDesc("dht_active_workers", "Current active workers by pool", []string{"pool"}, nil),
+	})
+}
+
 // DHTStats holds DHT network statistics
 type DHTStats struct {
 	RoutingTableNodes        int
@@ -366,6 +408,9 @@ type DHTStats struct {
 	PacketsDropped           int
 	MetadataRequestsDropped  int
 	MetadataResponsesDropped int
+	ProtocolEvents           []ProtocolEvent
+	QueueDepths              map[string]int
+	ActiveWorkers            map[string]int
 }
 
 // SetMySQLStatsGetter sets the function to get MySQL connection stats

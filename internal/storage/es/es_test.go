@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/elastic/go-elasticsearch/v7"
@@ -174,6 +175,21 @@ func TestWriteExistingCount(t *testing.T) {
 				t.Fatalf("unexpected stored document: %s", stored)
 			}
 		})
+	}
+}
+
+func TestWriteClientInitializationErrorIsReturned(t *testing.T) {
+	previousClient, previousErr := client, clientErr
+	t.Cleanup(func() {
+		client, clientErr = previousClient, previousErr
+		clientOnce = sync.Once{}
+	})
+	client = nil
+	clientErr = errors.New("invalid elasticsearch address")
+	clientOnce = sync.Once{}
+	clientOnce.Do(func() {})
+	if _, err := Write("metadata", "torrent", []byte(`{"infohash":"`+testInfohash+`"}`)); !errors.Is(err, clientErr) {
+		t.Fatalf("client initialization error was not returned: %v", err)
 	}
 }
 

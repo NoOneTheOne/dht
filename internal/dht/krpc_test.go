@@ -3,6 +3,8 @@ package dht
 import (
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -55,6 +57,25 @@ func readKRPCTestMessage(t *testing.T, conn *net.UDPConn) map[string]interface{}
 		t.Fatal(err)
 	}
 	return message
+}
+
+func TestTokenReuseExpiryAndInvalidAttempt(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	addr := remote.LocalAddr().(*net.UDPAddr)
+	tm := d.tokenManager
+	tokenString := tm.token(addr)
+	if tm.check(addr, "wrong") {
+		t.Fatal("invalid token accepted")
+	}
+	for i := 0; i < 3; i++ {
+		if !tm.check(addr, tokenString) {
+			t.Fatal("valid token consumed by another announce")
+		}
+	}
+	tm.Set(addr.IP.String(), token{data: tokenString, createTime: time.Now().Add(-2 * time.Minute)})
+	if tm.check(addr, tokenString) {
+		t.Fatal("expired token accepted")
+	}
 }
 
 func TestKRPCAnnounceRejectsInvalidArguments(t *testing.T) {
@@ -260,11 +281,6 @@ func TestKRPCDuplicateNotificationsDoNotBlock(t *testing.T) {
 			d, remote := newKRPCTestDHT(t)
 			addr := remote.LocalAddr().(*net.UDPAddr)
 			trans := addKRPCTestTransaction(t, d, addr, pingType)
-			// Keep the transaction registered and do not consume notifications.
-			// Start full, then deliver enough duplicates to exceed retry capacity.
-			for i := 0; i < cap(trans.response); i++ {
-				trans.response <- struct{}{}
-			}
 			for i := 0; i < cap(trans.response)+3; i++ {
 				done := make(chan bool, 1)
 				go func(isError bool) {
@@ -278,8 +294,8 @@ func TestKRPCDuplicateNotificationsDoNotBlock(t *testing.T) {
 				}(kind == "error" || kind == "mixed" && i%2 == 1)
 				select {
 				case success := <-done:
-					if !success {
-						t.Fatal("duplicate was rejected")
+					if success != (i == 0) {
+						t.Fatal("transaction must accept only its first valid reply")
 					}
 				case <-time.After(time.Second):
 					// Unblock a regressed blocking send before failing the test.
@@ -292,10 +308,65 @@ func TestKRPCDuplicateNotificationsDoNotBlock(t *testing.T) {
 					t.Fatal("duplicate notification blocked on a full channel")
 				}
 			}
-			if len(trans.response) != cap(trans.response) {
-				t.Fatal("duplicate notifications changed full channel state")
+			if len(trans.response) != 1 {
+				t.Fatal("transaction received more than one completion")
 			}
 		})
+	}
+}
+
+func TestKRPCConcurrentResponseCompletesOnce(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	addr := remote.LocalAddr().(*net.UDPAddr)
+	trans := addKRPCTestTransaction(t, d, addr, getPeersType)
+	var calls atomic.Int32
+	d.OnGetPeersResponse = func(string, *Peer) { calls.Add(1) }
+	r := makeResponse(trans.id, map[string]interface{}{
+		"id": strings.Repeat("r", 20), "token": "token",
+		"values": []interface{}{newPeer(net.IPv4(127, 0, 0, 2), 6881, "").CompactIPPortInfo()},
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Go(func() { handleResponse(d, addr, r) })
+	}
+	wg.Wait()
+	if calls.Load() != 1 || len(trans.response) != 1 {
+		t.Fatal("duplicate response repeated callback or completion")
+	}
+}
+
+func TestKRPCErrorValidationAndAssociation(t *testing.T) {
+	for _, value := range []interface{}{
+		"bad", []interface{}{}, []interface{}{201}, []interface{}{201, 1}, []interface{}{"201", "bad"},
+	} {
+		d, remote := newKRPCTestDHT(t)
+		addr := remote.LocalAddr().(*net.UDPAddr)
+		trans := addKRPCTestTransaction(t, d, addr, pingType)
+		message := makeError(trans.id, 201, "error")
+		message["e"] = value
+		if handleError(d, addr, message) || len(trans.response) != 0 {
+			t.Fatalf("accepted malformed error: %v", value)
+		}
+		if handleError(d, addr, makeError("unknown", 201, "error")) {
+			t.Fatal("accepted unsolicited error")
+		}
+		wrong := &net.UDPAddr{IP: addr.IP, Port: addr.Port + 1}
+		if handleError(d, wrong, makeError(trans.id, 201, "error")) || len(trans.response) != 0 {
+			t.Fatal("accepted error from wrong endpoint")
+		}
+		if !handleError(d, addr, makeError(trans.id, 201, "error")) || len(trans.response) != 1 {
+			t.Fatal("rejected associated valid error")
+		}
+	}
+}
+
+func TestKRPCGetPeersRejectsMalformedValues(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	addr := remote.LocalAddr().(*net.UDPAddr)
+	trans := addKRPCTestTransaction(t, d, addr, getPeersType)
+	r := map[string]interface{}{"id": strings.Repeat("r", 20), "token": "token", "values": "bad", "nodes": ""}
+	if handleResponse(d, addr, makeResponse(trans.id, r)) || len(trans.response) != 0 || d.routingTable.Len() != 0 {
+		t.Fatal("malformed values bypassed validation through nodes fallback")
 	}
 }
 

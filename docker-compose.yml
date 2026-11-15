@@ -23,6 +23,8 @@ services:
       - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
     volumes:
       - ./config/config.yml:/app/config.yml:ro
+      - spider-data:/app/data
+    stop_grace_period: 60s
     restart: unless-stopped
 
   dht-search:
@@ -51,3 +53,6 @@ services:
     volumes:
       - ./config/config.yml:/app/config.yml:ro
     restart: unless-stopped
+
+volumes:
+  spider-data:

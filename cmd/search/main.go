@@ -47,6 +47,7 @@ func main() {
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	router.GET("/search", searchHandler)
+	router.GET("/api/trending", trendingHandler(mysql.Trending))
 	router.GET("/api/torrents/:infohash", detailHandler(mysql.Detail))
 
 	router.GET("/health", func(c *gin.Context) {
@@ -80,7 +81,15 @@ func main() {
 		c.JSON(statusCode, health)
 	})
 
-	webDir := filepath.Join(filepath.Dir(os.Args[0]), "web")
+	executable, err := os.Executable()
+	if err != nil {
+		logging.Fatalln(err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		logging.Fatalln(err)
+	}
+	webDir := filepath.Join(filepath.Dir(executable), "web")
 	if _, err := os.Stat(webDir); err == nil {
 		router.NoRoute(func(c *gin.Context) {
 			path := c.Request.URL.Path
@@ -116,7 +125,13 @@ func main() {
 	if port == "" {
 		port = "30080"
 	}
-	err := router.Run(":" + port)
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	err = server.ListenAndServe()
 	if err != nil {
 		logging.Fatalln(err)
 	}
@@ -159,6 +174,31 @@ func searchHandler(c *gin.Context) {
 		"total": total, "items": results,
 		"page": page, "page_size": mysql.SearchPageSize,
 	})
+}
+
+func trendingHandler(lookup func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		period := c.DefaultQuery("window", "24h")
+		windows := map[string]time.Duration{"1h": time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour}
+		window, ok := windows[period]
+		limit, err := strconv.Atoi(c.DefaultQuery("limit", "10"))
+		if !ok || err != nil || limit < 1 || limit > 100 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "window must be 1h, 24h or 7d; limit must be 1..100"})
+			return
+		}
+		until := time.Now()
+		items, err := lookup(c.Request.Context(), window, limit, until)
+		metrics.RecordMySQLQuery("trending", time.Since(until), err)
+		if err != nil {
+			slog.ErrorContext(c.Request.Context(), "trending lookup failed", "component", "mysql", "event", "trending_failed", "window", period, "limit", limit, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		if items == nil {
+			items = []mysql.Data{}
+		}
+		c.JSON(http.StatusOK, gin.H{"items": items, "window": period, "limit": limit, "since": until.Add(-window), "until": until})
+	}
 }
 
 func detailHandler(lookup func(context.Context, string) (*mysql.Data, error)) gin.HandlerFunc {

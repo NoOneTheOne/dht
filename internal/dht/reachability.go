@@ -76,10 +76,17 @@ func (check *reachabilityCheck) wait(ctx context.Context) (*net.UDPAddr, bool) {
 }
 
 func (check *reachabilityCheck) logStartup(port int) {
+	check.logStartupContext(context.Background(), port)
+}
+
+func (check *reachabilityCheck) logStartupContext(parent context.Context, port int) {
 	log.Printf("[DHT Reachability] Checking public UDP ingress to local port %d for 30s", port)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	addr, responses := check.wait(ctx)
+	if parent.Err() != nil {
+		return
+	}
 	if addr != nil {
 		log.Printf("[DHT Reachability] UDP %d: public inbound traffic observed from %s (valid unsolicited DHT request); exact public NAT port is not verified", port, addr)
 		return

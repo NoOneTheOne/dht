@@ -122,14 +122,22 @@ func (bm *bootstrapManager) join() {
 		bm.retryDelay = min(bm.retryDelay*2, bootstrapMaxRetry)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	parent := bm.dht.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	addresses := bm.addresses
 	resolved := make(chan *net.UDPAddr, len(addresses))
+	var resolvers sync.WaitGroup
+	defer resolvers.Wait()
 	for _, address := range addresses {
+		resolvers.Add(1)
 		go func(address string) {
+			defer resolvers.Done()
 			addr, err := resolveBootstrapAddress(ctx, bm.dht.Network, address)
-			if err != nil {
+			if err != nil && ctx.Err() == nil {
 				log.Printf("[Bootstrap] Failed to resolve %s: %v", address, err)
 			}
 			resolved <- addr
@@ -145,6 +153,9 @@ func (bm *bootstrapManager) join() {
 				attempted++
 			}
 		case <-ctx.Done():
+			if parent.Err() != nil {
+				return
+			}
 			log.Printf("[Bootstrap] Attempt #%d timed out; attempted %d queries", attempt, attempted)
 			return
 		}

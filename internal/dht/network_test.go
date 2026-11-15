@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net"
@@ -9,6 +10,146 @@ import (
 	"testing"
 	"time"
 )
+
+func TestQueryWorkersStopAndReleaseQueue(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	d.stop = make(chan struct{})
+	d.QueryTimeout = time.Hour
+	d.QueryWorkerLimit = 2
+	tm := d.transactionManager
+	for i := 0; i < 20; i++ {
+		tm.sendQuery(&node{addr: remote.LocalAddr().(*net.UDPAddr)}, fmt.Sprint("query-", i), nil)
+	}
+	done := make(chan struct{})
+	go func() { tm.run(); close(done) }()
+	readKRPCTestMessage(t, remote)
+	close(d.stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("query workers did not stop")
+	}
+	if tm.len() != 0 || tm.index.Len() != 0 || len(tm.pending) != 0 || len(tm.queryChan) != 0 {
+		t.Fatal("query shutdown leaked reservations")
+	}
+	tm.sendQuery(&node{addr: remote.LocalAddr().(*net.UDPAddr)}, pingType, nil)
+	if len(tm.queryChan) != 0 {
+		t.Fatal("stopped query pool accepted work")
+	}
+}
+
+func TestDHTRunContextStopsAllWorkers(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := &DHT{
+			InitParam: &InitParam{Network: "udp4", Address: "127.0.0.1:0", K: 8, KBucketSize: 8, MaxNodes: 64, MaxTransactionCursor: 65536, QueryWorkerLimit: 2, QueryTimeout: time.Hour, CheckKBucketPeriod: time.Hour, Try: 1},
+			node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), workerTokens: make(chan struct{}, 2), stop: make(chan struct{}), stopped: make(chan struct{}),
+		}
+		cancel()
+		done := make(chan struct{})
+		go func() { d.RunContext(ctx); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("RunContext did not release workers")
+		}
+		d.Stop()
+		if d.ready.Load() || d.transactionManager.len() != 0 || len(d.workerTokens) != 0 {
+			t.Fatal("DHT remains active after stop")
+		}
+	}
+}
+
+func TestUDPQueueBackpressureDoesNotBlockListener(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	remote, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	d := &DHT{conn: conn, packets: make(chan packet), stop: make(chan struct{})}
+	before := protocolCount("packet_queue", "full")
+	d.listen()
+	defer func() { close(d.stop); conn.Close(); <-d.listenerDone }()
+	if _, err := remote.WriteToUDP([]byte("invalid"), conn.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for protocolCount("packet_queue", "full") == before {
+		select {
+		case <-deadline.C:
+			t.Fatal("full packet queue blocked listener")
+		case <-tick.C:
+		}
+	}
+}
+
+func TestDHTStopAfterServingPacket(t *testing.T) {
+	original := defaultBootstrapNodes
+	defaultBootstrapNodes = []string{"127.0.0.1:1"}
+	t.Cleanup(func() { defaultBootstrapNodes = original })
+	d := &DHT{
+		InitParam: &InitParam{Network: "udp4", Address: "127.0.0.1:0", Mode: "StandardMode", K: 8, KBucketSize: 8, MaxNodes: 64, MaxTransactionCursor: 65536, QueryWorkerLimit: 2, QueryTimeout: time.Hour, CheckKBucketPeriod: time.Hour, Try: 1},
+		node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), workerTokens: make(chan struct{}, 2), stop: make(chan struct{}), stopped: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); d.RunContext(context.Background()) }()
+	t.Cleanup(func() { d.Stop(); <-done })
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for !d.ready.Load() {
+		select {
+		case <-deadline.C:
+			t.Fatal("DHT did not start")
+		case <-tick.C:
+		}
+	}
+	remote, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	packet := []byte(Encode(makeQuery("live", pingType, map[string]interface{}{"id": strings.Repeat("r", 20)})))
+	if _, err := remote.WriteToUDP(packet, d.conn.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	if message := readKRPCTestMessage(t, remote); message["t"] != "live" {
+		t.Fatal("unexpected response")
+	}
+	stopped := make(chan struct{})
+	go func() { d.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("live DHT failed to stop")
+	}
+	if d.ready.Load() || d.transactionManager.len() != 0 || len(d.workerTokens) != 0 {
+		t.Fatal("live DHT leaked work")
+	}
+}
+
+func TestDHTStopBeforeRunAndRepeatedRun(t *testing.T) {
+	d := &DHT{stop: make(chan struct{}), stopped: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { d.Stop(); d.Stop(); d.Run(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stop before run blocked")
+	}
+	if stats := d.GetDHTStats(); stats.ActiveTransactions != 0 {
+		t.Fatal("unstarted DHT has transactions")
+	}
+}
 
 func TestGetPeersWaitsForRoutingTable(t *testing.T) {
 	d := &DHT{InitParam: &InitParam{KBucketSize: 8}}
@@ -199,6 +340,116 @@ func TestTransactionIndexRejectsDuplicates(t *testing.T) {
 	tm.delete(first.id)
 	if !tm.insert(second) {
 		t.Fatal("query could not be retried after completion")
+	}
+}
+
+func TestTransactionIDCollisionDoesNotOverwrite(t *testing.T) {
+	d := &DHT{InitParam: &InitParam{Try: 1}}
+	tm := newTransactionManager(2, d)
+	first := tm.newTransaction("same", &query{
+		node: &node{addr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6881}},
+		data: makeQuery("same", pingType, nil),
+	})
+	second := tm.newTransaction("same", &query{
+		node: &node{addr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6882}},
+		data: makeQuery("same", pingType, nil),
+	})
+	if !tm.insert(first) || tm.insert(second) || tm.getByTransID("same") != first || tm.index.Len() != 1 {
+		t.Fatal("transaction ID collision changed active indexes")
+	}
+	tm.delete(first.id)
+	if tm.len() != 0 || tm.index.Len() != 0 || !tm.insert(second) {
+		t.Fatal("collision left stale transaction indexes")
+	}
+}
+
+func TestQuerySendFailureKeepsKnownNode(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	nd, err := newNode(strings.Repeat("r", 20), "udp4", remote.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.routingTable.Insert(nd)
+	d.conn.Close()
+	d.transactionManager.query(&query{node: nd, data: makeQuery("send-error", pingType, nil)}, 1)
+	if d.blackList.in(nd.addr.IP.String(), nd.addr.Port) || d.routingTable.Len() != 1 {
+		t.Fatal("local send failure punished remote contact")
+	}
+	if d.transactionManager.len() != 0 || d.transactionManager.index.Len() != 0 {
+		t.Fatal("local send failure leaked transaction")
+	}
+}
+
+func TestQueryTimeoutRemovesContactWithoutBlacklist(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	d.QueryTimeout = time.Millisecond
+	nd, err := newNode(strings.Repeat("r", 20), "udp4", remote.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.routingTable.Insert(nd)
+	d.transactionManager.query(&query{node: nd, data: makeQuery("timeout", pingType, nil)}, 1)
+	if _, ok := d.routingTable.GetNodeByAddress(nd.addr.String()); ok {
+		t.Fatal("timed-out contact remained in routing table")
+	}
+	if d.blackList.in(nd.addr.IP.String(), nd.addr.Port) || !d.routingTable.Insert(nd) {
+		t.Fatal("ordinary timeout prevented contact rediscovery")
+	}
+}
+
+func TestQueryTimeoutKeepsRefreshedNode(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	d.QueryTimeout = 30 * time.Millisecond
+	nd, err := newNode(strings.Repeat("r", 20), "udp4", remote.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.routingTable.Insert(nd)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.transactionManager.query(&query{node: nd, data: makeQuery("stale", pingType, nil)}, 1)
+	}()
+	readKRPCTestMessage(t, remote)
+	refreshed, err := newNode(nd.id.RawString(), "udp4", nd.addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.routingTable.Insert(refreshed)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("query did not expire")
+	}
+	current, ok := d.routingTable.GetNodeByAddress(nd.addr.String())
+	if !ok || current != refreshed || d.blackList.in(nd.addr.IP.String(), nd.addr.Port) {
+		t.Fatal("stale timeout evicted refreshed contact")
+	}
+}
+
+func TestQueryStopDoesNotEvictNode(t *testing.T) {
+	d, remote := newKRPCTestDHT(t)
+	d.QueryTimeout = time.Hour
+	d.stop = make(chan struct{})
+	nd, err := newNode(strings.Repeat("r", 20), "udp4", remote.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.routingTable.Insert(nd)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.transactionManager.query(&query{node: nd, data: makeQuery("stop", pingType, nil)}, 1)
+	}()
+	readKRPCTestMessage(t, remote)
+	close(d.stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("query ignored stop")
+	}
+	if d.routingTable.Len() != 1 || d.blackList.in(nd.addr.IP.String(), nd.addr.Port) || d.transactionManager.len() != 0 {
+		t.Fatal("stopped query punished contact or leaked transaction")
 	}
 }
 

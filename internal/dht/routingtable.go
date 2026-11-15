@@ -176,9 +176,14 @@ func (bucket *KBucket) LastChanged() time.Time {
 
 // RandomChildID returns a random id that has the same prefix with bucket.
 func (bucket *KBucket) RandomChildID() string {
-	prefixLen := bucket.prefix.Size / 8
-
-	return bucket.prefix.RawString()[:prefixLen] + randomString(20-prefixLen)
+	id := []byte(randomString(20))
+	whole, bits := bucket.prefix.Size/8, bucket.prefix.Size%8
+	copy(id[:whole], bucket.prefix.data[:whole])
+	if bits != 0 {
+		mask := byte(0xff << (8 - bits))
+		id[whole] = id[whole]&^mask | bucket.prefix.data[whole]&mask
+	}
+	return string(id)
 }
 
 // UpdateTimestamp update bucket's last changed time.
@@ -356,7 +361,9 @@ func (rt *routingTable) Insert(nd *node) bool {
 	rt.Lock()
 	defer rt.Unlock()
 
-	if rt.dht.blackList.in(nd.addr.IP.String(), nd.addr.Port) {
+	if nd.id.RawString() == rt.dht.node.id.RawString() || nd.addr.Port < 1 || nd.addr.Port > 65535 ||
+		nd.addr.IP.IsUnspecified() || nd.addr.IP.IsMulticast() || nd.addr.IP.IsLinkLocalUnicast() ||
+		rt.dht.blackList.in(nd.addr.IP.String(), nd.addr.Port) {
 		return false
 	}
 
@@ -447,7 +454,8 @@ func (rt *routingTable) Insert(nd *node) bool {
 					root.KBucket().candidates.Front())
 			}
 
-			go root.KBucket().Fresh(rt.dht)
+			refreshBucket := root.KBucket()
+			rt.dht.background.Go(func() { refreshBucket.Fresh(rt.dht) })
 			return false
 		}
 	}
@@ -514,6 +522,12 @@ func (rt *routingTable) Remove(id *bitmap) {
 // removeLocked updates both indexes while the table write lock is held.
 func (rt *routingTable) removeLocked(id *bitmap) {
 	if nd, bucket := rt.getNodeKBucketByIDLocked(id); nd != nil {
+		for e := range bucket.candidates.Iter() {
+			candidate := e.Value.(*node)
+			if rt.dht.blackList.in(candidate.addr.IP.String(), candidate.addr.Port) {
+				bucket.candidates.Delete(candidate.id.RawString())
+			}
+		}
 		promoted := bucket.Replace(nd)
 		rt.cachedNodes.Delete(nd.addr.String())
 		if promoted != nil {
@@ -521,6 +535,23 @@ func (rt *routingTable) removeLocked(id *bitmap) {
 		}
 		rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
 	}
+}
+
+func (rt *routingTable) failNode(expected *node) {
+	rt.removeContact(expected, true)
+}
+
+func (rt *routingTable) removeContact(expected *node, blacklist bool) {
+	rt.Lock()
+	defer rt.Unlock()
+	current, ok := rt.cachedNodes.Get(expected.addr.String())
+	if !ok || current != expected {
+		return
+	}
+	if blacklist {
+		rt.dht.blackList.insert(expected.addr.IP.String(), expected.addr.Port)
+	}
+	rt.removeLocked(expected.id)
 }
 
 // RemoveByAddr Remove the node whose address is `ip:port`.

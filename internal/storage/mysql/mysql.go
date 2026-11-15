@@ -23,11 +23,11 @@ type Observation struct {
 	BatchID  string    `gorm:"column:batch_id;type:char(32);primaryKey"`
 	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey"`
 	Name     string    `gorm:"column:name;type:varchar(512);not null"`
-	Time     time.Time `gorm:"column:time;not null"`
+	Time     time.Time `gorm:"column:time;not null;index:idx_observation_window,priority:2"`
 	Length   int64     `gorm:"column:length;default:0"`
 	Count    int64     `gorm:"column:count;default:1"`
 	Files    []File    `gorm:"column:files;type:json;serializer:json"`
-	Applied  bool      `gorm:"column:applied;default:false;index"`
+	Applied  bool      `gorm:"column:applied;default:false;index;index:idx_observation_window,priority:1"`
 }
 
 func (Observation) TableName() string {
@@ -242,7 +242,7 @@ func WriteBatchWithID(batchID string, items []Data) error {
 				return err
 			}
 			var pending []Observation
-			if err := tx.Where("batch_id = ? AND applied = ?", batchID, false).Find(&pending).Error; err != nil {
+			if err := tx.Where("batch_id = ? AND applied = ?", batchID, false).Order("infohash ASC").Find(&pending).Error; err != nil {
 				return err
 			}
 			pendingRows := make([]Data, len(pending))
@@ -258,7 +258,7 @@ func WriteBatchWithID(batchID string, items []Data) error {
 			return tx.Model(&Observation{}).Where("batch_id = ? AND applied = ?", batchID, false).Update("applied", true).Error
 		})
 		var mysqlErr *mysqlDriver.MySQLError
-		return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213, err
+		return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1213 || mysqlErr.Number == 1205), err
 	})
 }
 
@@ -289,6 +289,29 @@ func Search(parent context.Context, name string, page int) ([]Data, int64, error
 		}
 	}
 	return results, total, nil
+}
+
+func Trending(parent context.Context, window time.Duration, limit int, until time.Time) ([]Data, error) {
+	if (window != time.Hour && window != 24*time.Hour && window != 7*24*time.Hour) || limit < 1 || limit > 100 {
+		return nil, fmt.Errorf("invalid trending parameters")
+	}
+	db, err := GetDB()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	ranked := db.WithContext(ctx).Model(&Observation{}).
+		Select("`infohash`, SUM(`count`) AS hits").
+		Where("applied = ? AND time >= ? AND time < ?", true, until.Add(-window), until).
+		Group("infohash").Order("hits DESC, infohash ASC").Limit(limit)
+	items := make([]Data, 0, limit)
+	err = db.WithContext(ctx).Model(&Data{}).
+		Table("? AS resources", clause.Table{Name: (Data{}).TableName()}).
+		Select("resources.name, resources.infohash, resources.time, resources.length, ranked.hits AS count, COALESCE(JSON_TYPE(resources.files) = 'ARRAY' AND JSON_LENGTH(resources.files) > 0, FALSE) AS has_files").
+		Joins("JOIN (?) AS ranked ON ranked.infohash = resources.infohash", ranked).
+		Order("ranked.hits DESC, resources.infohash ASC").Find(&items).Error
+	return items, err
 }
 
 func Detail(parent context.Context, infoHash string) (*Data, error) {

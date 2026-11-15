@@ -2,6 +2,7 @@ package dht
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
@@ -37,7 +38,13 @@ const (
 	maxRequestsPerInfoHash  = 3
 )
 
-var errWireMessageTooLarge = errors.New("peer wire message too large")
+var (
+	errWireMessageTooLarge     = errors.New("peer wire message too large")
+	errMetadataProtocol        = errors.New("invalid metadata protocol message")
+	errMetadataRejected        = errors.New("metadata request rejected")
+	errMetadataHashMismatch    = errors.New("metadata hash mismatch")
+	errMetadataResponseDropped = errors.New("metadata response dropped")
+)
 
 // Keepalives must not extend the download deadline.
 type metadataConn struct {
@@ -66,13 +73,11 @@ var handshakePrefix = []byte{
 
 // read size-length bytes from conn to data.
 func read(conn net.Conn, size int, data *bytes.Buffer) error {
-	conn.SetReadDeadline(time.Now().Add(time.Second * 15))
-
-	n, err := io.CopyN(data, conn, int64(size))
-	if err != nil || n != int64(size) {
-		return errors.New("read error")
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second * 15)); err != nil {
+		return err
 	}
-	return nil
+	_, err := io.CopyN(data, conn, int64(size))
+	return err
 }
 
 // readMessage gets a message from the tcp connection.
@@ -103,7 +108,9 @@ func sendMessage(conn net.Conn, data []byte) error {
 	frame := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
 	copy(frame[4:], data)
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
+	if err := conn.SetWriteDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		return err
+	}
 	n, err := conn.Write(frame)
 	if err == nil && n != len(frame) {
 		return io.ErrShortWrite
@@ -118,8 +125,13 @@ func sendHandshake(conn net.Conn, infoHash, peerID []byte) error {
 	copy(data[28:48], infoHash)
 	copy(data[48:], peerID)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
-	_, err := conn.Write(data)
+	if err := conn.SetWriteDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		return err
+	}
+	n, err := conn.Write(data)
+	if err == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -209,6 +221,8 @@ type Wire struct {
 	workers      sync.WaitGroup
 	connMu       sync.Mutex
 	connections  map[net.Conn]struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // NewWire returns a Wire pointer.
@@ -216,7 +230,10 @@ type Wire struct {
 //   - requestQueueSize: the max requests it can buffer
 //   - workerQueueSize: the max goroutine downloading workers
 func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Wire{
+		ctx:          ctx,
+		cancel:       cancel,
 		blackList:    newBlackList(blackListSize),
 		queue:        newSyncedMap(),
 		infoHashes:   make(map[string]int),
@@ -230,7 +247,14 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 }
 
 // Request pushes the request to the queue.
-func (wire *Wire) Request(infoHash []byte, ip string, port int) bool {
+func (wire *Wire) Request(infoHash []byte, ip string, port int) (accepted bool) {
+	reason := "invalid_endpoint"
+	defer func() {
+		if !accepted {
+			RecordMetadataRequestDropped()
+			RecordProtocolEvent("metadata_queue", reason)
+		}
+	}()
 	if len(infoHash) != 20 || port < 1 || port > 65535 {
 		return false
 	}
@@ -241,16 +265,25 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) bool {
 	}
 	ip = parsedIP.String()
 	if wire.blackList.in(ip, port) {
+		reason = "blacklisted"
 		return false
 	}
 	hashKey := string(infoHash)
 	key := hashKey + ":" + genAddress(ip, port)
 	wire.queue.Lock()
 	defer wire.queue.Unlock()
+	select {
+	case <-wire.stop:
+		reason = "stopped"
+		return false
+	default:
+	}
 	if wire.infoHashes[hashKey] >= maxRequestsPerInfoHash {
+		reason = "hash_limit"
 		return false
 	}
 	if _, exists := wire.queue.data[key]; exists {
+		reason = "duplicate"
 		return false
 	}
 	wire.queue.data[key] = struct{}{}
@@ -264,7 +297,7 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) bool {
 		if wire.infoHashes[hashKey] == 0 {
 			delete(wire.infoHashes, hashKey)
 		}
-		RecordMetadataRequestDropped()
+		reason = "full"
 		return false
 	}
 }
@@ -285,44 +318,48 @@ func (wire *Wire) releaseRequest(r Request) {
 	}
 }
 
+func (wire *Wire) QueueStats() (requests, responses, active int) {
+	return len(wire.requests), len(wire.responses), len(wire.workerTokens)
+}
+
 // Response returns a chan of Response.
 func (wire *Wire) Response() <-chan Response {
 	return wire.responses
 }
 
-func (wire *Wire) requestPieces(
-	conn net.Conn, utMetadata int, metadataSize int, piecesNum int) {
-
-	buffer := make([]byte, 1024)
-	for i := 0; i < piecesNum; i++ {
-		buffer[0] = EXTENDED
-		buffer[1] = byte(utMetadata)
-
-		msg := Encode(map[string]interface{}{
-			"msg_type": REQUEST,
-			"piece":    i,
-		})
-
-		length := len(msg) + 2
-		copy(buffer[2:length], msg)
-
-		if err := sendMessage(conn, buffer[:length]); err != nil {
-			return
+func (wire *Wire) requestPieces(conn net.Conn, utMetadata int, requests <-chan int) error {
+	for piece := range requests {
+		msg := append([]byte{EXTENDED, byte(utMetadata)}, Encode(map[string]interface{}{
+			"msg_type": REQUEST, "piece": piece,
+		})...)
+		if err := sendMessage(conn, msg); err != nil {
+			return err
 		}
 	}
-	buffer = nil
+	return nil
 }
 
 // fetchMetadata fetches medata info according to infohash from dht.
 func (wire *Wire) fetchMetadata(r Request) {
 	deadline := time.Now().Add(metadataDownloadTimeout)
 	dialer := net.Dialer{Timeout: 15 * time.Second, Deadline: deadline}
-	conn, err := dialer.Dial("tcp", genAddress(r.IP, r.Port))
+	conn, err := dialer.DialContext(wire.ctx, "tcp", genAddress(r.IP, r.Port))
 	if err != nil {
-		wire.blackList.insert(r.IP, r.Port)
+		if wire.ctx.Err() != nil {
+			RecordProtocolEvent("metadata", "stopped")
+		} else {
+			wire.blackList.insert(r.IP, r.Port)
+			recordMetadataError(err)
+		}
 		return
 	}
 	wire.connMu.Lock()
+	if wire.ctx.Err() != nil {
+		wire.connMu.Unlock()
+		_ = conn.Close()
+		RecordProtocolEvent("metadata", "stopped")
+		return
+	}
 	wire.connections[conn] = struct{}{}
 	wire.connMu.Unlock()
 	defer func() {
@@ -332,173 +369,224 @@ func (wire *Wire) fetchMetadata(r Request) {
 		_ = conn.Close()
 	}()
 	conn.(*net.TCPConn).SetLinger(0)
-	wire.fetchMetadataConn(conn, r, deadline)
+	err = wire.fetchMetadataConn(conn, r, deadline)
+	if wire.ctx.Err() != nil {
+		RecordProtocolEvent("metadata", "stopped")
+	} else {
+		recordMetadataError(err)
+	}
 }
 
 // fetchMetadataConn runs a download with a fixed deadline, including writes.
-func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) {
+func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) (result error) {
+	requests := make(chan int, 8)
+	var writerDone chan struct{}
+	var writerErr error
+	defer func() {
+		_ = raw.Close()
+		close(requests)
+		if writerDone != nil {
+			<-writerDone
+			if errors.Is(result, net.ErrClosed) && writerErr != nil {
+				result = writerErr
+			}
+		}
+	}()
 	if err := raw.SetDeadline(deadline); err != nil {
-		return
+		return err
 	}
 	conn := &metadataConn{Conn: raw, deadline: deadline}
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	var (
-		err          error
-		length       int
-		msgType      byte
-		piecesNum    int
-		pieces       [][]byte
-		utMetadata   int
-		metadataSize int
-		received     int
-	)
-
-	infoHash := r.InfoHash
-	data := bytes.NewBuffer(nil)
+	data := new(bytes.Buffer)
 	data.Grow(BLOCK)
-
-	if sendHandshake(conn, infoHash, []byte(randomString(20))) != nil ||
-		read(conn, 68, data) != nil ||
-		onHandshake(data.Next(68), infoHash) != nil ||
-		sendExtHandshake(conn) != nil {
-		return
+	if err := sendHandshake(conn, r.InfoHash, []byte(randomString(20))); err != nil {
+		return err
 	}
-
+	if err := read(conn, 68, data); err != nil {
+		return err
+	}
+	if err := onHandshake(data.Next(68), r.InfoHash); err != nil {
+		return errMetadataProtocol
+	}
+	if err := sendExtHandshake(conn); err != nil {
+		return err
+	}
+	var pieces [][]byte
+	var metadataSize, utMetadata, nextPiece, received int
 	for {
 		if !time.Now().Before(deadline) {
-			return
+			return context.DeadlineExceeded
 		}
-		length, err = readMessage(conn, data)
+		length, err := readMessage(conn, data)
 		if err != nil {
-			return
+			return err
 		}
-
 		if length == 0 {
 			continue
 		}
-
-		msgType, err = data.ReadByte()
-		if err != nil {
-			return
-		}
-
-		switch msgType {
-		case EXTENDED:
-			extendedID, err := data.ReadByte()
-			if err != nil {
-				return
-			}
-
-			payload, err := io.ReadAll(data)
-			if err != nil {
-				return
-			}
-
-			if extendedID == 0 {
-				if pieces != nil {
-					return
-				}
-
-				utMetadata, metadataSize, err = getUTMetaSize(payload)
-				if err != nil {
-					return
-				}
-
-				piecesNum = metadataSize / BLOCK
-				if metadataSize%BLOCK != 0 {
-					piecesNum++
-				}
-
-				pieces = make([][]byte, piecesNum)
-				go wire.requestPieces(conn, utMetadata, metadataSize, piecesNum)
-
-				continue
-			}
-
-			// Inbound IDs follow our handshake, not the peer's outgoing ID map.
-			if extendedID != localMetadataID {
-				continue
-			}
-			if pieces == nil {
-				return
-			}
-
-			d, index, err := DecodeDict(payload, 0)
-			if err != nil {
-				return
-			}
-			dict := d.(map[string]interface{})
-
-			if err = ParseKeys(dict, [][]string{
-				{"msg_type", "int"},
-				{"piece", "int"}}); err != nil {
-				return
-			}
-
-			if dict["msg_type"].(int) == REJECT {
-				return
-			}
-			if dict["msg_type"].(int) != DATA {
-				continue
-			}
-
-			piece := dict["piece"].(int)
-			if piece < 0 || piece >= piecesNum {
-				return
-			}
-			if value, ok := dict["total_size"]; ok {
-				if total, ok := value.(int); !ok || total != metadataSize {
-					return
-				}
-			}
-			pieceLen := length - 2 - index
-
-			expectedLastPieceLen := metadataSize % BLOCK
-			if expectedLastPieceLen == 0 {
-				expectedLastPieceLen = BLOCK
-			}
-			if (piece != piecesNum-1 && pieceLen != BLOCK) ||
-				(piece == piecesNum-1 && pieceLen != expectedLastPieceLen) {
-				return
-			}
-
-			if pieces[piece] == nil {
-				received++
-			}
-			pieces[piece] = payload[index:]
-
-			if received == piecesNum {
-				metadataInfo := bytes.Join(pieces, nil)
-
-				info := sha1.Sum(metadataInfo)
-				if !bytes.Equal(infoHash, info[:]) {
-					return
-				}
-
-				select {
-				case wire.responses <- Response{
-					Request:      r,
-					MetadataInfo: metadataInfo,
-				}:
-				case <-timer.C:
-					RecordMetadataResponseDropped()
-				case <-wire.stop:
-					RecordMetadataResponseDropped()
-				}
-				return
-			}
-		default:
+		msgType, _ := data.ReadByte()
+		if msgType != EXTENDED {
 			data.Reset()
+			continue
+		}
+		extendedID, err := data.ReadByte()
+		if err != nil {
+			return errMetadataProtocol
+		}
+		payload := bytes.Clone(data.Bytes())
+		data.Reset()
+		if extendedID == HANDSHAKE {
+			id, size, err := getUTMetaSize(payload)
+			if err != nil {
+				return errMetadataProtocol
+			}
+			if pieces != nil {
+				if id != utMetadata || size != metadataSize {
+					return errMetadataProtocol
+				}
+				continue
+			}
+			utMetadata, metadataSize = id, size
+			pieces = make([][]byte, (size+BLOCK-1)/BLOCK)
+			writerDone = make(chan struct{})
+			go func() {
+				defer close(writerDone)
+				writerErr = wire.requestPieces(conn, id, requests)
+				if writerErr != nil {
+					_ = raw.Close()
+				}
+			}()
+			for nextPiece < min(8, len(pieces)) {
+				requests <- nextPiece
+				nextPiece++
+			}
+			continue
+		}
+		if extendedID != localMetadataID {
+			continue
+		}
+		if pieces == nil {
+			return errMetadataProtocol
+		}
+		d, index, err := DecodeDict(payload, 0)
+		if err != nil {
+			return errMetadataProtocol
+		}
+		dict := d.(map[string]interface{})
+		if err := ParseKeys(dict, [][]string{{"msg_type", "int"}, {"piece", "int"}}); err != nil {
+			return errMetadataProtocol
+		}
+		piece := dict["piece"].(int)
+		if piece < 0 || piece >= nextPiece {
+			return errMetadataProtocol
+		}
+		if dict["msg_type"].(int) == REJECT {
+			return errMetadataRejected
+		}
+		if dict["msg_type"].(int) != DATA {
+			continue
+		}
+		if value, ok := dict["total_size"]; ok {
+			if total, ok := value.(int); !ok || total != metadataSize {
+				return errMetadataProtocol
+			}
+		}
+		expected := min(BLOCK, metadataSize-piece*BLOCK)
+		if len(payload)-index != expected {
+			return errMetadataProtocol
+		}
+		if pieces[piece] != nil {
+			if !bytes.Equal(pieces[piece], payload[index:]) {
+				return errMetadataProtocol
+			}
+			continue
+		}
+		pieces[piece] = payload[index:]
+		received++
+		if nextPiece < len(pieces) {
+			select {
+			case requests <- nextPiece:
+				nextPiece++
+			case <-writerDone:
+				return writerErr
+			case <-wire.stop:
+				return context.Canceled
+			case <-timer.C:
+				return context.DeadlineExceeded
+			}
+		}
+		if received != len(pieces) {
+			continue
+		}
+		metadataInfo := bytes.Join(pieces, nil)
+		hash := sha1.Sum(metadataInfo)
+		if !bytes.Equal(r.InfoHash, hash[:]) {
+			return errMetadataHashMismatch
+		}
+		select {
+		case wire.responses <- Response{Request: r, MetadataInfo: metadataInfo}:
+			return nil
+		case <-timer.C:
+			RecordMetadataResponseDropped()
+			return errMetadataResponseDropped
+		case <-wire.stop:
+			RecordMetadataResponseDropped()
+			return context.Canceled
 		}
 	}
 }
 
+func recordMetadataError(err error) {
+	reason := "io_error"
+	var timeout net.Error
+	switch {
+	case err == nil:
+		reason = "success"
+	case errors.Is(err, context.Canceled):
+		reason = "stopped"
+	case errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout():
+		reason = "timeout"
+	case errors.Is(err, errMetadataProtocol), errors.Is(err, errWireMessageTooLarge):
+		reason = "protocol_error"
+	case errors.Is(err, errMetadataRejected):
+		reason = "rejected"
+	case errors.Is(err, errMetadataHashMismatch):
+		reason = "hash_mismatch"
+	case errors.Is(err, errMetadataResponseDropped):
+		reason = "response_backpressure"
+	}
+	RecordProtocolEvent("metadata", reason)
+}
+
 // Run starts the peer wire protocol.
 func (wire *Wire) Run() {
-	go wire.blackList.clear()
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		wire.blackList.clear(wire.stop)
+	}()
 	defer func() {
+		wire.stopOnce.Do(func() { wire.cancel(); close(wire.stop) })
 		wire.workers.Wait()
+		wire.queue.Lock()
+		for {
+			select {
+			case _, ok := <-wire.requests:
+				if !ok {
+					goto drained
+				}
+				RecordMetadataRequestDropped()
+				RecordProtocolEvent("metadata_queue", "stopped")
+			default:
+				goto drained
+			}
+		}
+	drained:
+		clear(wire.queue.data)
+		clear(wire.infoHashes)
+		wire.queue.Unlock()
+		<-maintenanceDone
 		close(wire.responses)
 		close(wire.stopped)
 	}()
@@ -536,8 +624,11 @@ func (wire *Wire) Run() {
 
 func (wire *Wire) Stop() {
 	wire.stopOnce.Do(func() {
-		close(wire.stop)
 		wire.connMu.Lock()
+		wire.queue.Lock()
+		wire.cancel()
+		close(wire.stop)
+		wire.queue.Unlock()
 		for conn := range wire.connections {
 			_ = conn.Close()
 		}

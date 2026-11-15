@@ -2,6 +2,7 @@ package dht
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -129,6 +130,73 @@ func TestRoutingInvariantRefreshAndAliases(t *testing.T) {
 	if rt.Len() != 0 {
 		t.Fatal("address removal failed")
 	}
+}
+
+func TestBucketRandomChildPreservesEveryPrefixBit(t *testing.T) {
+	base := newBitmapFromString(strings.Repeat("\xa5", 20))
+	for bits := 0; bits <= 160; bits++ {
+		prefix := newBitmapFrom(base, bits)
+		bucket := newKBucket(prefix)
+		for i := 0; i < 8; i++ {
+			child := newBitmapFromString(bucket.RandomChildID())
+			if child.Size != 160 || prefix.Compare(child, bits) != 0 {
+				t.Fatalf("refresh target escaped %d-bit bucket", bits)
+			}
+		}
+	}
+}
+
+func TestRoutingRejectsInvalidContacts(t *testing.T) {
+	rt := invariantTable(8)
+	if rt.Insert(rt.dht.node) {
+		t.Fatal("inserted local node")
+	}
+	for _, address := range []net.UDPAddr{
+		{IP: net.IPv4zero, Port: 6881},
+		{IP: net.IPv4(224, 0, 0, 1), Port: 6881},
+		{IP: net.IPv4(169, 254, 1, 1), Port: 6881},
+		{IP: net.IPv4(127, 0, 0, 1), Port: 0},
+		{IP: net.IPv4(127, 0, 0, 1), Port: 65536},
+	} {
+		n := invariantNode(128, 1)
+		n.addr = &address
+		if rt.Insert(n) {
+			t.Fatalf("inserted invalid endpoint %v", address)
+		}
+	}
+	if rt.Len() != 0 {
+		t.Fatal("invalid contact polluted indexes")
+	}
+}
+
+func TestRoutingPromotionSkipsBlacklistedCandidates(t *testing.T) {
+	rt := invariantTable(1)
+	active, candidate := invariantNode(128, 2), invariantNode(192, 3)
+	rt.Insert(active)
+	rt.Insert(candidate)
+	rt.dht.blackList.insert(candidate.addr.IP.String(), candidate.addr.Port)
+	rt.Remove(active.id)
+	if rt.Len() != 0 {
+		t.Fatal("blacklisted candidate was promoted")
+	}
+	assertRoutingIndexes(t, rt)
+}
+
+func TestRoutingFailureChecksContactIdentity(t *testing.T) {
+	rt := invariantTable(2)
+	old := invariantNode(128, 2)
+	rt.Insert(old)
+	updated := invariantNode(128, 2)
+	rt.Insert(updated)
+	rt.failNode(old)
+	if rt.Len() != 1 || rt.dht.blackList.in(old.addr.IP.String(), old.addr.Port) {
+		t.Fatal("old query evicted updated contact")
+	}
+	rt.failNode(updated)
+	if rt.Len() != 0 || !rt.dht.blackList.in(updated.addr.IP.String(), updated.addr.Port) {
+		t.Fatal("current failed contact was not evicted")
+	}
+	assertRoutingIndexes(t, rt)
 }
 
 func TestRoutingInvariantConcurrentMutation(t *testing.T) {
