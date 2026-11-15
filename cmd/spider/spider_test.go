@@ -124,6 +124,11 @@ func TestTorrentFiles(t *testing.T) {
 		{"empty files", map[string]interface{}{"name": "multi", "files": []interface{}{}}, 0, 0, false},
 		{"empty path", map[string]interface{}{"name": "multi", "files": []interface{}{map[string]interface{}{"length": 2, "path": []interface{}{}}}}, 0, 0, false},
 		{"missing", map[string]interface{}{}, 0, 0, false},
+		{"name only", map[string]interface{}{"name": "hash-only"}, 0, 0, false},
+		{"null files", map[string]interface{}{"name": "hash-only", "files": nil}, 0, 0, false},
+		{"empty name", map[string]interface{}{"name": "", "length": 7}, 0, 0, false},
+		{"non-string name", map[string]interface{}{"name": 123, "length": 7}, 0, 0, false},
+		{"partially invalid files", map[string]interface{}{"name": "multi", "files": []interface{}{entry(7), entry(-1)}}, 0, 0, false},
 		{"negative single", map[string]interface{}{"name": "single", "length": -1}, 0, 0, false},
 		{"negative file", map[string]interface{}{"name": "multi", "files": []interface{}{entry(-1)}}, 0, 0, false},
 		{"overflow", map[string]interface{}{"name": "multi", "files": []interface{}{entry(int64(math.MaxInt64)), entry(1)}}, 0, 0, false},
@@ -138,8 +143,13 @@ func TestTorrentFiles(t *testing.T) {
 			if valid != tc.valid || length != tc.length || len(files) != tc.count {
 				t.Fatalf("got %d files, length %d, valid %v", len(files), length, valid)
 			}
-			if !valid {
-				return
+			item, accepted := torrentMetadata(tc.info)
+			name, named := tc.info["name"].(string)
+			if accepted != (named && name != "") {
+				t.Fatalf("metadata acceptance = %v for name %v", accepted, tc.info["name"])
+			}
+			if accepted && (item.Name != name || item.Length != length || !reflect.DeepEqual(item.Files, files)) {
+				t.Fatalf("metadata fields differ: %+v", item)
 			}
 			mysqlData := mysql.Data{Length: length, Files: files}
 			mysqlJSON, err := json.Marshal(mysqlData)

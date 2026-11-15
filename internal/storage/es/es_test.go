@@ -53,6 +53,9 @@ type updatePayload struct {
 	Script         struct {
 		Lang   string `json:"lang"`
 		Source string `json:"source"`
+		Params struct {
+			Metadata map[string]json.RawMessage `json:"metadata"`
+		} `json:"params"`
 	} `json:"script"`
 	Upsert map[string]json.RawMessage `json:"upsert"`
 	Doc    json.RawMessage            `json:"doc"`
@@ -80,15 +83,20 @@ func checkUpdate(t *testing.T, r *http.Request) updatePayload {
 	if !p.ScriptedUpsert || p.Doc != nil || p.Script.Lang != "painless" {
 		t.Fatalf("not a script-only scripted upsert: %+v", p)
 	}
-	// Pin the complete script: it must handle absent/null count and must not
-	// copy incoming metadata (particularly timestamp) over existing fields.
 	wantScript := "if (!ctx._source.containsKey('count') || ctx._source.count == null) { " +
-		"ctx._source.count = 0; } ctx._source.count += 1;"
+		"ctx._source.count = 0; } ctx._source.count += 1; " +
+		"if ((!ctx._source.containsKey('files') || ctx._source.files == null || ctx._source.files.isEmpty()) && " +
+		"params.metadata.containsKey('files') && params.metadata.files != null && !params.metadata.files.isEmpty()) { " +
+		"ctx._source.files = params.metadata.files; " +
+		"ctx._source.length = params.metadata.containsKey('length') ? params.metadata.length : 0; }"
 	if p.Script.Source != wantScript {
 		t.Fatalf("script = %q, want %q", p.Script.Source, wantScript)
 	}
 	if string(p.Upsert["count"]) != "0" || string(p.Upsert["infohash"]) != `"`+testInfohash+`"` {
 		t.Fatalf("unexpected upsert: %s", p.Upsert)
+	}
+	if !reflect.DeepEqual(p.Script.Params.Metadata, p.Upsert) {
+		t.Fatal("enrichment parameters differ from incoming metadata")
 	}
 	return p
 }
@@ -107,6 +115,24 @@ func applyUpdate(t *testing.T, existing map[string]json.RawMessage, p updatePayl
 		}
 	}
 	existing["count"] = json.RawMessage(fmt.Sprint(count + 1))
+	var currentFiles, incomingFiles []json.RawMessage
+	if raw := existing["files"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &currentFiles); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if raw := p.Script.Params.Metadata["files"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &incomingFiles); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(currentFiles) == 0 && len(incomingFiles) > 0 {
+		existing["files"] = p.Script.Params.Metadata["files"]
+		existing["length"] = p.Script.Params.Metadata["length"]
+		if len(existing["length"]) == 0 {
+			existing["length"] = json.RawMessage("0")
+		}
+	}
 	return existing
 }
 
@@ -144,6 +170,36 @@ func TestWriteSameInfohashPreservesFirstMetadata(t *testing.T) {
 	}
 	if string(stored["size"]) != "9007199254740993" {
 		t.Fatal("large JSON integer lost precision")
+	}
+}
+
+func TestWriteEnrichesMissingFiles(t *testing.T) {
+	for _, initialFiles := range []string{"", `,"files":null`, `,"files":[]`} {
+		t.Run(initialFiles, func(t *testing.T) {
+			var stored map[string]json.RawMessage
+			c := testClient(t, func(r *http.Request) (*http.Response, error) {
+				stored = applyUpdate(t, stored, checkUpdate(t, r))
+				return testResponse(http.StatusOK, io.NopCloser(strings.NewReader(`{}`))), nil
+			})
+			first := `{"infohash":"` + testInfohash + `","name":"original","timestamp":123,"length":0` + initialFiles + `}`
+			if _, err := write(c, "metadata", "torrent", []byte(first)); err != nil {
+				t.Fatal(err)
+			}
+			files := `[{"path":["file"],"length":7}]`
+			second := `{"infohash":"` + testInfohash + `","name":"later","timestamp":456,"length":7,"files":` + files + `}`
+			if _, err := write(c, "metadata", "torrent", []byte(second)); err != nil {
+				t.Fatal(err)
+			}
+			for _, later := range []string{first, strings.ReplaceAll(second, `"length":7`, `"length":8`)} {
+				if _, err := write(c, "metadata", "torrent", []byte(later)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if string(stored["files"]) != files || string(stored["length"]) != "7" ||
+				string(stored["name"]) != `"original"` || string(stored["timestamp"]) != "123" || string(stored["count"]) != "4" {
+				t.Fatalf("incorrect enrichment: %s", stored)
+			}
+		})
 	}
 }
 

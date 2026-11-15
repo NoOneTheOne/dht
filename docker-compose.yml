@@ -17,7 +17,7 @@ services:
     command:
       - ./dht-spider
       - -port=${DHT_PORT:-6881}
-      - -query-workers=${DHT_QUERY_WORKERS:-64}
+      - -query-workers=${DHT_QUERY_WORKERS:-512}
       - -query-timeout=${DHT_QUERY_TIMEOUT:-5s}
       - -metadata-workers=${DHT_METADATA_WORKERS:-64}
     ports:

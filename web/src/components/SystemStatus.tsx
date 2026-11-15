@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
 
 type Rate = { succeeded: number; failed: number; success_rate: number | null };
+type Breakdown = {
+  total: number; with_files: number; without_files: number;
+  with_files_percent: number | null; without_files_percent: number | null;
+};
 type Pool = 'packet' | 'query' | 'metadata';
 type Crawler = {
   started_at: string; uptime_seconds: number; collected: number; connected_peers: number;
@@ -10,6 +14,7 @@ type Crawler = {
 type Status = {
   status: 'operational' | 'degraded' | 'outage'; issues: string[]; updated_at: string;
   crawler: Crawler | null; total_collected: number | null; storage: string;
+  ingestion: { this_run: Breakdown | null; all_time: Breakdown | null };
 };
 
 const number = (value: number | null | undefined) => value == null ? '—' : value.toLocaleString('zh-CN');
@@ -27,9 +32,21 @@ function isStatus(value: unknown): value is Status {
   const nonnegative = (n: unknown) => typeof n === 'number' && Number.isFinite(n) && n >= 0;
   const rate = (r: Rate) => r && nonnegative(r.succeeded) && nonnegative(r.failed) &&
     (r.success_rate === null || nonnegative(r.success_rate) && r.success_rate <= 100);
+  const breakdown = (value: unknown) => {
+    if (value === null) return true;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const b = value as Breakdown;
+    const count = (n: unknown) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+    const percent = (n: unknown) => n === null || typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 100;
+    return [b.total, b.with_files, b.without_files].every(count) && b.with_files + b.without_files === b.total &&
+      percent(b.with_files_percent) && percent(b.without_files_percent) &&
+      (b.total !== 0 || b.with_files_percent === null && b.without_files_percent === null);
+  };
   const c = s.crawler;
   return ['operational', 'degraded', 'outage'].includes(s.status) && Array.isArray(s.issues) && s.issues.every(i => typeof i === 'string') &&
     Number.isFinite(Date.parse(s.updated_at)) && ['connected', 'unavailable'].includes(s.storage) &&
+    !!s.ingestion && typeof s.ingestion === 'object' && !Array.isArray(s.ingestion) &&
+    breakdown(s.ingestion.this_run) && breakdown(s.ingestion.all_time) &&
     (s.total_collected === null || nonnegative(s.total_collected)) && (c === null || !!c &&
       Number.isFinite(Date.parse(c.started_at)) && [c.uptime_seconds, c.collected, c.connected_peers, c.rejected_peers, c.dropped_peers].every(nonnegative) &&
       typeof c.nat === 'string' && typeof c.reachability === 'string' && typeof c.ready === 'boolean' && rate(c.dht_query) && rate(c.metadata_fetch) &&
@@ -43,6 +60,24 @@ function RateCard({ label, subtitle, rate }: { label: string; subtitle: string; 
     <div className="rate-track" aria-hidden="true"><span style={{ width: `${value ?? 0}%` }} /></div>
     <div className="rate-counts"><span>成功 <b>{number(rate?.succeeded)}</b></span><span>失败 <b>{number(rate?.failed)}</b></span></div>
     <p className="metric-note">{value == null ? '等待完成首次尝试' : subtitle}</p>
+  </article>;
+}
+
+function CoverageCard({ label, subtitle, breakdown }: { label: string; subtitle: string; breakdown: Breakdown | null | undefined }) {
+  const withFiles = breakdown?.with_files_percent;
+  const withoutFiles = breakdown?.without_files_percent;
+  return <article className="status-card coverage-card"><span className="metric-label">{label}<span>UNIQUE INFOHASH</span></span>
+    <strong className="metric-value">{number(breakdown?.total)}<small>个</small></strong>
+    <p className="metric-note">{subtitle}</p>
+    <div className="rate-track coverage-track" aria-hidden="true">
+      <span className="coverage-with" style={{ width: `${withFiles ?? 0}%` }} />
+      <span className="coverage-without" style={{ width: `${withoutFiles ?? 0}%` }} />
+    </div>
+    <dl className="coverage-counts">
+      <div><dt><i className="coverage-key coverage-with" aria-hidden="true" />有 filelist</dt><dd><b>{number(breakdown?.with_files)}</b><span>{withFiles == null ? '—' : `${withFiles.toFixed(1)}%`}</span></dd></div>
+      <div><dt><i className="coverage-key coverage-without" aria-hidden="true" />无 filelist</dt><dd><b>{number(breakdown?.without_files)}</b><span>{withoutFiles == null ? '—' : `${withoutFiles.toFixed(1)}%`}</span></dd></div>
+    </dl>
+    <p className="metric-note">{breakdown === undefined ? '正在获取入库统计' : breakdown === null ? '入库统计暂时不可用，不代表入库数量为 0' : breakdown.total === 0 ? '暂无入库样本，占比不适用' : '按当前文件明细（files）分类；占比以去重总量为分母'}</p>
   </article>;
 }
 
@@ -94,8 +129,14 @@ export default function SystemStatus() {
       <div className="status-grid overview-grid">
         <article className="status-card"><span className="metric-label">运行时间 <span>UPTIME</span></span><strong className="metric-value uptime-value">{duration(c?.uptime_seconds)}</strong><p className="metric-note">采集进程 · 自本次启动</p></article>
         <article className="status-card"><span className="metric-label">启动时间 <span>STARTED AT</span></span><strong className="metric-value start-value">{date(c?.started_at)}</strong><p className="metric-note">按浏览器本地时区显示</p></article>
-        <article className="status-card"><span className="metric-label">本次运行收集 <span>THIS RUN</span></span><strong className="metric-value">{number(c?.collected)}<small>条</small></strong><p className="metric-note">已通过哈希校验的元数据抓取次数</p></article>
+        <article className="status-card"><span className="metric-label">本次元数据抓取 <span>THIS RUN</span></span><strong className="metric-value">{number(c?.collected)}<small>次</small></strong><p className="metric-note">已通过哈希校验的抓取次数，含重复资源，非新增入库数</p></article>
         <article className="status-card"><span className="metric-label">总收集条目 <span>ALL TIME</span></span><strong className="metric-value">{number(data?.total_collected)}<small>条</small></strong><p className="metric-note">数据库已收录的去重资源数</p></article>
+      </div>
+      <div className="status-group-heading"><h2>入库明细覆盖</h2><span>INGESTION COVERAGE</span></div>
+      <p className="coverage-description">按 InfoHash 去重精确计数 · 统计缓存 1 分钟，刷新状态不会立即刷新入库统计。</p>
+      <div className="status-grid coverage-grid">
+        <CoverageCard label="本次新增入库" subtitle="数据库首次收录时间 ≥ 采集进程本次启动时间；不含重复旧 InfoHash" breakdown={data?.ingestion.this_run} />
+        <CoverageCard label="全局已入库" subtitle="全局数据库存量：主表所有唯一 InfoHash，不限采集进程启动时间" breakdown={data?.ingestion.all_time} />
       </div>
       <div className="status-group-heading"><h2>采集与连接</h2><span>CRAWLER & CONNECTIONS</span></div>
       <div className="status-grid connections-grid">

@@ -190,6 +190,21 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
 .rate-track > span { display: block; background: var(--accent); opacity: .65; height: 100%; border-radius: inherit; transition: width .3s; }
 .rate-counts { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 10px; margin: 16px 0 12px; }
 .rate-counts b { color: var(--text); font-weight: 500; margin-left: 5px; }
+.coverage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.coverage-description { color: var(--muted); font-size: 11px; line-height: 1.8; margin: -2px 0 16px; }
+.coverage-card > .metric-note { min-height: 36px; }
+.coverage-track { display: flex; height: 7px; margin-top: 18px; }
+.coverage-track > span { flex-shrink: 0; border-radius: 0; }
+.coverage-with, .coverage-track > .coverage-with { background: var(--accent); opacity: .75; }
+.coverage-without, .coverage-track > .coverage-without { background: var(--yellow); opacity: .75; }
+.coverage-counts { display: grid; gap: 12px; margin: 18px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.coverage-counts > div, .coverage-counts dt, .coverage-counts dd { display: flex; align-items: center; gap: 8px; }
+.coverage-counts > div { justify-content: space-between; flex-wrap: wrap; }
+.coverage-counts dt { color: var(--muted); }
+.coverage-key { width: 7px; height: 7px; border-radius: 2px; flex-shrink: 0; }
+.coverage-counts dd { margin: 0 0 0 auto; justify-content: flex-end; flex-wrap: wrap; overflow-wrap: anywhere; }
+.coverage-counts b { font-weight: 550; }
+.coverage-counts dd > span { min-width: 58px; text-align: right; color: var(--muted); font-size: 11px; }
 .worker-row { margin: 19px 0; }
 .worker-row > div:first-child { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; margin-bottom: 9px; }
 .worker-row b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
@@ -286,7 +301,9 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
   .metric-value { font-size: 28px; margin-top: 18px; }
   .uptime-value { font-size: 18px; }
   .start-value { font-size: 16px; line-height: 1.6; }
-  .connections-grid, .infrastructure-grid { grid-template-columns: 1fr; }
+  .connections-grid, .infrastructure-grid, .coverage-grid { grid-template-columns: 1fr; }
+  .coverage-grid { gap: 12px; }
+  .coverage-card > .metric-note { min-height: 0; }
   .peers-card { column-gap: 24px; }
   .peer-stat + .peer-stat { padding-left: 24px; }
   .status-group-heading { margin-top: 26px; }

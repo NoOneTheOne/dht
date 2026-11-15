@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/metrics"
+	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 	"github.com/gin-gonic/gin"
 )
 
@@ -22,12 +23,12 @@ func TestStatusHandler(t *testing.T) {
 				return nil, errors.New("private backend details")
 			}
 			return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual"}, nil
-		}, func(context.Context) (int64, error) {
+		}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
 			calls++
 			if unavailable {
-				return 0, errors.New("private database details")
+				return mysql.ResourceCounts{}, errors.New("private database details")
 			}
-			return 12, nil
+			return mysql.ResourceCounts{Total: 12, WithFiles: 9, ThisRunTotal: 4, ThisRunWithFiles: 1}, nil
 		})
 		router := gin.New()
 		router.GET("/api/status", handler)
@@ -45,8 +46,16 @@ func TestStatusHandler(t *testing.T) {
 			if status.Status != want || recorder.Header().Get("Cache-Control") != "no-store" {
 				t.Fatalf("unexpected status: %+v", status)
 			}
-			if unavailable && (status.Crawler != nil || status.TotalCollected != nil) {
+			if unavailable && (status.Crawler != nil || status.TotalCollected != nil || status.Ingestion.AllTime != nil || status.Ingestion.ThisRun != nil) {
 				t.Fatal("unavailable metrics must remain unknown")
+			}
+			if !unavailable {
+				all, run := status.Ingestion.AllTime, status.Ingestion.ThisRun
+				if all == nil || run == nil || all.Total != 12 || all.WithFiles != 9 || all.WithoutFiles != 3 ||
+					run.Total != 4 || run.WithFiles != 1 || run.WithoutFiles != 3 ||
+					all.WithFilesPercent == nil || *all.WithFilesPercent != 75 || run.WithFilesPercent == nil || *run.WithFilesPercent != 25 {
+					t.Fatalf("incorrect ingestion coverage: %+v", status.Ingestion)
+				}
 			}
 		}
 		if calls != 1 {
@@ -59,9 +68,9 @@ func TestStatusCountTimeoutPreservesCrawler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := statusHandler(func(context.Context) (*metrics.CrawlerStatus, error) {
 		return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual"}, nil
-	}, func(ctx context.Context) (int64, error) {
+	}, func(ctx context.Context, _ time.Time) (mysql.ResourceCounts, error) {
 		<-ctx.Done()
-		return 0, ctx.Err()
+		return mysql.ResourceCounts{}, ctx.Err()
 	})
 	router := gin.New()
 	router.GET("/api/status", handler)
@@ -87,7 +96,9 @@ func TestStatusCancellationDoesNotPoisonCache(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual"}, nil
-	}, func(context.Context) (int64, error) { return 12, nil })
+	}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
+		return mysql.ResourceCounts{Total: 12, WithFiles: 9, ThisRunTotal: 4, ThisRunWithFiles: 1}, nil
+	})
 	router := gin.New()
 	router.GET("/api/status", handler)
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/status", nil).WithContext(ctx))

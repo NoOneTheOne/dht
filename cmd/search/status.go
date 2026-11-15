@@ -37,22 +37,11 @@ func fetchCrawlerStatus(ctx context.Context, client *http.Client, url string) (*
 	return &status, nil
 }
 
-func totalResources(ctx context.Context) (int64, error) {
-	db, err := mysql.GetDB()
-	if err != nil {
-		return 0, err
-	}
-	var total int64
-	err = db.WithContext(ctx).Model(&mysql.Data{}).Count(&total).Error
-	return total, err
-}
-
-func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), count func(context.Context) (int64, error)) gin.HandlerFunc {
+func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), count func(context.Context, time.Time) (mysql.ResourceCounts, error)) gin.HandlerFunc {
 	var mu sync.Mutex
 	var cached metrics.SystemStatus
-	var expires time.Time
-	var total *int64
-	var countExpires time.Time
+	var expires, countExpires, countedStart time.Time
+	var totals *mysql.ResourceCounts
 	return func(c *gin.Context) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -62,29 +51,31 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 		if time.Now().After(expires) {
 			ctx, cancel := context.WithTimeout(c.Request.Context(), 4*time.Second)
 			defer cancel()
-			type countResult struct {
-				value int64
-				err   error
-			}
-			refreshCount := time.Now().After(countExpires)
-			counts := make(chan countResult, 1)
-			if refreshCount {
-				go func() {
-					value, err := count(ctx)
-					counts <- countResult{value, err}
-				}()
-			}
 			crawler, err := fetch(ctx)
 			if err != nil {
 				crawler = nil
 			}
-			nextTotal := total
+			startedAt := countedStart
+			if crawler != nil {
+				startedAt = crawler.StartedAt
+			}
+			refreshCount := time.Now().After(countExpires) || !startedAt.Equal(countedStart)
+			nextTotals := totals
 			if refreshCount {
-				nextTotal = nil
+				nextTotals = nil
+				type countResult struct {
+					value mysql.ResourceCounts
+					err   error
+				}
+				counts := make(chan countResult, 1)
+				go func() {
+					value, err := count(ctx, startedAt)
+					counts <- countResult{value, err}
+				}()
 				select {
 				case result := <-counts:
 					if result.err == nil {
-						nextTotal = &result.value
+						nextTotals = &result.value
 					}
 				case <-ctx.Done():
 				}
@@ -93,13 +84,24 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 				return
 			}
 			if refreshCount {
-				total = nextTotal
+				totals = nextTotals
+				countedStart = startedAt
 				countExpires = time.Now().Add(time.Minute)
-				if total == nil {
+				if totals == nil {
 					countExpires = time.Now().Add(10 * time.Second)
 				}
 			}
+			var total *int64
+			if totals != nil {
+				total = &totals.Total
+			}
 			cached = metrics.NewSystemStatus(crawler, total)
+			if totals != nil {
+				cached.Ingestion.AllTime = metrics.NewFileCoverage(totals.Total, totals.WithFiles)
+				if crawler != nil {
+					cached.Ingestion.ThisRun = metrics.NewFileCoverage(totals.ThisRunTotal, totals.ThisRunWithFiles)
+				}
+			}
 			expires = time.Now().Add(10 * time.Second)
 		}
 		c.Header("Cache-Control", "no-store")

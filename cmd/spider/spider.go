@@ -100,6 +100,19 @@ func torrentFiles(info map[string]interface{}) ([]mysql.File, int64, bool) {
 	return []mysql.File{{Path: []string{name}, Length: length}}, length, true
 }
 
+func torrentMetadata(info map[string]interface{}) (mysql.Data, bool) {
+	name, ok := info["name"].(string)
+	if !ok || name == "" {
+		dht.RecordProtocolEvent("metadata_decode", "invalid_name")
+		return mysql.Data{}, false
+	}
+	files, length, ok := torrentFiles(info)
+	if !ok {
+		dht.RecordProtocolEvent("metadata_decode", "invalid_files")
+	}
+	return mysql.Data{Name: name, Files: files, Length: length}, true
+}
+
 func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
 	writeMySQLBatchesWithRecovery(input, ticks, nil, func(_ string, items []mysql.Data) error {
 		return write(items)
@@ -250,36 +263,24 @@ func main() {
 				continue
 			}
 
-			name, ok := info["name"].(string)
-			if !ok || name == "" {
-				dht.RecordProtocolEvent("metadata_decode", "invalid_name")
-				continue
-			}
-
-			files, length, ok := torrentFiles(info)
+			item, ok := torrentMetadata(info)
 			if !ok {
-				dht.RecordProtocolEvent("metadata_decode", "invalid_files")
 				continue
 			}
-			infoHash := hex.EncodeToString(resp.InfoHash)
+			item.InfoHash = hex.EncodeToString(resp.InfoHash)
+			item.Time = time.Now()
 
 			switch c.Storage.Type {
 			case "mysql":
-				mysqlWrites <- mysql.Data{
-					Name:     name,
-					InfoHash: infoHash,
-					Time:     time.Now(),
-					Length:   length,
-					Files:    files,
-				}
+				mysqlWrites <- item
 
 			case "elasticsearch":
 				bt := bitTorrent{
-					Time:     time.Now(),
-					InfoHash: infoHash,
-					Name:     name,
-					Files:    files,
-					Length:   length,
+					Time:     item.Time,
+					InfoHash: item.InfoHash,
+					Name:     item.Name,
+					Files:    item.Files,
+					Length:   item.Length,
 				}
 
 				if data, err := json.Marshal(bt); err != nil {
@@ -288,7 +289,7 @@ func main() {
 					if _, err := es.Write(c.Elasticsearch.Index, "_doc", data); err != nil {
 						basic.CheckError(err)
 					} else {
-						slog.Info("Elasticsearch metadata persisted", "component", "elasticsearch", "infohash", infoHash, "length", length)
+						slog.Info("Elasticsearch metadata persisted", "component", "elasticsearch", "infohash", item.InfoHash, "length", item.Length)
 					}
 				}
 

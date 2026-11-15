@@ -47,7 +47,7 @@ func main() {
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	router.GET("/search", searchHandler)
-	router.GET("/api/status", statusHandler(crawlerStatusGetter(), totalResources))
+	router.GET("/api/status", statusHandler(crawlerStatusGetter(), mysql.CountResources))
 	router.GET("/api/trending", trendingHandler(mysql.Trending))
 	router.GET("/api/torrents/:infohash", detailHandler(mysql.Detail))
 

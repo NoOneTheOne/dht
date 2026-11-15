@@ -149,8 +149,9 @@ func aggregateWrites(items []Data) ([]Data, error) {
 		item.InfoHash = strings.ToLower(item.InfoHash)
 		if existing, ok := grouped[item.InfoHash]; ok {
 			existing.Count++
-			if len(existing.Files) == 0 {
+			if len(existing.Files) == 0 && len(item.Files) > 0 {
 				existing.Files = item.Files
+				existing.Length = item.Length
 			}
 			grouped[item.InfoHash] = existing
 			continue
@@ -211,10 +212,12 @@ func WriteBatch(items []Data) error {
 func upsertRows(tx *gorm.DB, values []Data) error {
 	return tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "infohash"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"count": gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)"),
-			"files": gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"),
-		}),
+		// MySQL evaluates assignments left to right; inspect the old files before replacing them.
+		DoUpdates: clause.Set{
+			{Column: clause.Column{Name: "count"}, Value: gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)")},
+			{Column: clause.Column{Name: "length"}, Value: gorm.Expr("IF((`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL') AND JSON_LENGTH(VALUES(`files`)) > 0, VALUES(`length`), `length`)")},
+			{Column: clause.Column{Name: "files"}, Value: gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)")},
+		},
 	}).Create(&values).Error
 }
 
@@ -312,6 +315,30 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 		Joins("JOIN (?) AS ranked ON ranked.infohash = resources.infohash", ranked).
 		Order("ranked.hits DESC, resources.infohash ASC").Find(&items).Error
 	return items, err
+}
+
+type ResourceCounts struct {
+	Total            int64
+	WithFiles        int64
+	ThisRunTotal     int64
+	ThisRunWithFiles int64
+}
+
+func CountResources(parent context.Context, startedAt time.Time) (ResourceCounts, error) {
+	var counts ResourceCounts
+	db, err := GetDB()
+	if err != nil {
+		return counts, err
+	}
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	hasFiles := "COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE)"
+	err = db.WithContext(ctx).Model(&Data{}).Select(
+		"COUNT(*) AS total, COALESCE(SUM("+hasFiles+"), 0) AS with_files, "+
+			"COALESCE(SUM(`time` >= ?), 0) AS this_run_total, "+
+			"COALESCE(SUM(`time` >= ? AND "+hasFiles+"), 0) AS this_run_with_files",
+		startedAt, startedAt).Find(&counts).Error
+	return counts, err
 }
 
 func Detail(parent context.Context, infoHash string) (*Data, error) {

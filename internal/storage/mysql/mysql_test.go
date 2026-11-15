@@ -45,10 +45,17 @@ func TestWriteBatchSQLUsesProductionUpsert(t *testing.T) {
 	if err := upsertRows(candidate.Session(&gorm.Session{SkipDefaultTransaction: true}), rows); err != nil {
 		t.Fatal(err)
 	}
-	for _, fragment := range []string{"COALESCE(`count`, 0) + VALUES(`count`)", "`files`=IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)"} {
+	for _, fragment := range []string{
+		"COALESCE(`count`, 0) + VALUES(`count`)",
+		"`length`=IF((`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL') AND JSON_LENGTH(VALUES(`files`)) > 0, VALUES(`length`), `length`)",
+		"`files`=IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)",
+	} {
 		if !strings.Contains(query, fragment) {
 			t.Fatalf("missing %s in %s", fragment, query)
 		}
+	}
+	if strings.Index(query, "`length`=IF") > strings.Index(query, "`files`=IF") {
+		t.Fatal("length must be enriched before files are replaced")
 	}
 }
 
@@ -214,8 +221,8 @@ func TestAggregateWrites(t *testing.T) {
 	first := time.Unix(100, 0)
 	files := []File{{Path: []string{"folder", "file"}, Length: 7}}
 	items := []Data{
-		{InfoHash: strings.Repeat("B", 40), Name: "first\xff", Time: first, Length: 7, Count: 999},
-		{InfoHash: strings.Repeat("b", 40), Name: "later", Time: first.Add(time.Hour), Length: 8, Files: files},
+		{InfoHash: strings.Repeat("B", 40), Name: "first\xff", Time: first, Count: 999},
+		{InfoHash: strings.Repeat("b", 40), Name: "later", Time: first.Add(time.Hour), Length: 7, Files: files},
 		{InfoHash: strings.Repeat("a", 40), Name: "other"},
 	}
 	rows, err := aggregateWrites(items)
@@ -231,10 +238,11 @@ func TestAggregateWrites(t *testing.T) {
 		t.Fatal("duplicate file-list enrichment lost data or mutated the caller")
 	}
 	preserved, err := aggregateWrites([]Data{
-		{InfoHash: strings.Repeat("a", 40), Files: files},
-		{InfoHash: strings.Repeat("a", 40), Files: []File{{Path: []string{"later"}, Length: 8}}},
+		{InfoHash: strings.Repeat("a", 40), Length: 7, Files: files},
+		{InfoHash: strings.Repeat("a", 40), Length: 8, Files: []File{{Path: []string{"later"}, Length: 8}}},
+		{InfoHash: strings.Repeat("a", 40)},
 	})
-	if err != nil || len(preserved[0].Files) != 1 || preserved[0].Files[0].Length != 7 {
+	if err != nil || len(preserved[0].Files) != 1 || preserved[0].Files[0].Length != 7 || preserved[0].Length != 7 || preserved[0].Count != 3 {
 		t.Fatal("duplicate overwrote the first file list")
 	}
 	if items[0].Count != 999 || items[0].Name != "first\xff" {
@@ -510,6 +518,52 @@ func TestSearchItemJSON(t *testing.T) {
 		if _, exists := fields["files"]; exists || string(fields["has_files"]) != fmt.Sprint(available) {
 			t.Fatalf("search JSON must expose availability without a file payload: %s", encoded)
 		}
+	}
+}
+
+func TestCountResources(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)
+	queries := 0
+	if err := candidate.Callback().Query().After("gorm:query").Register("capture_coverage", func(tx *gorm.DB) {
+		if err := tx.Statement.Context.Err(); err != nil {
+			tx.AddError(err)
+			return
+		}
+		queries++
+		sql := tx.Statement.SQL.String()
+		for _, fragment := range []string{"COUNT(*) AS total", "JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0", "AS with_files", "AS this_run_total", "AS this_run_with_files", "FROM `torrent_test`"} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("missing %s in %s", fragment, sql)
+			}
+		}
+		if len(tx.Statement.Vars) != 2 || tx.Statement.Vars[0] != startedAt || tx.Statement.Vars[1] != startedAt {
+			t.Fatalf("run start not bound: %v", tx.Statement.Vars)
+		}
+		if _, ok := tx.Statement.Context.Deadline(); !ok {
+			t.Fatal("coverage query has no timeout")
+		}
+		*tx.Statement.Dest.(*ResourceCounts) = ResourceCounts{Total: 12, WithFiles: 9, ThisRunTotal: 4, ThisRunWithFiles: 1}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+	counts, err := CountResources(context.Background(), startedAt)
+	if err != nil || queries != 1 || counts.Total != 12 || counts.WithFiles != 9 || counts.ThisRunTotal != 4 || counts.ThisRunWithFiles != 1 {
+		t.Fatalf("incorrect coverage: %+v, queries=%d, error=%v", counts, queries, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := CountResources(ctx, startedAt); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled coverage query returned %v", err)
 	}
 }
 

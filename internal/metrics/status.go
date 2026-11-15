@@ -43,13 +43,38 @@ type CrawlerStatus struct {
 	Ready          bool           `json:"ready"`
 }
 
+type FileCoverage struct {
+	Total               int64    `json:"total"`
+	WithFiles           int64    `json:"with_files"`
+	WithoutFiles        int64    `json:"without_files"`
+	WithFilesPercent    *float64 `json:"with_files_percent"`
+	WithoutFilesPercent *float64 `json:"without_files_percent"`
+}
+
+func NewFileCoverage(total, withFiles int64) *FileCoverage {
+	coverage := &FileCoverage{Total: total, WithFiles: withFiles, WithoutFiles: total - withFiles}
+	if total > 0 {
+		withPercent := float64(withFiles) / float64(total) * 100
+		withoutPercent := float64(coverage.WithoutFiles) / float64(total) * 100
+		coverage.WithFilesPercent = &withPercent
+		coverage.WithoutFilesPercent = &withoutPercent
+	}
+	return coverage
+}
+
+type IngestionStatus struct {
+	ThisRun *FileCoverage `json:"this_run"`
+	AllTime *FileCoverage `json:"all_time"`
+}
+
 type SystemStatus struct {
-	Status         string         `json:"status"`
-	Issues         []string       `json:"issues"`
-	UpdatedAt      time.Time      `json:"updated_at"`
-	Crawler        *CrawlerStatus `json:"crawler"`
-	TotalCollected *int64         `json:"total_collected"`
-	Storage        string         `json:"storage"`
+	Status         string          `json:"status"`
+	Issues         []string        `json:"issues"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+	Crawler        *CrawlerStatus  `json:"crawler"`
+	TotalCollected *int64          `json:"total_collected"`
+	Storage        string          `json:"storage"`
+	Ingestion      IngestionStatus `json:"ingestion"`
 }
 
 func NewSystemStatus(crawler *CrawlerStatus, total *int64) SystemStatus {

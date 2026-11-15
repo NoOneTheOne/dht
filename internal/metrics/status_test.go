@@ -13,6 +13,24 @@ func TestOutcomeRate(t *testing.T) {
 	}
 }
 
+func TestFileCoverage(t *testing.T) {
+	for _, tc := range []struct{ total, with int64 }{{0, 0}, {4, 1}, {10, 0}, {10, 10}} {
+		coverage := NewFileCoverage(tc.total, tc.with)
+		if coverage.Total != tc.total || coverage.WithFiles != tc.with || coverage.WithoutFiles != tc.total-tc.with {
+			t.Fatalf("incorrect counts: %+v", coverage)
+		}
+		if tc.total == 0 {
+			if coverage.WithFilesPercent != nil || coverage.WithoutFilesPercent != nil {
+				t.Fatal("empty coverage must have unknown percentages")
+			}
+		} else if coverage.WithFilesPercent == nil || coverage.WithoutFilesPercent == nil ||
+			*coverage.WithFilesPercent != float64(tc.with)/float64(tc.total)*100 ||
+			*coverage.WithoutFilesPercent != float64(tc.total-tc.with)/float64(tc.total)*100 {
+			t.Fatalf("incorrect percentages: %+v", coverage)
+		}
+	}
+}
+
 func TestSystemStatus(t *testing.T) {
 	total := int64(10)
 	for _, tc := range []struct {
