@@ -172,7 +172,7 @@ func TestGetPeersValidatesHashAndBoundsFanout(t *testing.T) {
 	d.routingTable = newRoutingTable(8, d)
 	d.transactionManager = newTransactionManager(math.MaxUint32, d)
 	for i, n := range nearestTestNodes(100) {
-		n.addr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10000 + i}
+		n.addr = &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 10000 + i}
 		d.routingTable.cachedNodes.Set(n.addr.String(), n)
 	}
 	d.ready.Store(true)
@@ -184,20 +184,26 @@ func TestGetPeersValidatesHashAndBoundsFanout(t *testing.T) {
 	if len(d.transactionManager.queryChan) != 0 {
 		t.Fatal("invalid hash queued queries")
 	}
-	for _, hash := range []string{strings.Repeat("a", 20), strings.Repeat("61", 20)} {
-		if err := d.GetPeers(hash); err != nil {
-			t.Fatal(err)
-		}
+	if err := d.GetPeers(strings.Repeat("a", 20)); err != nil {
+		t.Fatal(err)
 	}
-	if got := len(d.transactionManager.queryChan); got != d.K {
-		t.Fatalf("queued %d queries, want %d", got, d.K)
+	if err := d.GetPeers(strings.Repeat("61", 20)); err != ErrQueryNotQueued {
+		t.Fatalf("duplicate query must report no admission: %v", err)
+	}
+	if got := len(d.transactionManager.queryChan); got != peerLookupAlpha {
+		t.Fatalf("queued %d queries, want %d", got, peerLookupAlpha)
 	}
 	target := newBitmapFromString(strings.Repeat("a", 20))
-	for _, want := range d.routingTable.GetNeighbors(target, d.K) {
+	for _, want := range d.routingTable.GetNeighbors(target, peerLookupAlpha) {
 		got := <-d.transactionManager.queryChan
 		if got.node != want || got.data["a"].(map[string]interface{})["info_hash"] != target.RawString() {
 			t.Fatal("queued query does not match nearest peer or decoded hash")
 		}
+	}
+	d.transactionManager.queryChan = make(chan *query)
+	clear(d.transactionManager.pending)
+	if err := d.GetPeers(strings.Repeat("b", 20)); err != ErrQueryNotQueued {
+		t.Fatalf("full query queue consumed a lookup: %v", err)
 	}
 }
 

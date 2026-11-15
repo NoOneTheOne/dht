@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NoOneTheOne/dht/internal/dht"
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
 
@@ -102,6 +103,36 @@ func TestFailedBatchRetainsIDAndContents(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("retained batch did not drain")
+	}
+}
+
+func TestFilelistOutcomeReasons(t *testing.T) {
+	for _, tc := range []struct {
+		reason string
+		info   map[string]interface{}
+	}{
+		{"missing_layout", map[string]interface{}{"name": "resource"}},
+		{"invalid_length", map[string]interface{}{"name": "resource", "length": -1}},
+		{"invalid_list", map[string]interface{}{"name": "resource", "files": "invalid"}},
+		{"empty_list", map[string]interface{}{"name": "resource", "files": []interface{}{}}},
+		{"conflicting_layout", map[string]interface{}{"name": "resource", "files": []interface{}{}, "length": 7}},
+		{"invalid_entries", map[string]interface{}{"name": "resource", "files": []interface{}{7}}},
+		{"complete", map[string]interface{}{"name": "resource", "length": 7}},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			count := func() int64 {
+				for _, event := range dht.GetProtocolEvents() {
+					if event.Stage == "filelist" && event.Reason == tc.reason {
+						return event.Count
+					}
+				}
+				return 0
+			}
+			before := count()
+			if _, ok := torrentMetadata(tc.info); !ok || count() != before+1 {
+				t.Fatal("named metadata rejected or filelist reason missing")
+			}
+		})
 	}
 }
 

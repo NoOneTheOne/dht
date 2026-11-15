@@ -335,6 +335,7 @@ type routingTable struct {
 	cachedKBuckets *keyedDeque
 	dht            *DHT
 	clearQueue     *syncedList
+	refreshOffset  int
 }
 
 // newRoutingTable returns a new routingTable pointer.

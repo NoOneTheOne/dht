@@ -90,7 +90,6 @@ function App() {
 
   return (
     <div className="app-shell">
-      <a className="skip-link" href="#main-content" onClick={event => { event.preventDefault(); document.getElementById('main-content')?.focus(); }}>跳到主要内容</a>
       <header className="site-header">
         <a className="brand" href="/" aria-label="DHT 首页"><img className="brand-mark" src="/search-icon.svg" alt="" width="33" height="33" /><span>DHT</span></a>
         <nav className="header-nav" aria-label="主要导航">

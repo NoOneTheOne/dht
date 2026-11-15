@@ -213,24 +213,30 @@ func (rt *routingTable) OptimizedRefresh() {
 			continue
 		}
 
-		// Refresh this bucket
-		i := 0
+		selected := make([]*node, 0, bp.bucket.nodes.Len())
 		for e := range bp.bucket.nodes.Iter() {
-			if i < rt.dht.RefreshNodeNum {
-				no := e.Value.(*node)
-				rt.dht.transactionManager.findNode(no, bp.bucket.RandomChildID())
-				if rt.dht.IsCrawlMode() {
-					rt.clearQueue.PushBack(no)
-				}
+			selected = append(selected, e.Value.(*node))
+		}
+		if len(selected) == 0 {
+			continue
+		}
+		// Rotating the snapshot avoids repeatedly probing the same oldest contacts.
+		rt.Lock()
+		offset := rt.refreshOffset % len(selected)
+		rt.refreshOffset += min(rt.dht.RefreshNodeNum, len(selected))
+		rt.Unlock()
+		for i := 0; i < min(rt.dht.RefreshNodeNum, len(selected)); i++ {
+			no := selected[(offset+i)%len(selected)]
+			rt.dht.transactionManager.findNode(no, bp.bucket.RandomChildID())
+			if rt.dht.IsCrawlMode() {
+				rt.clearQueue.PushBack(no)
 			}
-			i++
 		}
 		refreshCount++
 	}
-
 	if rt.dht.IsCrawlMode() {
 		for e := range rt.clearQueue.Iter() {
-			rt.Remove(e.Value.(*node).id)
+			rt.removeContact(e.Value.(*node), false)
 		}
 		rt.clearQueue.Clear()
 	}

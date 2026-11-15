@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"log"
@@ -109,6 +108,23 @@ func torrentMetadata(info map[string]interface{}) (mysql.Data, bool) {
 	files, length, ok := torrentFiles(info)
 	if !ok {
 		dht.RecordProtocolEvent("metadata_decode", "invalid_files")
+		reason := "invalid_entries"
+		if value, exists := info["files"]; exists {
+			if _, conflicting := info["length"]; conflicting {
+				reason = "conflicting_layout"
+			} else if entries, list := value.([]interface{}); !list {
+				reason = "invalid_list"
+			} else if len(entries) == 0 {
+				reason = "empty_list"
+			}
+		} else if _, exists := info["length"]; !exists {
+			reason = "missing_layout"
+		} else {
+			reason = "invalid_length"
+		}
+		dht.RecordProtocolEvent("filelist", reason)
+	} else {
+		dht.RecordProtocolEvent("filelist", "complete")
 	}
 	return mysql.Data{Name: name, Files: files, Length: length}, true
 }
@@ -247,29 +263,11 @@ func main() {
 	} else {
 		close(writeDone)
 	}
+	items := make(chan mysql.Data, 100)
 	go func() {
 		defer close(responseDone)
 		defer close(mysqlWrites)
-		for resp := range w.Response() {
-			metadata, err := dht.Decode(resp.MetadataInfo)
-			if err != nil {
-				dht.RecordProtocolEvent("metadata_decode", "decode_error")
-				continue
-			}
-
-			info, ok := metadata.(map[string]interface{})
-			if !ok {
-				dht.RecordProtocolEvent("metadata_decode", "invalid_info")
-				continue
-			}
-
-			item, ok := torrentMetadata(info)
-			if !ok {
-				continue
-			}
-			item.InfoHash = hex.EncodeToString(resp.InfoHash)
-			item.Time = time.Now()
-
+		for item := range items {
 			switch c.Storage.Type {
 			case "mysql":
 				mysqlWrites <- item
@@ -305,23 +303,29 @@ func main() {
 	initConfig.Address = net.JoinHostPort("", strconv.Itoa(*port))
 	initConfig.QueryWorkerLimit = *queryWorkers
 	initConfig.QueryTimeout = *queryTimeout
-	log.Printf("[DHT] Listening on UDP %d, query workers=%d timeout=%s, metadata workers=%d", *port, *queryWorkers, *queryTimeout, *metadataWorkers)
-	queuePeer := func(infoHash, ip string, peerPort int) {
-		if len(infoHash) != 20 || !dht.IsPublicPeerIP(ip) {
-			return
+	initConfig.NodeCachePath = os.Getenv("NODE_CACHE_PATH")
+	if initConfig.NodeCachePath == "" {
+		recoveryPath := os.Getenv("RECOVERY_FILE_PATH")
+		if recoveryPath == "" {
+			recoveryPath = filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl")
 		}
-		dht.RecordTorrentDiscovered()
-		w.Request([]byte(infoHash), ip, peerPort)
+		initConfig.NodeCachePath = filepath.Join(filepath.Dir(recoveryPath), "dht-nodes.json")
+	}
+	log.Printf("[DHT] Listening on UDP %d, query workers=%d timeout=%s, metadata workers=%d", *port, *queryWorkers, *queryTimeout, *metadataWorkers)
+	var d *dht.DHT
+	scheduler := newHashScheduler(*metadataWorkers, func(hash string) error { return d.GetPeers(hash) }, w.Request)
+	initConfig.OnGetPeers = func(infoHash, _ string, _ int) {
+		scheduler.discover(infoHash, "", 0, "get_peers")
 	}
 	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
-		queuePeer(infoHash, ip, port)
+		scheduler.discover(infoHash, ip, port, "announce_peer")
 	}
 	initConfig.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
-		queuePeer(infoHash, peer.IP.String(), peer.Port)
+		scheduler.discover(infoHash, peer.IP.String(), peer.Port, "lookup")
 	}
 
-	// Create DHT instance
-	d := dht.New(initConfig)
+	d = dht.New(initConfig)
+	go scheduler.run(w.Response(), w.Failures(), items)
 
 	// Register DHT stats getter for Prometheus metrics
 	metrics.SetDHTStatsGetter(func() metrics.DHTStats {
@@ -413,6 +417,7 @@ func main() {
 	go func() {
 		defer close(shutdownDone)
 		<-stopSignal
+		close(scheduler.stop)
 		d.Stop()
 		w.Stop()
 		<-responseDone

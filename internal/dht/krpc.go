@@ -151,18 +151,21 @@ func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
 
 // query represents the query data included queried node and query-formed data.
 type query struct {
-	node *node
-	data map[string]interface{}
+	node        *node
+	data        map[string]interface{}
+	lookup      *peerLookup
+	resultNodes []*node
 }
 
 // transaction implements transaction.
 type transaction struct {
 	*query
-	id          string
-	response    chan struct{}
-	mu          sync.Mutex
-	completed   bool
-	remoteError bool
+	id           string
+	response     chan struct{}
+	mu           sync.Mutex
+	completed    bool
+	remoteError  bool
+	verifiedNode *node
 }
 
 // transactionManager represents the manager of transactions.
@@ -301,6 +304,10 @@ func (tm *transactionManager) filterOne(
 // When timeout, it will retry `try - 1` times, which means it will query
 // `try` times totally.
 func (tm *transactionManager) query(q *query, try int) {
+	if q.lookup != nil && !time.Now().Before(q.lookup.deadline) {
+		return
+	}
+	started := time.Now()
 	transID := q.data["t"].(string)
 	trans := tm.newTransaction(transID, q)
 
@@ -317,8 +324,16 @@ func (tm *transactionManager) query(q *query, try int) {
 			}
 		}
 		trans.completed = true
+		verified := trans.verifiedNode
 		trans.mu.Unlock()
 		tm.delete(trans.id)
+		if tm.dht.verifiedNodes != nil {
+			if outcome == "success" && verified != nil {
+				tm.dht.verifiedNodes.recordSuccess(verified, time.Since(started))
+			} else if outcome != "stopped" {
+				tm.dht.verifiedNodes.recordFailure(q.node)
+			}
+		}
 		RecordProtocolEvent("query", outcome)
 	}()
 
@@ -328,11 +343,19 @@ func (tm *transactionManager) query(q *query, try int) {
 			return
 		default:
 		}
+		if q.lookup != nil && !time.Now().Before(q.lookup.deadline) {
+			outcome = "timeout"
+			return
+		}
 		if err := send(tm.dht, q.node.addr, q.data); err != nil {
 			outcome = "send_error"
 			return
 		}
-		timer := time.NewTimer(tm.dht.QueryTimeout)
+		wait := tm.dht.QueryTimeout
+		if q.lookup != nil {
+			wait = min(wait, max(time.Duration(0), time.Until(q.lookup.deadline)))
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-trans.response:
 			outcome = "reply"
@@ -386,6 +409,9 @@ func (tm *transactionManager) run() {
 				tm.Lock()
 				delete(tm.pending, tm.genIndexKey(q.data["q"].(string), q.node.addr.String()))
 				tm.Unlock()
+				if q.lookup != nil {
+					q.lookup.complete(q)
+				}
 			}
 		}()
 	}
@@ -408,19 +434,24 @@ func (tm *transactionManager) run() {
 
 // sendQuery send query-formed data to the chan.
 func (tm *transactionManager) sendQuery(
-	no *node, queryType string, a map[string]interface{}) {
+	no *node, queryType string, a map[string]interface{}) bool {
+	return tm.queueQuery(no, queryType, a, nil)
+}
+
+func (tm *transactionManager) queueQuery(no *node, queryType string, a map[string]interface{}, lookup *peerLookup) bool {
 
 	// If the target is self, then stop.
 	if no.id != nil && no.id.RawString() == tm.dht.node.id.RawString() ||
 		tm.getByIndex(tm.genIndexKey(queryType, no.addr.String())) != nil ||
 		tm.dht.blackList.in(no.addr.IP.String(), no.addr.Port) {
-		return
+		return false
 	}
 
 	data := makeQuery(tm.genTransID(), queryType, a)
 	q := &query{
-		node: no,
-		data: data,
+		node:   no,
+		data:   data,
+		lookup: lookup,
 	}
 
 	key := tm.genIndexKey(queryType, no.addr.String())
@@ -429,18 +460,20 @@ func (tm *transactionManager) sendQuery(
 	select {
 	case <-tm.dht.stop:
 		RecordProtocolEvent("query_queue", "stopped")
-		return
+		return false
 	default:
 	}
 	if _, exists := tm.pending[key]; exists {
-		return
+		return false
 	}
 	tm.pending[key] = struct{}{}
 	select {
 	case tm.queryChan <- q:
+		return true
 	default:
 		delete(tm.pending, key)
 		RecordProtocolEvent("query_queue", "full")
+		return false
 	}
 }
 
@@ -460,8 +493,8 @@ func (tm *transactionManager) findNode(no *node, target string) {
 }
 
 // getPeers sends get_peers query to the chan.
-func (tm *transactionManager) getPeers(no *node, infoHash string) {
-	tm.sendQuery(no, getPeersType, map[string]interface{}{
+func (tm *transactionManager) getPeers(no *node, infoHash string) bool {
+	return tm.sendQuery(no, getPeersType, map[string]interface{}{
 		"id":        tm.dht.id(infoHash),
 		"info_hash": infoHash,
 	})
@@ -833,6 +866,24 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		token := r["token"].(string)
 		infoHash := a["info_hash"].(string)
 
+		if trans.lookup != nil {
+			if value, exists := r["nodes"]; exists {
+				compact, ok := value.(string)
+				if !ok || len(compact)%26 != 0 {
+					return
+				}
+				for offset := 0; offset < len(compact) && len(trans.resultNodes) < peerLookupCandidates; offset += 26 {
+					n, err := newNodeFromCompactInfo(compact[offset:offset+26], dht.Network)
+					if err == nil {
+						if _, _, public := verifiedNodeEndpoint(n.addr.String()); !public {
+							continue
+						}
+						trans.resultNodes = append(trans.resultNodes, n)
+						dht.routingTable.Insert(n)
+					}
+				}
+			}
+		}
 		if _, exists := r["values"]; exists {
 			if err := ParseKey(r, "values", "list"); err != nil {
 				return
@@ -852,7 +903,7 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 					dht.OnGetPeersResponse(infoHash, p)
 				}
 			}
-		} else if findOn(
+		} else if trans.lookup == nil && findOn(
 			dht, r, newBitmapFromString(infoHash), getPeersType) != nil {
 			return
 		}
@@ -861,6 +912,7 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
+	trans.verifiedNode = node
 	trans.completed = true
 	select {
 	case trans.response <- struct{}{}:

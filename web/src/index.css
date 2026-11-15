@@ -114,8 +114,6 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
 .file-list th:last-child, .file-list td:last-child { width: 115px; text-align: right; white-space: nowrap; color: var(--accent); font-variant-numeric: tabular-nums; }
 .site-footer { border-top: 1px solid var(--border); padding: 24px 0; display: flex; justify-content: space-between; gap: 16px; color: var(--subtle); font-size: 10px; line-height: 1.8; }
 .footer-divider { color: var(--muted); margin: 0 8px; }
-.skip-link { position: absolute; z-index: 20; top: -60px; padding: 12px; background: var(--solid); border-radius: 6px; }
-.skip-link:focus { top: 12px; }
 .trending-section { padding: 28px 0 48px; }
 .trending-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 24px 0 30px; }
 .trending-heading h1 { font-size: 36px; margin: 12px 0; }
@@ -292,7 +290,6 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
   .banner-icon { width: 28px; height: 28px; font-size: 18px; }
   .status-heading { padding: 28px 0 20px; align-items: flex-start; }
   .status-heading h1 { font-size: 26px; }
-  h1 .status-title-dot { display: inline; }
   .status-heading p { font-size: 11px; }
   .refresh-button { padding: 8px 10px; font-size: 11px; }
   .status-card { padding: 18px; }

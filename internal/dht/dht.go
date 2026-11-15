@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"log"
 	"math"
 	"net"
 	"sync"
@@ -25,7 +26,8 @@ var udpBufPool = sync.Pool{
 
 var (
 	// ErrNotReady is the error when DHT is not initialized.
-	ErrNotReady = errors.New("dht is not ready")
+	ErrNotReady       = errors.New("dht is not ready")
+	ErrQueryNotQueued = errors.New("no get_peers query was queued")
 	// ErrOnGetPeersResponseNotSet is the error that config
 	// OnGetPeersResponseNotSet is not set when call dht.GetPeers.
 	ErrOnGetPeersResponseNotSet = errors.New("OnGetPeersResponse is not set")
@@ -43,7 +45,8 @@ type InitParam struct {
 	// format is `ip:port`
 	Address string
 	// the prime nodes through which we can join in dht network
-	PrimeNodes []string
+	PrimeNodes    []string
+	NodeCachePath string
 	// the KBucket expired duration
 	KBucketExpiredAfter time.Duration
 	// the node expired duration
@@ -143,8 +146,12 @@ type DHT struct {
 	tokenManager       *tokenManager
 	blackList          *blackList
 	bootstrapMgr       *bootstrapManager
+	verifiedNodes      *verifiedNodeStore
+	lookupMu           sync.Mutex
+	lookups            map[string]*peerLookup
 	reachability       *reachabilityCheck
 	ready              atomic.Bool
+	refreshing         atomic.Bool
 	packets            chan packet
 	workerTokens       chan struct{}
 	stopOnce           sync.Once
@@ -224,6 +231,10 @@ func (dht *DHT) init() {
 	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
 	dht.transactionManager = newTransactionManager(dht.MaxTransactionCursor, dht)
 	dht.bootstrapMgr = newBootstrapManager(dht)
+	dht.verifiedNodes = newVerifiedNodeStore(dht.NodeCachePath)
+	if err := dht.verifiedNodes.load(time.Now()); err != nil {
+		log.Printf("[DHT] Node cache load failed: %v", err)
+	}
 	dht.reachability = newReachabilityCheck()
 
 	dht.background.Go(dht.transactionManager.run)
@@ -323,11 +334,7 @@ func (dht *DHT) GetPeers(infoHash string) error {
 	neighbors := dht.routingTable.GetNeighbors(
 		newBitmapFromString(infoHash), dht.K)
 
-	for _, no := range neighbors {
-		dht.transactionManager.getPeers(no, infoHash)
-	}
-
-	return nil
+	return dht.startPeerLookup(infoHash, neighbors)
 }
 
 // Run starts the dht.
@@ -353,6 +360,11 @@ func (dht *DHT) RunContext(ctx context.Context) {
 	dht.listen()
 	dht.background.Go(func() { dht.reachability.logStartupContext(dht.ctx, dht.conn.LocalAddr().(*net.UDPAddr).Port) })
 	dht.ready.Store(true)
+	dht.background.Go(func() {
+		for _, seed := range dht.verifiedNodes.seeds(time.Now()) {
+			dht.transactionManager.findNode(seed, dht.node.id.RawString())
+		}
+	})
 	dht.background.Go(dht.join)
 
 	var pkt packet
@@ -365,6 +377,12 @@ func (dht *DHT) RunContext(ctx context.Context) {
 		<-dht.listenerDone
 		dht.packetWorkers.Wait()
 		dht.background.Wait()
+		if err := dht.verifiedNodes.save(time.Now()); err != nil {
+			log.Printf("[DHT] Node cache save failed: %v", err)
+		}
+		dht.lookupMu.Lock()
+		clear(dht.lookups)
+		dht.lookupMu.Unlock()
 		close(dht.stopped)
 	}()
 
@@ -380,13 +398,22 @@ func (dht *DHT) RunContext(ctx context.Context) {
 			// Use bootstrap manager to check if re-bootstrap is needed
 			if dht.bootstrapMgr.needsRebootstrap() {
 				dht.background.Go(dht.join)
-			} else if dht.transactionManager.len() == 0 {
-				// Use optimized refresh instead of regular Fresh
-				dht.background.Go(dht.routingTable.OptimizedRefresh)
+			} else if dht.transactionManager.len() < max(1, dht.QueryWorkerLimit/2) &&
+				len(dht.transactionManager.queryChan) < cap(dht.transactionManager.queryChan)/2 &&
+				dht.refreshing.CompareAndSwap(false, true) {
+				dht.background.Go(func() {
+					defer dht.refreshing.Store(false)
+					dht.routingTable.OptimizedRefresh()
+				})
 			}
 		case <-evictTicker.C:
 			// Periodically evict stale nodes (older than 15 minutes)
-			dht.background.Go(func() { dht.routingTable.EvictStaleNodes(15 * time.Minute) })
+			dht.background.Go(func() {
+				dht.routingTable.EvictStaleNodes(15 * time.Minute)
+				if err := dht.verifiedNodes.save(time.Now()); err != nil {
+					log.Printf("[DHT] Node cache save failed: %v", err)
+				}
+			})
 		}
 	}
 }

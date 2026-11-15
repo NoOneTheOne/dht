@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type discardWireConn struct {
@@ -24,6 +26,421 @@ func (discardWireConn) Write(data []byte) (int, error) {
 
 func (discardWireConn) SetWriteDeadline(time.Time) error {
 	return nil
+}
+
+func TestWireWorkerDialFailureFeedback(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wire := NewWire(8, 2, 1)
+	go wire.Run()
+	defer wire.Stop()
+	hash := bytes.Repeat([]byte{'d'}, 20)
+	before := protocolCount("metadata", "io_error")
+	dialBefore := protocolCount("metadata_dial", "failure")
+	if !wire.Request(hash, "127.0.0.1", port) {
+		t.Fatal("request not accepted")
+	}
+	select {
+	case failure := <-wire.Failures():
+		if failure.Reason != "dial_error" || failure.IP != "127.0.0.1" || failure.Port != port || !bytes.Equal(failure.InfoHash, hash) {
+			t.Fatalf("failure = %+v", failure)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not report dial failure")
+	}
+	if protocolCount("metadata", "io_error") != before+1 || protocolCount("metadata_dial", "failure") != dialBefore+1 {
+		t.Fatal("download or dial event counted incorrectly")
+	}
+	if len(wire.Response()) != 0 || wire.queue.Len() != 0 {
+		t.Fatal("failure produced response or leaked reservation")
+	}
+	if wire.blackList.in("127.0.0.1", port) {
+		t.Fatal("dial failure inserted one-hour blacklist entry")
+	}
+	if wire.Request(bytes.Repeat([]byte{'e'}, 20), "127.0.0.1", port) {
+		t.Fatal("dial failure did not cool endpoint")
+	}
+}
+
+func TestWireWorkerCompletion(t *testing.T) {
+	for _, reason := range []string{"success", "rejected", "protocol_error", "hash_mismatch"} {
+		t.Run(reason, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			port := listener.Addr().(*net.TCPAddr).Port
+			metadata := []byte("worker metadata")
+			hash := sha1.Sum(metadata)
+			if reason == "hash_mismatch" {
+				hash[0] ^= 1
+			}
+			peerDone := make(chan error, 1)
+			go func() {
+				peerDone <- func() error {
+					peer, err := listener.Accept()
+					if err != nil {
+						return err
+					}
+					defer peer.Close()
+					if err := peerWireTestHandshake(peer); err != nil {
+						return err
+					}
+					if reason == "protocol_error" {
+						return sendMessage(peer, []byte{EXTENDED})
+					}
+					if err := sendMessage(peer, append([]byte{EXTENDED, 0}, Encode(map[string]interface{}{
+						"m": map[string]interface{}{"ut_metadata": 7}, "metadata_size": len(metadata),
+					})...)); err != nil {
+						return err
+					}
+					if _, err := readMessage(peer, new(bytes.Buffer)); err != nil {
+						return err
+					}
+					messageType := DATA
+					if reason == "rejected" {
+						messageType = REJECT
+					}
+					payload := append([]byte{EXTENDED, 1}, Encode(map[string]interface{}{"msg_type": messageType, "piece": 0})...)
+					return sendMessage(peer, append(payload, metadata...))
+				}()
+			}()
+			wire := NewWire(8, 2, 1)
+			go wire.Run()
+			defer wire.Stop()
+			before := protocolCount("metadata", reason)
+			if !wire.Request(hash[:], "127.0.0.1", port) {
+				t.Fatal("request not accepted")
+			}
+			if reason == "success" {
+				select {
+				case response := <-wire.Response():
+					if !bytes.Equal(response.MetadataInfo, metadata) {
+						t.Fatal("metadata changed")
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("worker did not report success")
+				}
+			} else {
+				select {
+				case failure := <-wire.Failures():
+					if failure.Reason != reason || !bytes.Equal(failure.InfoHash, hash[:]) || failure.Port != port {
+						t.Fatalf("failure = %+v, want %s", failure, reason)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("worker did not report failure")
+				}
+			}
+			if err := <-peerDone; err != nil {
+				t.Fatal(err)
+			}
+			wire.Stop() // Wait for aggregate accounting and feedback closure.
+			if protocolCount("metadata", reason) != before+1 {
+				t.Fatal("aggregate outcome not counted exactly once")
+			}
+			if len(wire.Failures()) != 0 || len(wire.Response()) != 0 {
+				t.Fatal("completion delivered more than once or on the wrong channel")
+			}
+			if reason == "success" {
+				for _, stage := range []string{"dial", "handshake", "extension", "pieces"} {
+					if protocolCount("metadata_"+stage, "success") == 0 {
+						t.Fatalf("missing success stage %s", stage)
+					}
+				}
+			}
+		})
+	}
+}
+
+func metadataEventTotal() int64 {
+	var total int64
+	for _, event := range GetProtocolEvents() {
+		if event.Stage == "metadata" {
+			total += event.Count
+		}
+	}
+	return total
+}
+
+func TestWireFailureBackpressureAndStop(t *testing.T) {
+	wire := NewWire(8, 3, 1)
+	wire.failures = make(chan MetadataFailure, 1)
+	for i := 0; i < 3; i++ {
+		if !wire.Request(bytes.Repeat([]byte{byte(i)}, 20), "127.0.0.1", 1) {
+			t.Fatal("request not accepted")
+		}
+	}
+	wire.blackList.insert("127.0.0.1", 1) // A second blacklist check must report completion.
+	before := protocolCount("metadata_queue", "blacklisted")
+	metadataBefore := metadataEventTotal()
+	go wire.Run()
+	stopped := false
+	defer func() {
+		if !stopped {
+			wire.Stop()
+		}
+	}()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for protocolCount("metadata_queue", "blacklisted") < before+2 {
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("worker did not reach full failure channel")
+		}
+	}
+	if len(wire.failures) != 1 || len(wire.workerTokens) != 1 {
+		t.Fatal("full failure channel did not backpressure worker")
+	}
+	done := make(chan struct{})
+	go func() { wire.Stop(); close(done) }()
+	select {
+	case <-done:
+		stopped = true
+	case <-time.After(time.Second):
+		t.Fatal("stop blocked on unread failures")
+	}
+	for failure := range wire.Failures() {
+		if failure.Reason != "blacklisted" {
+			t.Fatalf("skip reason = %s", failure.Reason)
+		}
+	}
+	if _, ok := <-wire.Response(); ok {
+		t.Fatal("response channel not closed or failure was sent as response")
+	}
+	if wire.queue.Len() != 0 || len(wire.workerTokens) != 0 {
+		t.Fatal("stop leaked worker reservations")
+	}
+	if metadataEventTotal() != metadataBefore {
+		t.Fatal("blacklist skip was counted as an actual download")
+	}
+}
+
+func TestWireFailureBackpressureDeliversAll(t *testing.T) {
+	wire := NewWire(8, 3, 1)
+	wire.failures = make(chan MetadataFailure, 1)
+	for i := 0; i < 3; i++ {
+		if !wire.Request(bytes.Repeat([]byte{byte(i)}, 20), "127.0.0.1", 1) {
+			t.Fatal("request not accepted")
+		}
+	}
+	wire.blackList.insert("127.0.0.1", 1)
+	before := protocolCount("metadata_queue", "blacklisted")
+	go wire.Run()
+	defer wire.Stop()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for protocolCount("metadata_queue", "blacklisted") < before+2 {
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatal("worker did not reach backpressure")
+		}
+	}
+	seen := make(map[byte]bool)
+	for i := 0; i < 3; i++ {
+		select {
+		case failure := <-wire.Failures():
+			if failure.Reason != "blacklisted" || seen[failure.InfoHash[0]] {
+				t.Fatalf("invalid or duplicate completion: %+v", failure)
+			}
+			seen[failure.InfoHash[0]] = true
+		case <-timer.C:
+			t.Fatal("full channel silently lost failure feedback")
+		}
+	}
+}
+
+func TestWireFailureMinimumBufferAndClosure(t *testing.T) {
+	wire := NewWire(8, 0, 1)
+	if cap(wire.Failures()) < 1 {
+		t.Fatal("failure channel has no buffer")
+	}
+	go wire.Run()
+	wire.Stop()
+	if _, ok := <-wire.Failures(); ok {
+		t.Fatal("failure channel not closed")
+	}
+}
+
+func TestMetadataFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		stage  string
+		err    error
+		reason string
+	}{
+		{"dial", context.DeadlineExceeded, "dial_timeout"},
+		{"dial", io.EOF, "dial_error"},
+		{"handshake", context.DeadlineExceeded, "handshake_timeout"},
+		{"extension", context.DeadlineExceeded, "extension_timeout"},
+		{"pieces", context.DeadlineExceeded, "piece_timeout"},
+		{"pieces", errMetadataRejected, "rejected"},
+		{"handshake", errMetadataProtocol, "protocol_error"},
+		{"extension", errWireMessageTooLarge, "protocol_error"},
+		{"pieces", errMetadataHashMismatch, "hash_mismatch"},
+		{"", errMetadataResponseDropped, "response_backpressure"},
+		{"pieces", io.EOF, "io_error"},
+		{"dial", context.Canceled, "stopped"},
+	} {
+		err := &metadataStageError{stage: tc.stage, err: tc.err}
+		if got := metadataFailureReason(err); got != tc.reason {
+			t.Fatalf("%s/%v = %s, want %s", tc.stage, tc.err, got, tc.reason)
+		}
+		if !errors.Is(err, tc.err) {
+			t.Fatal("stage wrapper broke errors.Is")
+		}
+	}
+}
+
+func TestPeerWireStageTimeouts(t *testing.T) {
+	for _, stage := range []string{"handshake", "extension", "pieces"} {
+		t.Run(stage, func(t *testing.T) {
+			client, peer := net.Pipe()
+			defer peer.Close()
+			wire := NewWire(8, 1, 1)
+			done := make(chan error, 1)
+			before := protocolCount("metadata_"+stage, "failure")
+			go func() {
+				done <- wire.fetchMetadataConn(client, Request{InfoHash: make([]byte, 20)}, time.Now().Add(150*time.Millisecond))
+			}()
+			if stage != "handshake" {
+				if err := peerWireTestHandshake(peer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stage == "pieces" {
+				if err := sendMessage(peer, append([]byte{EXTENDED, 0}, Encode(map[string]interface{}{
+					"m": map[string]interface{}{"ut_metadata": 7}, "metadata_size": 1,
+				})...)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := readMessage(peer, new(bytes.Buffer)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := stage + "_timeout"
+			if stage == "pieces" {
+				want = "piece_timeout"
+			}
+			select {
+			case err := <-done:
+				if got := metadataFailureReason(err); got != want {
+					t.Fatalf("failure = %s (%v), want %s", got, err, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("stage did not time out")
+			}
+			if protocolCount("metadata_"+stage, "failure") != before+1 {
+				t.Fatal("stage failure not counted exactly once")
+			}
+		})
+	}
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(metadataStageDuration)
+	metrics, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, family := range metrics {
+		for _, metric := range family.Metric {
+			stage, result := "", ""
+			for _, label := range metric.Label {
+				switch label.GetName() {
+				case "stage":
+					stage = label.GetValue()
+				case "result":
+					result = label.GetValue()
+				}
+			}
+			if result == "failure" && metric.Histogram.GetSampleCount() > 0 && metric.Histogram.GetSampleSum() > 0 {
+				seen[stage] = true
+			}
+		}
+	}
+	for _, stage := range []string{"handshake", "extension", "pieces"} {
+		if !seen[stage] {
+			t.Fatalf("missing real duration histogram for %s", stage)
+		}
+	}
+}
+
+func TestWireFailureCooldownScopesAndExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		reason   string
+		endpoint bool
+		duration time.Duration
+	}{
+		{"dial_error", true, time.Minute}, {"dial_timeout", true, time.Minute},
+		{"rejected", false, time.Minute}, {"protocol_error", false, time.Minute},
+		{"hash_mismatch", true, 5 * time.Minute},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			wire := NewWire(8, 4, 1)
+			r := Request{InfoHash: bytes.Repeat([]byte{'a'}, 20), IP: "127.0.0.1", Port: 1}
+			other := r
+			other.InfoHash = bytes.Repeat([]byte{'b'}, 20)
+			started := time.Now()
+			wire.coolFailure(r, tc.reason)
+			if !wire.inFailureCooldown(r) || wire.inFailureCooldown(other) != tc.endpoint {
+				t.Fatal("incorrect cooldown scope")
+			}
+			wire.queue.Lock()
+			if !wire.inFailureCooldownLocked(r, started.Add(tc.duration-time.Second)) || wire.inFailureCooldownLocked(r, started.Add(tc.duration+time.Second)) {
+				t.Fatal("incorrect cooldown duration or lazy expiration")
+			}
+			wire.queue.Unlock()
+			if len(wire.cooldowns) != 0 || wire.cooldownFIFO.Len() != 0 {
+				t.Fatal("expired cooldown not removed")
+			}
+			if !wire.Request(r.InfoHash, r.IP, r.Port) {
+				t.Fatal("expired cooldown still rejects requests")
+			}
+		})
+	}
+	wire := NewWire(8, 1, 1)
+	r := Request{InfoHash: make([]byte, 20), IP: "127.0.0.1", Port: 1}
+	wire.coolFailure(r, "hash_mismatch")
+	wire.coolFailure(r, "dial_error")
+	wire.queue.Lock()
+	if !wire.inFailureCooldownLocked(r, time.Now().Add(2*time.Minute)) {
+		t.Fatal("short dial cooldown overwrote hash mismatch cooldown")
+	}
+	wire.queue.Unlock()
+	for _, reason := range []string{"stopped", "io_error", "piece_timeout", "response_backpressure"} {
+		other := r
+		other.Port = 2
+		wire.coolFailure(other, reason)
+		if wire.inFailureCooldown(other) {
+			t.Fatalf("unexpected cooldown for %s", reason)
+		}
+	}
+}
+
+func TestWireFailureCooldownBounded(t *testing.T) {
+	wire := NewWire(8, 1, 1)
+	for i := 0; i <= maxMetadataCooldowns; i++ {
+		r := Request{InfoHash: make([]byte, 20), IP: "127.0.0.1", Port: 1}
+		binary.BigEndian.PutUint64(r.InfoHash, uint64(i))
+		wire.coolFailure(r, "rejected")
+	}
+	if len(wire.cooldowns) != maxMetadataCooldowns || wire.cooldownFIFO.Len() != maxMetadataCooldowns {
+		t.Fatal("cooldown cache exceeded bound")
+	}
+	if wire.inFailureCooldown(Request{InfoHash: make([]byte, 20), IP: "127.0.0.1", Port: 1}) {
+		t.Fatal("oldest cooldown was not evicted")
+	}
 }
 
 func TestConnectedPeers(t *testing.T) {

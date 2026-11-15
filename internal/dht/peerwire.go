@@ -2,6 +2,7 @@ package dht
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -36,6 +39,7 @@ const (
 	metadataDownloadTimeout = time.Minute
 	localMetadataID         = 1
 	maxRequestsPerInfoHash  = 3
+	maxMetadataCooldowns    = 65536
 )
 
 var (
@@ -45,6 +49,70 @@ var (
 	errMetadataHashMismatch    = errors.New("metadata hash mismatch")
 	errMetadataResponseDropped = errors.New("metadata response dropped")
 )
+
+// metadataStageError preserves errors.Is/As while carrying a bounded stage name.
+type metadataStageError struct {
+	stage string
+	err   error
+}
+
+func (err *metadataStageError) Error() string { return err.stage + ": " + err.err.Error() }
+func (err *metadataStageError) Unwrap() error { return err.err }
+
+var metadataStageDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "dht_metadata_stage_duration_seconds",
+	Help:    "Actual peer metadata stage duration, excluding queue and response delivery waits.",
+	Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60},
+}, []string{"stage", "result"})
+
+func init() {
+	prometheus.MustRegister(metadataStageDuration)
+}
+
+func recordMetadataStage(stage string, started time.Time, err error) {
+	result := "success"
+	if err != nil {
+		result = "failure"
+	}
+	RecordProtocolEvent("metadata_"+stage, result)
+	metadataStageDuration.WithLabelValues(stage, result).Observe(time.Since(started).Seconds())
+}
+
+func metadataFailureReason(err error) string {
+	var stageErr *metadataStageError
+	stage := ""
+	if errors.As(err, &stageErr) {
+		stage = stageErr.stage
+	}
+	var timeout net.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "stopped"
+	case errors.Is(err, errMetadataResponseDropped):
+		return "response_backpressure"
+	case errors.Is(err, errMetadataRejected):
+		return "rejected"
+	case errors.Is(err, errMetadataProtocol), errors.Is(err, errWireMessageTooLarge):
+		return "protocol_error"
+	case errors.Is(err, errMetadataHashMismatch):
+		return "hash_mismatch"
+	case errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout():
+		switch stage {
+		case "dial":
+			return "dial_timeout"
+		case "handshake":
+			return "handshake_timeout"
+		case "extension":
+			return "extension_timeout"
+		case "pieces":
+			return "piece_timeout"
+		}
+	}
+	if stage == "dial" {
+		return "dial_error"
+	}
+	return "io_error"
+}
 
 // Keepalives must not extend the download deadline.
 type metadataConn struct {
@@ -207,6 +275,18 @@ type Response struct {
 	MetadataInfo []byte
 }
 
+// MetadataFailure reports an accepted request that did not produce a Response.
+// Shutdown may discard feedback; consumers must not retry the "stopped" reason.
+type MetadataFailure struct {
+	Request
+	Reason string
+}
+
+type metadataCooldown struct {
+	key     string
+	expires time.Time
+}
+
 // Wire represents the wire protocol.
 type Wire struct {
 	blackList    *blackList
@@ -214,6 +294,9 @@ type Wire struct {
 	infoHashes   map[string]int // Queued and active requests, guarded by queue's lock.
 	requests     chan Request
 	responses    chan Response
+	failures     chan MetadataFailure
+	cooldowns    map[string]*list.Element // Guarded by queue's lock.
+	cooldownFIFO *list.List               // Bounded insertion order, not expiration order.
 	workerTokens chan struct{}
 	stopOnce     sync.Once
 	stop         chan struct{}
@@ -239,6 +322,9 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 		infoHashes:   make(map[string]int),
 		requests:     make(chan Request, requestQueueSize),
 		responses:    make(chan Response, 1024),
+		failures:     make(chan MetadataFailure, max(1, requestQueueSize)),
+		cooldowns:    make(map[string]*list.Element),
+		cooldownFIFO: list.New(),
 		workerTokens: make(chan struct{}, workerQueueSize),
 		stop:         make(chan struct{}),
 		stopped:      make(chan struct{}),
@@ -277,6 +363,10 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) (accepted bool) 
 		reason = "stopped"
 		return false
 	default:
+	}
+	if wire.inFailureCooldownLocked(Request{InfoHash: infoHash, IP: ip, Port: port}, time.Now()) {
+		reason = "cooldown"
+		return false
 	}
 	if wire.infoHashes[hashKey] >= maxRequestsPerInfoHash {
 		reason = "hash_limit"
@@ -333,6 +423,74 @@ func (wire *Wire) Response() <-chan Response {
 	return wire.responses
 }
 
+// Failures returns bounded, reliable completion feedback until Stop. Callers
+// must drain it alongside Response; a full channel backpressures workers.
+// Run closes it after all workers exit. Shutdown may discard pending feedback.
+func (wire *Wire) Failures() <-chan MetadataFailure {
+	return wire.failures
+}
+
+func (wire *Wire) sendFailure(r Request, reason string) {
+	select {
+	case wire.failures <- MetadataFailure{Request: r, Reason: reason}:
+	case <-wire.stop:
+	}
+}
+
+// Cooldowns use distinct endpoint and hash+endpoint keys. Lookups lazily expire
+// only the requested keys; insertion evicts the oldest entry at capacity in O(1).
+func (wire *Wire) inFailureCooldownLocked(r Request, now time.Time) bool {
+	endpoint := genAddress(r.IP, r.Port)
+	for _, key := range []string{"endpoint:" + endpoint, "hash:" + string(r.InfoHash) + ":" + endpoint} {
+		if item := wire.cooldowns[key]; item != nil {
+			if now.Before(item.Value.(metadataCooldown).expires) {
+				return true
+			}
+			delete(wire.cooldowns, key)
+			wire.cooldownFIFO.Remove(item)
+		}
+	}
+	return false
+}
+
+func (wire *Wire) inFailureCooldown(r Request) bool {
+	wire.queue.Lock()
+	defer wire.queue.Unlock()
+	return wire.inFailureCooldownLocked(r, time.Now())
+}
+
+func (wire *Wire) coolFailure(r Request, reason string) {
+	endpoint := genAddress(r.IP, r.Port)
+	key, duration := "endpoint:"+endpoint, time.Minute
+	switch reason {
+	case "dial_timeout", "dial_error":
+	case "rejected", "protocol_error":
+		key = "hash:" + string(r.InfoHash) + ":" + endpoint
+	case "hash_mismatch":
+		duration = 5 * time.Minute
+	default:
+		return
+	}
+	wire.queue.Lock()
+	defer wire.queue.Unlock()
+	expires := time.Now().Add(duration)
+	if item := wire.cooldowns[key]; item != nil {
+		// A later short dial failure must not shorten a hash-mismatch cooldown.
+		if item.Value.(metadataCooldown).expires.After(expires) {
+			return
+		}
+		item.Value = metadataCooldown{key: key, expires: expires}
+		wire.cooldownFIFO.MoveToBack(item)
+		return
+	}
+	if len(wire.cooldowns) >= maxMetadataCooldowns {
+		oldest := wire.cooldownFIFO.Front()
+		delete(wire.cooldowns, oldest.Value.(metadataCooldown).key)
+		wire.cooldownFIFO.Remove(oldest)
+	}
+	wire.cooldowns[key] = wire.cooldownFIFO.PushBack(metadataCooldown{key: key, expires: expires})
+}
+
 func (wire *Wire) requestPieces(conn net.Conn, utMetadata int, requests <-chan int) error {
 	for piece := range requests {
 		msg := append([]byte{EXTENDED, byte(utMetadata)}, Encode(map[string]interface{}{
@@ -345,26 +503,27 @@ func (wire *Wire) requestPieces(conn net.Conn, utMetadata int, requests <-chan i
 	return nil
 }
 
-// fetchMetadata fetches medata info according to infohash from dht.
-func (wire *Wire) fetchMetadata(r Request) {
-	deadline := time.Now().Add(metadataDownloadTimeout)
+// fetchMetadata records exactly one aggregate outcome for an actual download.
+func (wire *Wire) fetchMetadata(r Request) (result error) {
+	defer func() {
+		if result != nil && wire.ctx.Err() != nil {
+			result = context.Canceled
+		}
+		recordMetadataError(result)
+	}()
+	started := time.Now()
+	deadline := started.Add(metadataDownloadTimeout)
 	dialer := net.Dialer{Timeout: 15 * time.Second, Deadline: deadline}
 	conn, err := dialer.DialContext(wire.ctx, "tcp", genAddress(r.IP, r.Port))
+	recordMetadataStage("dial", started, err)
 	if err != nil {
-		if wire.ctx.Err() != nil {
-			RecordProtocolEvent("metadata", "stopped")
-		} else {
-			wire.blackList.insert(r.IP, r.Port)
-			recordMetadataError(err)
-		}
-		return
+		return &metadataStageError{stage: "dial", err: err}
 	}
 	wire.connMu.Lock()
 	if wire.ctx.Err() != nil {
 		wire.connMu.Unlock()
 		_ = conn.Close()
-		RecordProtocolEvent("metadata", "stopped")
-		return
+		return context.Canceled
 	}
 	wire.connections[conn] = struct{}{}
 	wire.connMu.Unlock()
@@ -375,16 +534,23 @@ func (wire *Wire) fetchMetadata(r Request) {
 		_ = conn.Close()
 	}()
 	conn.(*net.TCPConn).SetLinger(0)
-	err = wire.fetchMetadataConn(conn, r, deadline)
-	if wire.ctx.Err() != nil {
-		RecordProtocolEvent("metadata", "stopped")
-	} else {
-		recordMetadataError(err)
-	}
+	return wire.fetchMetadataConn(conn, r, deadline)
 }
 
 // fetchMetadataConn runs a download with a fixed deadline, including writes.
 func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) (result error) {
+	stage, started := "handshake", time.Now()
+	finishStage := func(err error) {
+		recordMetadataStage(stage, started, err)
+	}
+	defer func() {
+		if stage != "" {
+			finishStage(result)
+			if result != nil {
+				result = &metadataStageError{stage: stage, err: result}
+			}
+		}
+	}()
 	requests := make(chan int, 8)
 	var writerDone chan struct{}
 	var writerErr error
@@ -415,6 +581,8 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 	if err := onHandshake(data.Next(68), r.InfoHash); err != nil {
 		return errMetadataProtocol
 	}
+	finishStage(nil)
+	stage, started = "extension", time.Now()
 	if err := sendExtHandshake(conn); err != nil {
 		return err
 	}
@@ -453,6 +621,8 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 				}
 				continue
 			}
+			finishStage(nil)
+			stage, started = "pieces", time.Now()
 			utMetadata, metadataSize = id, size
 			pieces = make([][]byte, (size+BLOCK-1)/BLOCK)
 			writerDone = make(chan struct{})
@@ -530,6 +700,8 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 		if !bytes.Equal(r.InfoHash, hash[:]) {
 			return errMetadataHashMismatch
 		}
+		finishStage(nil)
+		stage = "" // Response delivery is not peer download time.
 		select {
 		case wire.responses <- Response{Request: r, MetadataInfo: metadataInfo}:
 			return nil
@@ -591,9 +763,12 @@ func (wire *Wire) Run() {
 	drained:
 		clear(wire.queue.data)
 		clear(wire.infoHashes)
+		clear(wire.cooldowns)
+		wire.cooldownFIFO.Init()
 		wire.queue.Unlock()
 		<-maintenanceDone
 		close(wire.responses)
+		close(wire.failures)
 		close(wire.stopped)
 	}()
 	for {
@@ -603,10 +778,6 @@ func (wire *Wire) Run() {
 		case r, ok := <-wire.requests:
 			if !ok {
 				return
-			}
-			if wire.blackList.in(r.IP, r.Port) {
-				wire.releaseRequest(r)
-				continue
 			}
 			select {
 			case wire.workerTokens <- struct{}{}:
@@ -618,11 +789,36 @@ func (wire *Wire) Run() {
 			wire.workers.Add(1)
 			go func(r Request) {
 				defer wire.workers.Done()
+				released := false
+				release := func() {
+					if !released {
+						wire.releaseRequest(r)
+						released = true
+					}
+				}
 				defer func() {
-					wire.releaseRequest(r)
+					release()
 					<-wire.workerTokens
 				}()
-				wire.fetchMetadata(r)
+				if wire.ctx.Err() != nil {
+					return
+				}
+				if wire.blackList.in(r.IP, r.Port) || wire.inFailureCooldown(r) {
+					RecordMetadataRequestDropped()
+					RecordProtocolEvent("metadata_queue", "blacklisted")
+					release()
+					wire.sendFailure(r, "blacklisted")
+					return
+				}
+				if err := wire.fetchMetadata(r); err != nil {
+					reason := metadataFailureReason(err)
+					if reason != "stopped" {
+						wire.coolFailure(r, reason)
+					}
+					// Release before feedback so a consumer may immediately reschedule.
+					release()
+					wire.sendFailure(r, reason)
+				}
 			}(r)
 		}
 	}

@@ -120,7 +120,7 @@ export default function SystemStatus() {
       <div><strong>{title}</strong><p>{error ? `${error}${data ? ' 下方为上次成功获取的数据，可能已过期。' : ''}` : data ? '持续观测采集、存储与网络连接状态。' : '正在连接采集进程与资源数据库。'}</p></div>
       <span className="banner-badge">{state === 'operational' ? 'OPERATIONAL' : state === 'outage' ? 'DISRUPTION' : 'ATTENTION'}</span>
     </div>
-    <div className="status-heading"><div><span className="eyebrow">LIVE SYSTEM OVERVIEW</span><h1 id="status-title">系统运行状态<span className="status-title-dot">.</span></h1><p>分布式网络的每一次连接，都在这里汇成可见的脉搏。</p></div>
+    <div className="status-heading"><div><span className="eyebrow">LIVE SYSTEM OVERVIEW</span><h1 id="status-title">系统运行状态</h1><p>分布式网络的每一次连接，都在这里汇成可见的脉搏。</p></div>
       <button className="page-button refresh-button" disabled={loading} onClick={() => setRefresh(v => v + 1)}><svg className={loading ? 'refresh-spinning' : ''} width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg>{loading ? '更新中' : '刷新状态'}</button>
     </div>
     <div className="status-meta"><span><i className={`status-dot ${error ? 'outage' : loading ? 'degraded' : data?.status ?? 'degraded'}`} />每 15 秒自动更新</span><span>最后更新 {date(data?.updated_at)}</span></div>
