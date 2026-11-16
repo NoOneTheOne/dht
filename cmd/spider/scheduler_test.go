@@ -214,11 +214,12 @@ func TestHashSchedulerAttemptLimitAndCooldown(t *testing.T) {
 
 func TestHashSchedulerRunDrainsOnStop(t *testing.T) {
 	s := newHashScheduler(1, func(string) error { return errors.New("not ready") }, func([]byte, string, int) bool { return false })
-	responses := make(chan dht.Response, 2)
+	responses := make(chan dht.Response, 3)
 	failures := make(chan dht.MetadataFailure, 1)
 	output := make(chan mysql.Data, 4)
-	responses <- dht.Response{Request: dht.Request{InfoHash: []byte(strings.Repeat("h", 20))}, MetadataInfo: []byte(dht.Encode(map[string]interface{}{"name": "resource"}))}
+	responses <- dht.Response{Request: dht.Request{InfoHash: []byte(strings.Repeat("h", 20))}, MetadataInfo: []byte(dht.Encode(map[string]interface{}{"name": "resource", "length": 7}))}
 	responses <- dht.Response{Request: dht.Request{InfoHash: []byte(strings.Repeat("i", 20))}, MetadataInfo: []byte("invalid")}
+	responses <- dht.Response{Request: dht.Request{InfoHash: []byte(strings.Repeat("j", 20))}, MetadataInfo: []byte(dht.Encode(map[string]interface{}{"name": "name-only"}))}
 	close(s.stop)
 	close(responses)
 	close(failures)
@@ -230,10 +231,13 @@ func TestHashSchedulerRunDrainsOnStop(t *testing.T) {
 		t.Fatal("scheduler did not drain metadata responses")
 	}
 	item, ok := <-output
-	if !ok || item.Name != "resource" || len(item.Files) != 0 {
-		t.Fatal("valid name-only metadata lost at stop")
+	if !ok || item.Name != "resource" || len(item.Files) != 1 || item.Length != 7 {
+		t.Fatal("metadata with a valid filelist lost at stop")
 	}
 	if _, ok := <-output; ok {
-		t.Fatal("invalid metadata was emitted")
+		t.Fatal("invalid metadata or metadata without a filelist was emitted")
+	}
+	if s.cached[strings.Repeat("j", 20)].Value.(*cachedHash).item != nil {
+		t.Fatal("metadata without a filelist was cached as a success")
 	}
 }

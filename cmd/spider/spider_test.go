@@ -129,8 +129,11 @@ func TestFilelistOutcomeReasons(t *testing.T) {
 				return 0
 			}
 			before := count()
-			if _, ok := torrentMetadata(tc.info); !ok || count() != before+1 {
-				t.Fatal("named metadata rejected or filelist reason missing")
+			if _, ok := torrentMetadata(tc.info); ok != (tc.reason == "complete") {
+				t.Fatalf("metadata acceptance = %v for filelist reason %s", ok, tc.reason)
+			}
+			if count() != before+1 {
+				t.Fatal("filelist reason missing")
 			}
 		})
 	}
@@ -175,9 +178,9 @@ func TestTorrentFiles(t *testing.T) {
 				t.Fatalf("got %d files, length %d, valid %v", len(files), length, valid)
 			}
 			item, accepted := torrentMetadata(tc.info)
-			name, named := tc.info["name"].(string)
-			if accepted != (named && name != "") {
-				t.Fatalf("metadata acceptance = %v for name %v", accepted, tc.info["name"])
+			name, _ := tc.info["name"].(string)
+			if accepted != tc.valid {
+				t.Fatalf("metadata acceptance = %v, want %v", accepted, tc.valid)
 			}
 			if accepted && (item.Name != name || item.Length != length || !reflect.DeepEqual(item.Files, files)) {
 				t.Fatalf("metadata fields differ: %+v", item)

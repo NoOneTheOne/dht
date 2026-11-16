@@ -123,9 +123,9 @@ func torrentMetadata(info map[string]interface{}) (mysql.Data, bool) {
 			reason = "invalid_length"
 		}
 		dht.RecordProtocolEvent("filelist", reason)
-	} else {
-		dht.RecordProtocolEvent("filelist", "complete")
+		return mysql.Data{}, false
 	}
+	dht.RecordProtocolEvent("filelist", "complete")
 	return mysql.Data{Name: name, Files: files, Length: length}, true
 }
 
