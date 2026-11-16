@@ -35,7 +35,10 @@ const (
 	HANDSHAKE = 0
 
 	// Allow a metadata piece plus message IDs and 1 KiB of headers.
-	maxWireMessageSize      = BLOCK + 2 + 1024
+	maxWireMessageSize = BLOCK + 2 + 1024
+	// A v1 piece hash takes 20 metadata bytes; round the bitfield up to bytes,
+	// and include its message ID. Check this coarse bound before reading an ID.
+	maxBitfieldMessageSize  = 1 + (MaxMetadataSize/20+7)/8
 	metadataDownloadTimeout = time.Minute
 	localMetadataID         = 1
 	maxRequestsPerInfoHash  = 3
@@ -148,7 +151,9 @@ func read(conn net.Conn, size int, data *bytes.Buffer) error {
 	return err
 }
 
-// readMessage gets a message from the tcp connection.
+// readMessage gets a message from the tcp connection. Large bitfields retain
+// only their message ID in data, with a nonzero length so callers ignore them
+// as non-EXTENDED messages rather than treating them as keepalives.
 func readMessage(conn net.Conn, data *bytes.Buffer) (
 	length int, err error) {
 
@@ -157,7 +162,7 @@ func readMessage(conn net.Conn, data *bytes.Buffer) (
 	}
 
 	frameLength := bytes2int(data.Next(4))
-	if frameLength > maxWireMessageSize {
+	if frameLength > maxBitfieldMessageSize {
 		return 0, errWireMessageTooLarge
 	}
 	length = int(frameLength)
@@ -165,6 +170,19 @@ func readMessage(conn net.Conn, data *bytes.Buffer) (
 		return
 	}
 
+	if length > maxWireMessageSize {
+		if err = read(conn, 1, data); err != nil {
+			return
+		}
+		if data.Bytes()[0] != 5 { // Only bitfields may exceed the metadata frame limit.
+			data.Reset()
+			return 0, errWireMessageTooLarge
+		}
+		// Do not buffer unused bitfield bytes or refresh the read deadline while
+		// draining them. metadataConn also caps it at the download deadline.
+		_, err = io.CopyN(io.Discard, conn, int64(length-1))
+		return
+	}
 	if err = read(conn, length, data); err != nil {
 		return
 	}

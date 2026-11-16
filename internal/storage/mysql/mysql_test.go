@@ -2,9 +2,12 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,12 +23,16 @@ import (
 )
 
 // Tests replace initialization, never loading config or contacting MySQL.
-func stubInitialization(t *testing.T, init func() (*gorm.DB, error)) {
+func stubInitialization(t *testing.T, init func(context.Context) (*gorm.DB, error)) {
 	t.Helper()
-	previousDB, previousInit := db, initDB
-	db, initDB = nil, init
+	dbMu.Lock()
+	previousDB, previousInit, previousRound := db, initDB, dbStarting
+	db, initDB, dbStarting = nil, init, nil
+	dbMu.Unlock()
 	t.Cleanup(func() {
-		db, initDB = previousDB, previousInit
+		dbMu.Lock()
+		db, initDB, dbStarting = previousDB, previousInit, previousRound
+		dbMu.Unlock()
 	})
 }
 
@@ -109,7 +116,7 @@ func TestGetDBRetriesFailureAndCachesSuccess(t *testing.T) {
 	failure := errors.New("temporary initialization failure")
 	candidate := &gorm.DB{}
 	calls := 0
-	stubInitialization(t, func() (*gorm.DB, error) {
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) {
 		calls++
 		if calls == 1 {
 			// Even a partial handle must not be published on failure.
@@ -118,14 +125,14 @@ func TestGetDBRetriesFailureAndCachesSuccess(t *testing.T) {
 		return candidate, nil
 	})
 
-	if got, err := GetDB(); got != nil || !errors.Is(err, failure) {
+	if got, err := GetDBContext(context.Background()); got != nil || !errors.Is(err, failure) {
 		t.Fatalf("failed initialization = (%p, %v), want nil and failure", got, err)
 	}
 	if db != nil {
 		t.Fatal("failed initialization was published")
 	}
 	for i := 0; i < 2; i++ {
-		if got, err := GetDB(); got != candidate || err != nil {
+		if got, err := GetDBContext(context.Background()); got != candidate || err != nil {
 			t.Fatalf("successful initialization = (%p, %v), want cached handle", got, err)
 		}
 	}
@@ -138,14 +145,14 @@ func TestGetDBConcurrentRetryInitializesOnce(t *testing.T) {
 	candidate := &gorm.DB{}
 	failure := errors.New("temporary initialization failure")
 	calls := 0
-	stubInitialization(t, func() (*gorm.DB, error) {
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) {
 		calls++ // GetDB must serialize all calls to the initializer.
 		if calls == 1 {
 			return nil, failure
 		}
 		return candidate, nil
 	})
-	if _, err := GetDB(); !errors.Is(err, failure) {
+	if _, err := GetDBContext(context.Background()); !errors.Is(err, failure) {
 		t.Fatalf("first initialization error = %v", err)
 	}
 
@@ -157,7 +164,7 @@ func TestGetDBConcurrentRetryInitializesOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if got, err := GetDB(); got != candidate || err != nil {
+			if got, err := GetDBContext(context.Background()); got != candidate || err != nil {
 				t.Errorf("concurrent GetDB = (%p, %v), want shared handle", got, err)
 			}
 		}()
@@ -169,9 +176,162 @@ func TestGetDBConcurrentRetryInitializesOnce(t *testing.T) {
 	}
 }
 
+// Done is observed only after GetDBContext has selected the in-flight round.
+// This makes concurrent failure tests independent of goroutine scheduling.
+type initializationWaitContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *initializationWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func TestGetDBContextSharesRoundResult(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failure_%t", fail), func(t *testing.T) {
+			candidate := &gorm.DB{}
+			failure := errors.New("initialization failed after opening a handle")
+			started, release := make(chan struct{}), make(chan struct{})
+			calls := 0
+			stubInitialization(t, func(context.Context) (*gorm.DB, error) {
+				calls++
+				if calls == 1 {
+					close(started)
+					<-release
+					if fail {
+						return candidate, failure
+					}
+				}
+				return candidate, nil
+			})
+			var wg sync.WaitGroup
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			defer func() { unblock(); wg.Wait() }()
+			check := func() {
+				defer wg.Done()
+				got, err := GetDBContext(context.Background())
+				if fail {
+					if got != nil || err != failure {
+						t.Errorf("failed round = (%p, %v), want nil and shared failure", got, err)
+					}
+				} else if got != candidate || err != nil {
+					t.Errorf("successful round = (%p, %v), want shared handle", got, err)
+				}
+			}
+			wg.Add(1)
+			go check()
+			<-started
+			for i := 0; i < 32; i++ {
+				ctx := &initializationWaitContext{Context: context.Background(), waiting: make(chan struct{})}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					got, err := GetDBContext(ctx)
+					if fail {
+						if got != nil || err != failure {
+							t.Errorf("waiter = (%p, %v), want nil and shared failure", got, err)
+						}
+					} else if got != candidate || err != nil {
+						t.Errorf("waiter = (%p, %v), want shared handle", got, err)
+					}
+				}()
+				select {
+				case <-ctx.waiting:
+				case <-time.After(2 * time.Second):
+					t.Fatal("waiter blocked acquiring initialization lock")
+				}
+			}
+			unblock()
+			wg.Wait()
+			if calls != 1 {
+				t.Fatalf("initializations = %d, want one for the entire round", calls)
+			}
+			if fail && db != nil {
+				t.Fatal("partial handle was cached")
+			}
+			if got, err := GetDBContext(context.Background()); got != candidate || err != nil {
+				t.Fatalf("next request = (%p, %v), want successful handle", got, err)
+			}
+			wantCalls := 1
+			if fail {
+				wantCalls = 2
+			}
+			if calls != wantCalls {
+				t.Fatalf("initializations = %d, want %d", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestGetDBContextWaitCanCancel(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline_%t", deadline), func(t *testing.T) {
+			started, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			candidate := &gorm.DB{}
+			calls := 0
+			stubInitialization(t, func(context.Context) (*gorm.DB, error) {
+				calls++
+				close(started)
+				<-release
+				return candidate, nil
+			})
+			defer func() { close(release); <-finished }()
+			go func() {
+				defer close(finished)
+				if got, err := GetDBContext(context.Background()); got != candidate || err != nil {
+					t.Errorf("initializer = (%p, %v)", got, err)
+				}
+			}()
+			<-started
+			parent, cancel := context.WithCancel(context.Background())
+			wantErr := context.Canceled
+			if deadline {
+				cancel()
+				parent, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+				wantErr = context.DeadlineExceeded
+			}
+			defer cancel()
+			ctx := &initializationWaitContext{Context: parent, waiting: make(chan struct{})}
+			result := make(chan error, 1)
+			go func() {
+				got, err := GetDBContext(ctx)
+				if got != nil {
+					t.Errorf("canceled waiter received handle %p", got)
+				}
+				result <- err
+			}()
+			select {
+			case <-ctx.waiting:
+			case <-time.After(2 * time.Second):
+				t.Fatal("waiter blocked acquiring initialization lock")
+			}
+			if !deadline {
+				cancel()
+			}
+			select {
+			case err := <-result:
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("wait error = %v, want %v", err, wantErr)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("cancellation did not interrupt initialization wait")
+			}
+			select {
+			case <-finished:
+				t.Fatal("waiter canceled the initializer")
+			default:
+			}
+		})
+	}
+}
+
 func TestOperationsPropagateInitializationError(t *testing.T) {
 	failure := errors.New("backend unavailable")
-	stubInitialization(t, func() (*gorm.DB, error) { return nil, failure })
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return nil, failure })
 	if err := Write(&Data{Name: "test", InfoHash: strings.Repeat("a", 40)}); !errors.Is(err, failure) {
 		t.Fatalf("Write error = %v, want initialization failure", err)
 	}
@@ -180,6 +340,80 @@ func TestOperationsPropagateInitializationError(t *testing.T) {
 	}
 	if result, err := Detail(context.Background(), strings.Repeat("a", 40)); result != nil || !errors.Is(err, failure) {
 		t.Fatalf("Detail = (%v, %v), want nil and initialization failure", result, err)
+	}
+}
+
+func TestOperationInitializationHasTimeout(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{"write", func(context.Context) error {
+			return WriteBatchWithID("test", []Data{{InfoHash: strings.Repeat("a", 40)}})
+		}},
+		{"search", func(ctx context.Context) error { _, _, err := Search(ctx, "test", 1); return err }},
+		{"trending", func(ctx context.Context) error {
+			_, err := Trending(ctx, time.Hour, 10, time.Now())
+			return err
+		}},
+		{"counts", func(ctx context.Context) error { _, err := CountResources(ctx, time.Now()); return err }},
+		{"detail", func(ctx context.Context) error { _, err := Detail(ctx, strings.Repeat("a", 40)); return err }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			failure := errors.New("backend unavailable")
+			calls := 0
+			type contextKey struct{}
+			stubInitialization(t, func(ctx context.Context) (*gorm.DB, error) {
+				calls++
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) > operationTimeout {
+					t.Error("initialization has no operation timeout")
+				}
+				if tt.name != "write" && ctx.Value(contextKey{}) != "request" {
+					t.Error("initialization lost request context")
+				}
+				return &gorm.DB{}, failure
+			})
+			parent := context.WithValue(context.Background(), contextKey{}, "request")
+			if err := tt.run(parent); err != failure || calls != 1 {
+				t.Fatalf("error=%v initializations=%d, want shared failure and no internal initialization retry", err, calls)
+			}
+			if db != nil {
+				t.Fatal("operation cached partial handle")
+			}
+			if tt.name == "write" {
+				return // The write API has no parent context.
+			}
+			ctx, cancel := context.WithCancel(parent)
+			cancel()
+			if err := tt.run(ctx); !errors.Is(err, context.Canceled) || calls != 1 {
+				t.Fatalf("canceled operation: error=%v initializations=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestGetDBContextInitializerCancellationDoesNotCacheHandle(t *testing.T) {
+	candidate := &gorm.DB{}
+	calls := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stubInitialization(t, func(got context.Context) (*gorm.DB, error) {
+		calls++
+		if calls == 1 {
+			if got != ctx {
+				t.Fatal("initializer did not receive caller context")
+			}
+			cancel()
+			return candidate, got.Err()
+		}
+		return candidate, nil
+	})
+	if got, err := GetDBContext(ctx); got != nil || !errors.Is(err, context.Canceled) || db != nil {
+		t.Fatalf("canceled initialization = (%p, %v), cached=%p", got, err, db)
+	}
+	if got, err := GetDBContext(context.Background()); got != candidate || err != nil || calls != 2 {
+		t.Fatalf("retry = (%p, %v), calls=%d", got, err, calls)
 	}
 }
 
@@ -212,7 +446,10 @@ func TestRetryUncommitted(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := retryUncommitted(ctx, func() (bool, error) { return true, failure }); !errors.Is(err, context.Canceled) {
+	if err := retryUncommitted(ctx, func() (bool, error) {
+		t.Fatal("canceled retry invoked write/initialization")
+		return true, failure
+	}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled retry = %v", err)
 	}
 }
@@ -275,7 +512,7 @@ func TestWriteBatchAtomicCountSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	var query string
-	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
 	hash := strings.Repeat("a", 40)
 	rows, err := aggregateWrites([]Data{{InfoHash: hash, Name: "first", Files: []File{{Path: []string{"folder", "file"}, Length: 7}}}, {InfoHash: hash, Name: "second"}})
 	if err != nil {
@@ -355,7 +592,7 @@ func TestTrendingQuery(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
 	items, err := Trending(context.Background(), time.Hour, 10, until)
 	if err != nil || items == nil || calls != 1 {
 		t.Fatalf("items=%v calls=%d err=%v", items, calls, err)
@@ -448,7 +685,7 @@ func TestSearchQueries(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+			stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
 			rows, total, err := Search(parent, "a%_|", tt.page)
 			wantTotal, wantQueries := int64(n), 1
 			if tt.page > 1 || n == SearchPageSize {
@@ -496,12 +733,16 @@ func TestSearchCanceledRequest(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+	initializations := 0
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) {
+		initializations++
+		return candidate, nil
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	rows, total, err := Search(ctx, "test", 1)
-	if !errors.Is(err, context.Canceled) || rows != nil || total != 0 || calls != 1 {
-		t.Fatalf("canceled search = %v, %d, %v; queries=%d", rows, total, err, calls)
+	if !errors.Is(err, context.Canceled) || rows != nil || total != 0 || calls != 0 || initializations != 0 {
+		t.Fatalf("canceled search = %v, %d, %v; queries=%d initializations=%d", rows, total, err, calls, initializations)
 	}
 }
 
@@ -555,7 +796,7 @@ func TestCountResources(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
 	counts, err := CountResources(context.Background(), startedAt)
 	if err != nil || queries != 1 || counts.Total != 12 || counts.WithFiles != 9 || counts.ThisRunTotal != 4 || counts.ThisRunWithFiles != 1 {
 		t.Fatalf("incorrect coverage: %+v, queries=%d, error=%v", counts, queries, err)
@@ -609,7 +850,7 @@ func TestDetailQuery(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			stubInitialization(t, func() (*gorm.DB, error) { return candidate, nil })
+			stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
 			result, err := Detail(parent, hash)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("detail error=%v, want %v", err, tc.wantErr)
@@ -621,6 +862,103 @@ func TestDetailQuery(t *testing.T) {
 				t.Fatal("returned detail on error")
 			}
 		})
+	}
+}
+
+type versionConnector struct {
+	version string
+	query   func(context.Context, string) error
+}
+
+func (c versionConnector) Connect(context.Context) (driver.Conn, error) {
+	return versionConnection{connector: c}, nil
+}
+
+func (c versionConnector) Driver() driver.Driver { return nil } // sql.OpenDB uses Connect.
+
+type versionConnection struct {
+	connector versionConnector
+}
+
+func (c versionConnection) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unexpected Prepare")
+}
+func (c versionConnection) Close() error              { return nil }
+func (c versionConnection) Begin() (driver.Tx, error) { return nil, errors.New("unexpected Begin") }
+func (c versionConnection) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if err := c.connector.query(ctx, query); err != nil {
+		return nil, err
+	}
+	return &versionRows{version: c.connector.version}, nil
+}
+
+type versionRows struct {
+	version string
+	read    bool
+}
+
+func (r *versionRows) Columns() []string { return []string{"VERSION()"} }
+func (r *versionRows) Close() error      { return nil }
+func (r *versionRows) Next(dest []driver.Value) error {
+	if r.read {
+		return io.EOF
+	}
+	r.read = true
+	dest[0] = r.version
+	return nil
+}
+
+func TestInitializationVersionQueryContextAndCompatibility(t *testing.T) {
+	for _, version := range []string{"5.7.44", "8.0.36", "10.5.23-MariaDB", "8.0.11-TiDB-v7.5.0"} {
+		t.Run(version, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			queries := 0
+			pool := sql.OpenDB(versionConnector{version: version, query: func(got context.Context, query string) error {
+				queries++
+				if got != ctx || query != "SELECT VERSION()" {
+					t.Errorf("version query context=%v query=%q", got, query)
+				}
+				return nil
+			}})
+			defer pool.Close()
+			dialector := gormMySQL.New(gormMySQL.Config{Conn: initializationPool{ConnPool: pool, ctx: ctx}})
+			candidate, err := gorm.Open(dialector, &gorm.Config{DisableAutomaticPing: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings := candidate.Dialector.(*gormMySQL.Dialector)
+			if queries != 1 || settings.ServerVersion != version {
+				t.Fatalf("queries=%d version=%q", queries, settings.ServerVersion)
+			}
+			if strings.HasPrefix(version, "5.7.") && (!settings.DontSupportRenameColumn || !settings.DontSupportDropConstraint) {
+				t.Fatal("MySQL 5.7 migration compatibility flags lost")
+			}
+			if strings.Contains(version, "MariaDB") && (!settings.DontSupportRenameIndex || !settings.DontSupportRenameColumn || !settings.DontSupportNullAsDefaultValue) {
+				t.Fatal("MariaDB migration compatibility flags lost")
+			}
+			if strings.Contains(version, "TiDB") && !settings.DontSupportRenameColumnUnique {
+				t.Fatal("TiDB migration compatibility flag lost")
+			}
+		})
+	}
+}
+
+func TestInitializationVersionQueryCanCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := sql.OpenDB(versionConnector{query: func(got context.Context, _ string) error {
+		if got != ctx {
+			return errors.New("version query lost initialization context")
+		}
+		cancel()
+		<-got.Done()
+		return got.Err()
+	}})
+	defer pool.Close()
+	_, err := gorm.Open(gormMySQL.New(gormMySQL.Config{Conn: initializationPool{ConnPool: pool, ctx: ctx}}), &gorm.Config{DisableAutomaticPing: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("version initialization error = %v, want canceled", err)
 	}
 }
 

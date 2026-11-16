@@ -41,7 +41,7 @@ func main() {
 
 	// Set up MySQL stats getter for metrics
 	metrics.SetMySQLStatsGetter(func() (open, inUse, idle int) {
-		return mysqlStats(mysql.GetDB)
+		return mysqlStats(mysql.GetDBContext)
 	})
 
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
@@ -70,7 +70,7 @@ func main() {
 		}
 
 		// Check MySQL connection
-		checkMySQLHealth(c.Request.Context(), health, mysql.GetDB)
+		checkMySQLHealth(c.Request.Context(), health, mysql.GetDBContext)
 
 		statusCode := http.StatusOK
 		if health["status"] == "unhealthy" {
@@ -256,8 +256,10 @@ func accessLog() gin.HandlerFunc {
 	}
 }
 
-func mysqlStats(getDB func() (*gorm.DB, error)) (open, inUse, idle int) {
-	db, err := getDB()
+func mysqlStats(getDB func(context.Context) (*gorm.DB, error)) (open, inUse, idle int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	db, err := getDB(ctx)
 	if err != nil {
 		return 0, 0, 0
 	}
@@ -269,11 +271,13 @@ func mysqlStats(getDB func() (*gorm.DB, error)) (open, inUse, idle int) {
 	return stats.OpenConnections, stats.InUse, stats.Idle
 }
 
-func checkMySQLHealth(parent context.Context, health gin.H, getDB func() (*gorm.DB, error)) {
+func checkMySQLHealth(parent context.Context, health gin.H, getDB func(context.Context) (*gorm.DB, error)) {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
 	status := health["status"]
 	health["status"] = "unhealthy"
 	health["mysql"] = "unavailable"
-	db, err := getDB()
+	db, err := getDB(ctx)
 	if err != nil {
 		return
 	}
@@ -281,8 +285,6 @@ func checkMySQLHealth(parent context.Context, health gin.H, getDB func() (*gorm.
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-	defer cancel()
 	if err := pool.PingContext(ctx); err != nil {
 		return
 	}

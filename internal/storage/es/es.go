@@ -66,12 +66,13 @@ func write(c *elasticsearch.Client, i, t string, data []byte) (string, error) {
 		"scripted_upsert": true,
 		"script": map[string]interface{}{
 			"lang": "painless",
-			"source": "if (!ctx._source.containsKey('count') || ctx._source.count == null) { " +
+			"source": "if (ctx.op == 'create' && (!params.metadata.containsKey('files') || params.metadata.files == null || params.metadata.files.isEmpty())) { ctx.op = 'noop'; } else { " +
+				"if (!ctx._source.containsKey('count') || ctx._source.count == null) { " +
 				"ctx._source.count = 0; } ctx._source.count += 1; " +
 				"if ((!ctx._source.containsKey('files') || ctx._source.files == null || ctx._source.files.isEmpty()) && " +
 				"params.metadata.containsKey('files') && params.metadata.files != null && !params.metadata.files.isEmpty()) { " +
 				"ctx._source.files = params.metadata.files; " +
-				"ctx._source.length = params.metadata.containsKey('length') ? params.metadata.length : 0; }",
+				"ctx._source.length = params.metadata.containsKey('length') ? params.metadata.length : 0; } }",
 			"params": map[string]interface{}{"metadata": doc},
 		},
 		"upsert": doc,

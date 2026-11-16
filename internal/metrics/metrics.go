@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"net/http"
 	"runtime"
 	"strconv"
 	"sync"
@@ -456,10 +457,17 @@ func Middleware() gin.HandlerFunc {
 			path = "unknown"
 		}
 
+		method := c.Request.Method
+		switch method {
+		case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace:
+		default:
+			method = "OTHER"
+		}
+
 		// Record request size
 		reqSize := float64(c.Request.ContentLength)
 		if reqSize > 0 {
-			httpRequestSize.WithLabelValues(c.Request.Method, path).Observe(reqSize)
+			httpRequestSize.WithLabelValues(method, path).Observe(reqSize)
 		}
 
 		c.Next()
@@ -467,9 +475,9 @@ func Middleware() gin.HandlerFunc {
 		duration := time.Since(start).Seconds()
 		status := strconv.Itoa(c.Writer.Status())
 
-		httpRequestsTotal.WithLabelValues(c.Request.Method, path, status).Inc()
-		httpRequestDuration.WithLabelValues(c.Request.Method, path).Observe(duration)
-		httpResponseSize.WithLabelValues(c.Request.Method, path).Observe(float64(c.Writer.Size()))
+		httpRequestsTotal.WithLabelValues(method, path, status).Inc()
+		httpRequestDuration.WithLabelValues(method, path).Observe(duration)
+		httpResponseSize.WithLabelValues(method, path).Observe(float64(c.Writer.Size()))
 	}
 }
 

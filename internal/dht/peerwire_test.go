@@ -935,16 +935,24 @@ func TestPeerWireRequestCanonicalizesIP(t *testing.T) {
 }
 
 func TestPeerWireRejectsOversizedFrameBeforePayload(t *testing.T) {
-	for _, size := range []uint32{maxWireMessageSize + 1, ^uint32(0)} {
-		t.Run(fmt.Sprint(size), func(t *testing.T) {
+	for _, tc := range []struct {
+		size uint32
+		id   []byte
+	}{
+		{maxBitfieldMessageSize + 1, nil},
+		{^uint32(0), nil},
+		{maxWireMessageSize + 1, []byte{EXTENDED}},
+		{maxWireMessageSize + 1, []byte{7}},
+	} {
+		t.Run(fmt.Sprintf("size=%d/id=%v", tc.size, tc.id), func(t *testing.T) {
 			client, peer := net.Pipe()
 			defer client.Close()
 			defer peer.Close()
 			written := make(chan error, 1)
 			go func() {
 				var prefix [4]byte
-				binary.BigEndian.PutUint32(prefix[:], size)
-				_, err := peer.Write(prefix[:]) // Deliberately never send a body.
+				binary.BigEndian.PutUint32(prefix[:], tc.size)
+				_, err := peer.Write(append(prefix[:], tc.id...)) // Never send a payload.
 				written <- err
 			}()
 			buffer := new(bytes.Buffer)
@@ -976,6 +984,7 @@ func TestPeerWireAcceptsMaximumFrame(t *testing.T) {
 	defer client.Close()
 	defer peer.Close()
 	payload := bytes.Repeat([]byte{'x'}, maxWireMessageSize)
+	payload[0] = EXTENDED
 	written := make(chan error, 1)
 	go func() { written <- sendMessage(peer, payload) }()
 	buffer := new(bytes.Buffer)
@@ -985,6 +994,74 @@ func TestPeerWireAcceptsMaximumFrame(t *testing.T) {
 	}
 	if err := <-written; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPeerWireDiscardsLargeBitfield(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	payload := bytes.Repeat([]byte{0xff}, maxBitfieldMessageSize)
+	payload[0] = 5
+	next := []byte{EXTENDED, HANDSHAKE, 'd', 'e'}
+	written := make(chan error, 1)
+	go func() {
+		if err := sendMessage(peer, payload); err != nil {
+			written <- err
+			return
+		}
+		written <- sendMessage(peer, next)
+	}()
+	buffer := new(bytes.Buffer)
+	length, err := readMessage(client, buffer)
+	if err != nil || length != len(payload) || !bytes.Equal(buffer.Bytes(), []byte{5}) {
+		t.Fatalf("discarded bitfield: length=%d data=%v err=%v", length, buffer.Bytes(), err)
+	}
+	if buffer.Cap() > 1024 {
+		t.Fatalf("bitfield grew buffer to %d bytes", buffer.Cap())
+	}
+	buffer.Reset() // Same contract as the metadata reader's non-EXTENDED path.
+	length, err = readMessage(client, buffer)
+	if err != nil || length != len(next) || !bytes.Equal(buffer.Bytes(), next) {
+		t.Fatalf("frame after bitfield: length=%d data=%v err=%v", length, buffer.Bytes(), err)
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPeerWireBitfieldDiscardHonorsDownloadDeadline(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	deadline := time.Now().Add(150 * time.Millisecond)
+	conn := &metadataConn{Conn: client, deadline: deadline}
+	result := make(chan error, 1)
+	go func() {
+		_, err := readMessage(conn, new(bytes.Buffer))
+		result <- err
+	}()
+	var frame [6]byte
+	binary.BigEndian.PutUint32(frame[:4], maxBitfieldMessageSize)
+	frame[4] = 5
+	frame[5] = 0xff // Stall partway through the discarded payload.
+	if err := peer.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Write(frame[:]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("discard error = %v, want timeout", err)
+		}
+		if time.Now().Before(deadline) {
+			t.Fatal("discard stopped before download deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bitfield discard exceeded download deadline")
 	}
 }
 
@@ -1052,7 +1129,7 @@ func TestPeerWireKeepalivesDoNotExtendDownloadDeadline(t *testing.T) {
 	}
 }
 
-func TestPeerWireMetadataFlowAndHash(t *testing.T) {
+func TestPeerWireMetadataFlowWithLargeBitfieldAndHash(t *testing.T) {
 	metadata := []byte(Encode(map[string]interface{}{
 		"name":    "local-test",
 		"padding": string(bytes.Repeat([]byte{'x'}, BLOCK)),
@@ -1068,12 +1145,16 @@ func TestPeerWireMetadataFlowAndHash(t *testing.T) {
 				hash[0] ^= 1
 			}
 			request := Request{InfoHash: hash[:], IP: "127.0.0.1", Port: 1234}
-			done := make(chan struct{})
+			done := make(chan error, 1)
 			go func() {
-				wire.fetchMetadataConn(client, request, time.Now().Add(2*time.Second))
-				close(done)
+				done <- wire.fetchMetadataConn(client, request, time.Now().Add(2*time.Second))
 			}()
 			if err := peerWireTestHandshake(peer); err != nil {
+				t.Fatal(err)
+			}
+			bitfield := bytes.Repeat([]byte{0xff}, 32*1024+1)
+			bitfield[0] = 5
+			if err := sendMessage(peer, bitfield); err != nil {
 				t.Fatal(err)
 			}
 			extHandshake := append([]byte{EXTENDED, HANDSHAKE}, Encode(map[string]interface{}{
@@ -1095,6 +1176,9 @@ func TestPeerWireMetadataFlowAndHash(t *testing.T) {
 				if !bytes.Equal(buffer.Bytes(), want) {
 					t.Fatalf("unexpected piece request: %q", buffer.Bytes())
 				}
+			}
+			if err := sendMessage(peer, bitfield); err != nil {
+				t.Fatal(err)
 			}
 			for _, extensionID := range []byte{2, 7} {
 				if err := sendMessage(peer, []byte{EXTENDED, extensionID, 'x'}); err != nil {
@@ -1121,7 +1205,13 @@ func TestPeerWireMetadataFlowAndHash(t *testing.T) {
 				}
 			}
 			select {
-			case <-done:
+			case err := <-done:
+				if validHash && err != nil {
+					t.Fatalf("metadata download failed: %v", err)
+				}
+				if !validHash && !errors.Is(err, errMetadataHashMismatch) {
+					t.Fatalf("metadata download error = %v, want hash mismatch", err)
+				}
 			case <-time.After(time.Second):
 				t.Fatal("metadata flow did not finish")
 			}

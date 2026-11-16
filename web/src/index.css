@@ -145,7 +145,8 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
 .status-banner.operational { color: var(--green); background: var(--green-bg); }
 .status-banner.degraded { color: var(--yellow); background: var(--yellow-bg); }
 .status-banner.outage { color: var(--red); background: var(--red-bg); }
-.banner-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1.5px solid currentColor; border-radius: 50%; font-size: 22px; flex-shrink: 0; }
+.banner-icon { display: block; width: 34px; height: 34px; flex-shrink: 0; }
+.banner-icon-mark { stroke: var(--solid); }
 .status-banner strong { font-size: 17px; font-weight: 650; }
 .status-banner p { font-size: 12px; line-height: 1.8; margin: 5px 0 0; }
 .banner-badge { margin-left: auto; font-size: 10px; letter-spacing: .12em; white-space: nowrap; }
@@ -188,21 +189,8 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
 .rate-track > span { display: block; background: var(--accent); opacity: .65; height: 100%; border-radius: inherit; transition: width .3s; }
 .rate-counts { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 10px; margin: 16px 0 12px; }
 .rate-counts b { color: var(--text); font-weight: 500; margin-left: 5px; }
-.coverage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.coverage-description { color: var(--muted); font-size: 11px; line-height: 1.8; margin: -2px 0 16px; }
-.coverage-card > .metric-note { min-height: 36px; }
-.coverage-track { display: flex; height: 7px; margin-top: 18px; }
-.coverage-track > span { flex-shrink: 0; border-radius: 0; }
-.coverage-with, .coverage-track > .coverage-with { background: var(--accent); opacity: .75; }
-.coverage-without, .coverage-track > .coverage-without { background: var(--yellow); opacity: .75; }
-.coverage-counts { display: grid; gap: 12px; margin: 18px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
-.coverage-counts > div, .coverage-counts dt, .coverage-counts dd { display: flex; align-items: center; gap: 8px; }
-.coverage-counts > div { justify-content: space-between; flex-wrap: wrap; }
-.coverage-counts dt { color: var(--muted); }
-.coverage-key { width: 7px; height: 7px; border-radius: 2px; flex-shrink: 0; }
-.coverage-counts dd { margin: 0 0 0 auto; justify-content: flex-end; flex-wrap: wrap; overflow-wrap: anywhere; }
-.coverage-counts b { font-weight: 550; }
-.coverage-counts dd > span { min-width: 58px; text-align: right; color: var(--muted); font-size: 11px; }
+.ingestion-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ingestion-description { color: var(--muted); font-size: 11px; line-height: 1.8; margin: -2px 0 16px; }
 .worker-row { margin: 19px 0; }
 .worker-row > div:first-child { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; margin-bottom: 9px; }
 .worker-row b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
@@ -287,7 +275,7 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
   .status-banner { padding: 18px; gap: 12px; align-items: flex-start; }
   .status-banner strong { font-size: 15px; }
   .banner-badge { display: none; }
-  .banner-icon { width: 28px; height: 28px; font-size: 18px; }
+  .banner-icon { width: 28px; height: 28px; }
   .status-heading { padding: 28px 0 20px; align-items: flex-start; }
   .status-heading h1 { font-size: 26px; }
   .status-heading p { font-size: 11px; }
@@ -298,9 +286,8 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
   .metric-value { font-size: 28px; margin-top: 18px; }
   .uptime-value { font-size: 18px; }
   .start-value { font-size: 16px; line-height: 1.6; }
-  .connections-grid, .infrastructure-grid, .coverage-grid { grid-template-columns: 1fr; }
-  .coverage-grid { gap: 12px; }
-  .coverage-card > .metric-note { min-height: 0; }
+  .connections-grid, .infrastructure-grid, .ingestion-grid { grid-template-columns: 1fr; }
+  .ingestion-grid { gap: 12px; }
   .peers-card { column-gap: 24px; }
   .peer-stat + .peer-stat { padding-left: 24px; }
   .status-group-heading { margin-top: 26px; }

@@ -766,6 +766,10 @@ func findOn(dht *DHT, r map[string]interface{}, target *bitmap,
 		if err != nil {
 			return err
 		}
+		// Third-party recommendations must not route queries to non-public endpoints.
+		if _, _, public := verifiedNodeEndpoint(no.addr.String()); !public {
+			continue
+		}
 
 		if no.id.RawString() == target.RawString() {
 			found = true

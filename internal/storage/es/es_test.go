@@ -83,12 +83,13 @@ func checkUpdate(t *testing.T, r *http.Request) updatePayload {
 	if !p.ScriptedUpsert || p.Doc != nil || p.Script.Lang != "painless" {
 		t.Fatalf("not a script-only scripted upsert: %+v", p)
 	}
-	wantScript := "if (!ctx._source.containsKey('count') || ctx._source.count == null) { " +
+	wantScript := "if (ctx.op == 'create' && (!params.metadata.containsKey('files') || params.metadata.files == null || params.metadata.files.isEmpty())) { ctx.op = 'noop'; } else { " +
+		"if (!ctx._source.containsKey('count') || ctx._source.count == null) { " +
 		"ctx._source.count = 0; } ctx._source.count += 1; " +
 		"if ((!ctx._source.containsKey('files') || ctx._source.files == null || ctx._source.files.isEmpty()) && " +
 		"params.metadata.containsKey('files') && params.metadata.files != null && !params.metadata.files.isEmpty()) { " +
 		"ctx._source.files = params.metadata.files; " +
-		"ctx._source.length = params.metadata.containsKey('length') ? params.metadata.length : 0; }"
+		"ctx._source.length = params.metadata.containsKey('length') ? params.metadata.length : 0; } }"
 	if p.Script.Source != wantScript {
 		t.Fatalf("script = %q, want %q", p.Script.Source, wantScript)
 	}
@@ -105,7 +106,16 @@ func checkUpdate(t *testing.T, r *http.Request) updatePayload {
 // Executing Painless and real version-conflict handling requires a real ES cluster.
 func applyUpdate(t *testing.T, existing map[string]json.RawMessage, p updatePayload) map[string]json.RawMessage {
 	t.Helper()
+	var incomingFiles []json.RawMessage
+	if raw := p.Script.Params.Metadata["files"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &incomingFiles); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if existing == nil {
+		if len(incomingFiles) == 0 {
+			return nil
+		}
 		existing = p.Upsert
 	}
 	count := 0
@@ -115,14 +125,9 @@ func applyUpdate(t *testing.T, existing map[string]json.RawMessage, p updatePayl
 		}
 	}
 	existing["count"] = json.RawMessage(fmt.Sprint(count + 1))
-	var currentFiles, incomingFiles []json.RawMessage
+	var currentFiles []json.RawMessage
 	if raw := existing["files"]; len(raw) > 0 {
 		if err := json.Unmarshal(raw, &currentFiles); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if raw := p.Script.Params.Metadata["files"]; len(raw) > 0 {
-		if err := json.Unmarshal(raw, &incomingFiles); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -173,6 +178,61 @@ func TestWriteSameInfohashPreservesFirstMetadata(t *testing.T) {
 	}
 }
 
+func TestWriteSummaryAfterFailedCreateDoesNotCreateAndFullMetadataRecovers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files string
+	}{
+		{name: "missing"},
+		{name: "null", files: `,"files":null`},
+		{name: "empty", files: `,"files":[]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stored map[string]json.RawMessage
+			calls := 0
+			c := testClient(t, func(r *http.Request) (*http.Response, error) {
+				calls++
+				p := checkUpdate(t, r)
+				if calls == 1 {
+					// Fail before applying the initial full metadata write.
+					return testResponse(http.StatusServiceUnavailable, io.NopCloser(strings.NewReader(`{"error":"unavailable"}`))), nil
+				}
+				stored = applyUpdate(t, stored, p)
+				if stored == nil {
+					if string(p.Upsert["count"]) != "0" {
+						t.Fatalf("noop changed count: %s", p.Upsert["count"])
+					}
+					return testResponse(http.StatusOK, io.NopCloser(strings.NewReader(`{"result":"noop"}`))), nil
+				}
+				return testResponse(http.StatusCreated, io.NopCloser(strings.NewReader(`{"result":"created"}`))), nil
+			})
+			files := `[{"path":["file"],"length":7}]`
+			full := `{"infohash":"` + testInfohash + `","name":"full","timestamp":123,"length":7,"files":` + files + `}`
+			if _, err := write(c, "metadata", "torrent", []byte(full)); err == nil {
+				t.Fatal("initial full metadata write unexpectedly succeeded")
+			}
+			if calls != 1 || stored != nil {
+				t.Fatalf("failed write: calls = %d, stored = %s", calls, stored)
+			}
+			summary := `{"infohash":"` + testInfohash + `","name":"summary","timestamp":456,"count":99` + tc.files + `}`
+			if result, err := write(c, "metadata", "torrent", []byte(summary)); err != nil || result != `[200 OK] {"result":"noop"}` {
+				t.Fatalf("summary write = %q, %v", result, err)
+			}
+			if calls != 2 || stored != nil {
+				t.Fatalf("summary created a document: calls = %d, stored = %s", calls, stored)
+			}
+			// A later, independently supplied full payload can create the document.
+			if _, err := write(c, "metadata", "torrent", []byte(full)); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 3 || string(stored["count"]) != "1" || string(stored["files"]) != files ||
+				string(stored["length"]) != "7" || string(stored["name"]) != `"full"` || string(stored["timestamp"]) != "123" {
+				t.Fatalf("full metadata did not recover creation: calls = %d, stored = %s", calls, stored)
+			}
+		})
+	}
+}
+
 func TestWriteEnrichesMissingFiles(t *testing.T) {
 	for _, initialFiles := range []string{"", `,"files":null`, `,"files":[]`} {
 		t.Run(initialFiles, func(t *testing.T) {
@@ -181,8 +241,9 @@ func TestWriteEnrichesMissingFiles(t *testing.T) {
 				stored = applyUpdate(t, stored, checkUpdate(t, r))
 				return testResponse(http.StatusOK, io.NopCloser(strings.NewReader(`{}`))), nil
 			})
-			first := `{"infohash":"` + testInfohash + `","name":"original","timestamp":123,"length":0` + initialFiles + `}`
-			if _, err := write(c, "metadata", "torrent", []byte(first)); err != nil {
+			// Seed a legacy document; current writes cannot create without files.
+			first := `{"infohash":"` + testInfohash + `","name":"original","timestamp":123,"count":1,"length":0` + initialFiles + `}`
+			if err := json.Unmarshal([]byte(first), &stored); err != nil {
 				t.Fatal(err)
 			}
 			files := `[{"path":["file"],"length":7}]`

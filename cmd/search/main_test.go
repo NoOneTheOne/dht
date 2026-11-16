@@ -257,7 +257,7 @@ func TestHTTPRequestLogCorrelation(t *testing.T) {
 }
 
 func TestMySQLInitializationFailure(t *testing.T) {
-	getDB := func() (*gorm.DB, error) {
+	getDB := func(context.Context) (*gorm.DB, error) {
 		return nil, errors.New("synthetic private backend details")
 	}
 	health := gin.H{"status": "ok"}
@@ -274,7 +274,7 @@ func TestMySQLInitializationFailure(t *testing.T) {
 }
 
 func TestMySQLPoolAccessFailure(t *testing.T) {
-	getDB := func() (*gorm.DB, error) {
+	getDB := func(context.Context) (*gorm.DB, error) {
 		return &gorm.DB{Config: &gorm.Config{}}, nil
 	}
 	health := gin.H{"status": "ok"}
@@ -301,7 +301,7 @@ func TestMySQLHealthPing(t *testing.T) {
 			conn := &healthConn{pingErr: tc.pingErr}
 			pool := sql.OpenDB(healthConnector{conn})
 			t.Cleanup(func() { _ = pool.Close() })
-			getDB := func() (*gorm.DB, error) {
+			getDB := func(context.Context) (*gorm.DB, error) {
 				return &gorm.DB{Config: &gorm.Config{ConnPool: pool}}, nil
 			}
 			health := gin.H{"status": "degraded"}
@@ -334,6 +334,23 @@ func TestMySQLHealthPing(t *testing.T) {
 	}
 }
 
+func TestMySQLChecksBoundInitialization(t *testing.T) {
+	calls := 0
+	getDB := func(ctx context.Context) (*gorm.DB, error) {
+		calls++
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 2*time.Second {
+			t.Fatal("database initialization must share the check deadline")
+		}
+		return nil, errors.New("unavailable")
+	}
+	checkMySQLHealth(context.Background(), gin.H{"status": "ok"}, getDB)
+	mysqlStats(getDB)
+	if calls != 2 {
+		t.Fatalf("got %d initialization checks, want 2", calls)
+	}
+}
+
 func TestMySQLHealthHonorsRequestCancellation(t *testing.T) {
 	conn := &healthConn{}
 	pool := sql.OpenDB(healthConnector{conn})
@@ -341,7 +358,7 @@ func TestMySQLHealthHonorsRequestCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	health := gin.H{"status": "ok"}
-	checkMySQLHealth(ctx, health, func() (*gorm.DB, error) {
+	checkMySQLHealth(ctx, health, func(context.Context) (*gorm.DB, error) {
 		return &gorm.DB{Config: &gorm.Config{ConnPool: pool}}, nil
 	})
 	if health["status"] != "unhealthy" || health["mysql"] != "unavailable" {

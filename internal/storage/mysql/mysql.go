@@ -60,10 +60,18 @@ const (
 )
 
 var (
-	db     *gorm.DB
-	dbMu   sync.RWMutex
-	initDB = openDB
+	db         *gorm.DB
+	dbMu       sync.Mutex
+	dbStarting *dbInitialization
+	initDB     = openDB
 )
+
+// Each waiter retains its round's result, even if a later request starts a retry.
+type dbInitialization struct {
+	done chan struct{}
+	db   *gorm.DB
+	err  error
+}
 
 var getCfg = config.GetConfig
 
@@ -83,28 +91,66 @@ func mysqlDSN(c *config.Config) string {
 	return dsn.FormatDSN()
 }
 
-func GetDB() (*gorm.DB, error) {
-	dbMu.RLock()
-	cached := db
-	dbMu.RUnlock()
-	if cached != nil {
-		return cached, nil
-	}
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	if db != nil {
-		return db, nil
-	}
-
-	candidate, err := initDB()
-	if err != nil {
+// Waiting callers can cancel independently of the caller performing initialization.
+func GetDBContext(ctx context.Context) (*gorm.DB, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db = candidate
-	return db, nil
+	dbMu.Lock()
+	if err := ctx.Err(); err != nil {
+		dbMu.Unlock()
+		return nil, err
+	}
+	if db != nil {
+		cached := db
+		dbMu.Unlock()
+		return cached, nil
+	}
+	if round := dbStarting; round != nil {
+		dbMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-round.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return round.db, round.err
+		}
+	}
+	round := &dbInitialization{done: make(chan struct{})}
+	dbStarting = round
+	dbMu.Unlock()
+
+	candidate, err := initDB(ctx)
+	dbMu.Lock()
+	if err == nil {
+		db = candidate
+		round.db = candidate
+	}
+	round.err = err
+	dbStarting = nil
+	close(round.done)
+	dbMu.Unlock()
+	return round.db, round.err
 }
 
-func openDB() (*gorm.DB, error) {
+// Bound the dialector's background-context version query without retaining the initialization context.
+type initializationPool struct {
+	gorm.ConnPool
+	ctx context.Context
+}
+
+func (p initializationPool) QueryRowContext(_ context.Context, query string, args ...interface{}) *sql.Row {
+	return p.ConnPool.QueryRowContext(p.ctx, query, args...)
+}
+
+func openDB(parent context.Context) (*gorm.DB, error) {
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pool, err := sql.Open("mysql", mysqlDSN(getCfg()))
 	if err != nil {
 		return nil, fmt.Errorf("open MySQL pool: %w", err)
@@ -119,14 +165,23 @@ func openDB() (*gorm.DB, error) {
 	pool.SetMaxOpenConns(100)
 	pool.SetConnMaxLifetime(time.Hour)
 
-	candidate, err := gorm.Open(mysql.New(mysql.Config{Conn: pool}), &gorm.Config{Logger: newGORMLogger()})
+	if err := pool.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping MySQL: %w", err)
+	}
+	dialector := mysql.New(mysql.Config{Conn: initializationPool{ConnPool: pool, ctx: ctx}})
+	candidate, err := gorm.Open(dialector, &gorm.Config{Logger: newGORMLogger(), DisableAutomaticPing: true})
 	if err != nil {
 		return nil, fmt.Errorf("connect MySQL: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
-	defer cancel()
+	// All subsequent queries use their own context, including migrations below.
+	dialector.(*mysql.Dialector).Conn = pool
+	candidate.ConnPool = pool
+	candidate.Statement.ConnPool = pool
 	if err := candidate.WithContext(ctx).AutoMigrate(&Data{}, &Observation{}); err != nil {
 		return nil, fmt.Errorf("migrate MySQL: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	initialized = true
 	return candidate, nil
@@ -179,6 +234,9 @@ func aggregateWrites(items []Data) ([]Data, error) {
 
 func retryUncommitted(ctx context.Context, write func() (bool, error)) error {
 	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		retryable, err := write()
 		if err == nil || !retryable || attempt == 2 {
 			return err
@@ -231,12 +289,12 @@ func WriteBatchWithID(batchID string, items []Data) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
 	defer cancel()
+	db, err := GetDBContext(ctx)
+	if err != nil {
+		return err
+	}
 	return retryUncommitted(ctx, func() (bool, error) {
-		db, err := GetDB()
-		if err != nil {
-			return true, err
-		}
-		err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			observations := make([]Observation, len(rows))
 			for i, row := range rows {
 				observations[i] = Observation{BatchID: batchID, InfoHash: row.InfoHash, Name: row.Name, Time: row.Time, Length: row.Length, Count: row.Count, Files: row.Files}
@@ -273,12 +331,12 @@ func Search(parent context.Context, name string, page int) ([]Data, int64, error
 	}
 	results := make([]Data, 0, SearchPageSize)
 
-	db, err := GetDB()
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	db, err := GetDBContext(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	ctx, cancel := context.WithTimeout(parent, operationTimeout)
-	defer cancel()
 	escaped := escapeLike(name)
 	query := db.WithContext(ctx).Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
 
@@ -298,12 +356,12 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 	if (window != time.Hour && window != 24*time.Hour && window != 7*24*time.Hour) || limit < 1 || limit > 100 {
 		return nil, fmt.Errorf("invalid trending parameters")
 	}
-	db, err := GetDB()
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	db, err := GetDBContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(parent, operationTimeout)
-	defer cancel()
 	ranked := db.WithContext(ctx).Model(&Observation{}).
 		Select("`infohash`, SUM(`count`) AS hits").
 		Where("applied = ? AND time >= ? AND time < ?", true, until.Add(-window), until).
@@ -326,12 +384,12 @@ type ResourceCounts struct {
 
 func CountResources(parent context.Context, startedAt time.Time) (ResourceCounts, error) {
 	var counts ResourceCounts
-	db, err := GetDB()
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	db, err := GetDBContext(ctx)
 	if err != nil {
 		return counts, err
 	}
-	ctx, cancel := context.WithTimeout(parent, operationTimeout)
-	defer cancel()
 	hasFiles := "COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE)"
 	err = db.WithContext(ctx).Model(&Data{}).Select(
 		"COUNT(*) AS total, COALESCE(SUM("+hasFiles+"), 0) AS with_files, "+
@@ -342,12 +400,12 @@ func CountResources(parent context.Context, startedAt time.Time) (ResourceCounts
 }
 
 func Detail(parent context.Context, infoHash string) (*Data, error) {
-	db, err := GetDB()
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	db, err := GetDBContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(parent, operationTimeout)
-	defer cancel()
 	var result Data
 	if err := db.WithContext(ctx).Where("infohash = ? AND JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0", infoHash).Take(&result).Error; err != nil {
 		return nil, err

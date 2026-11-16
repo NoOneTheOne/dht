@@ -104,7 +104,7 @@ function App() {
         <section className="hero" aria-labelledby="page-title">
           <span className="eyebrow" lang="en">DISCOVER THE DISTRIBUTED WEB</span>
           <h1 id="page-title">万千微光，<span>自成星海。</span></h1>
-          <SearchBar onSearch={handleSearch} loading={loading} />
+          <SearchBar onSearch={handleSearch} loading={loading} initialQuery={query} />
           <div className="search-notes"><span>按名称关键词匹配</span><span>每页 50 条，支持翻页</span><span>不托管资源文件</span></div>
         </section>
         {error ? (

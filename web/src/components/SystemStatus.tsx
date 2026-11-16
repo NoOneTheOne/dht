@@ -63,21 +63,11 @@ function RateCard({ label, subtitle, rate }: { label: string; subtitle: string; 
   </article>;
 }
 
-function CoverageCard({ label, subtitle, breakdown }: { label: string; subtitle: string; breakdown: Breakdown | null | undefined }) {
-  const withFiles = breakdown?.with_files_percent;
-  const withoutFiles = breakdown?.without_files_percent;
-  return <article className="status-card coverage-card"><span className="metric-label">{label}<span>UNIQUE INFOHASH</span></span>
+function IngestionCard({ label, subtitle, breakdown }: { label: string; subtitle: string; breakdown: Breakdown | null | undefined }) {
+  return <article className="status-card ingestion-card"><span className="metric-label">{label}<span>UNIQUE INFOHASH</span></span>
     <strong className="metric-value">{number(breakdown?.total)}<small>个</small></strong>
     <p className="metric-note">{subtitle}</p>
-    <div className="rate-track coverage-track" aria-hidden="true">
-      <span className="coverage-with" style={{ width: `${withFiles ?? 0}%` }} />
-      <span className="coverage-without" style={{ width: `${withoutFiles ?? 0}%` }} />
-    </div>
-    <dl className="coverage-counts">
-      <div><dt><i className="coverage-key coverage-with" aria-hidden="true" />有 filelist</dt><dd><b>{number(breakdown?.with_files)}</b><span>{withFiles == null ? '—' : `${withFiles.toFixed(1)}%`}</span></dd></div>
-      <div><dt><i className="coverage-key coverage-without" aria-hidden="true" />无 filelist</dt><dd><b>{number(breakdown?.without_files)}</b><span>{withoutFiles == null ? '—' : `${withoutFiles.toFixed(1)}%`}</span></dd></div>
-    </dl>
-    <p className="metric-note">{breakdown === undefined ? '正在获取入库统计' : breakdown === null ? '入库统计暂时不可用，不代表入库数量为 0' : breakdown.total === 0 ? '暂无入库样本，占比不适用' : '按当前文件明细（files）分类；占比以去重总量为分母'}</p>
+    {breakdown == null && <p className="metric-note">{breakdown === undefined ? '正在获取入库统计' : '入库统计暂时不可用，不代表入库数量为 0'}</p>}
   </article>;
 }
 
@@ -116,7 +106,10 @@ export default function SystemStatus() {
   const natLabels: Record<string, string> = { manual: '手动端口转发', discovering: '正在发现网关', mapped: '自动映射已建立', unavailable: '未发现 NAT 网关', mapping_failed: '自动映射失败' };
   const reachLabels: Record<string, string> = { checking: '正在检测', reachable: '已观察到公网入站', unknown: '尚未确认' };
   return <section className="status-section" aria-labelledby="status-title">
-    <div className={`status-banner ${state}`} role="status" aria-live="polite"><span className="banner-icon" aria-hidden="true">{state === 'operational' ? '✓' : state === 'outage' ? '!' : '−'}</span>
+    <div className={`status-banner ${state}`} role="status" aria-live="polite"><svg className="banner-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="12" fill="currentColor" />
+      <path d={state === 'operational' ? 'm6.5 12 3.5 3.5 7.5-7.5' : state === 'outage' ? 'm8 8 8 8m0-8-8 8' : 'M12 6.5v7m0 4v.01'} fill="none" className="banner-icon-mark" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
       <div><strong>{title}</strong><p>{error ? `${error}${data ? ' 下方为上次成功获取的数据，可能已过期。' : ''}` : data ? '持续观测采集、存储与网络连接状态。' : '正在连接采集进程与资源数据库。'}</p></div>
       <span className="banner-badge">{state === 'operational' ? 'OPERATIONAL' : state === 'outage' ? 'DISRUPTION' : 'ATTENTION'}</span>
     </div>
@@ -132,11 +125,11 @@ export default function SystemStatus() {
         <article className="status-card"><span className="metric-label">本次元数据抓取 <span>THIS RUN</span></span><strong className="metric-value">{number(c?.collected)}<small>次</small></strong><p className="metric-note">已通过哈希校验的抓取次数，含重复资源，非新增入库数</p></article>
         <article className="status-card"><span className="metric-label">总收集条目 <span>ALL TIME</span></span><strong className="metric-value">{number(data?.total_collected)}<small>条</small></strong><p className="metric-note">数据库已收录的去重资源数</p></article>
       </div>
-      <div className="status-group-heading"><h2>入库明细覆盖</h2><span>INGESTION COVERAGE</span></div>
-      <p className="coverage-description">按 InfoHash 去重精确计数 · 统计缓存 1 分钟，刷新状态不会立即刷新入库统计。</p>
-      <div className="status-grid coverage-grid">
-        <CoverageCard label="本次新增入库" subtitle="数据库首次收录时间 ≥ 采集进程本次启动时间；不含重复旧 InfoHash" breakdown={data?.ingestion.this_run} />
-        <CoverageCard label="全局已入库" subtitle="全局数据库存量：主表所有唯一 InfoHash，不限采集进程启动时间" breakdown={data?.ingestion.all_time} />
+      <div className="status-group-heading"><h2>入库统计</h2><span>INGESTION TOTALS</span></div>
+      <p className="ingestion-description">按 InfoHash 去重精确计数 · 统计缓存 1 分钟，刷新状态不会立即刷新入库统计。</p>
+      <div className="status-grid ingestion-grid">
+        <IngestionCard label="本次新增入库" subtitle="数据库首次收录时间 ≥ 采集进程本次启动时间；不含重复旧 InfoHash" breakdown={data?.ingestion.this_run} />
+        <IngestionCard label="全局已入库" subtitle="全局数据库存量：主表所有唯一 InfoHash，不限采集进程启动时间" breakdown={data?.ingestion.all_time} />
       </div>
       <div className="status-group-heading"><h2>采集与连接</h2><span>CRAWLER & CONNECTIONS</span></div>
       <div className="status-grid connections-grid">

@@ -3,10 +3,11 @@ import { useState } from 'react';
 interface SearchBarProps {
   onSearch: (query: string) => void;
   loading: boolean;
+  initialQuery: string;
 }
 
-export default function SearchBar({ onSearch, loading }: SearchBarProps) {
-  const [query, setQuery] = useState('');
+export default function SearchBar({ onSearch, loading, initialQuery }: SearchBarProps) {
+  const [query, setQuery] = useState(initialQuery);
   const [error, setError] = useState('');
 
   const handleSubmit = (event: React.FormEvent) => {

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,12 +25,13 @@ type Mapping struct {
 	Internal   int // Internal port
 	Desc       string
 	Expires    time.Time
+	lease      time.Duration
 }
 
 // NAT interface for NAT traversal operations
 type NAT interface {
 	GetExternalAddress() (net.IP, error)
-	AddPortMapping(protocol string, externalPort, internalPort int, desc string, timeout time.Duration) error
+	AddPortMapping(protocol string, externalPort, internalPort int, desc string, timeout time.Duration) (int, time.Duration, error)
 	DeletePortMapping(protocol string, externalPort, internalPort int) error
 	Type() string
 }
@@ -38,6 +41,7 @@ type UPnPNAT struct {
 	ipService  *internetgateway2.WANIPConnection1
 	pppService *internetgateway2.WANPPPConnection1
 	devURL     string
+	localIP    net.IP
 }
 
 // NATPMP implements NAT using NAT-PMP
@@ -79,23 +83,61 @@ func Discover() (NAT, error) {
 func discoverUPnP() (*UPnPNAT, error) {
 	// Try WANIPConnection1
 	ipServices, _, err := internetgateway2.NewWANIPConnection1Clients()
-	if err == nil && len(ipServices) > 0 {
-		return &UPnPNAT{
-			ipService: ipServices[0],
-			devURL:    ipServices[0].ServiceClient.Location.String(),
-		}, nil
+	if err == nil {
+		for _, service := range ipServices {
+			localIP, err := localIPv4ForGateway(service.ServiceClient.Location)
+			if err != nil {
+				continue
+			}
+			return &UPnPNAT{
+				ipService: service,
+				devURL:    service.ServiceClient.Location.String(),
+				localIP:   localIP,
+			}, nil
+		}
 	}
 
 	// Try WANPPPConnection1
 	pppServices, _, err := internetgateway2.NewWANPPPConnection1Clients()
-	if err == nil && len(pppServices) > 0 {
-		return &UPnPNAT{
-			pppService: pppServices[0],
-			devURL:     pppServices[0].ServiceClient.Location.String(),
-		}, nil
+	if err == nil {
+		for _, service := range pppServices {
+			localIP, err := localIPv4ForGateway(service.ServiceClient.Location)
+			if err != nil {
+				continue
+			}
+			return &UPnPNAT{
+				pppService: service,
+				devURL:     service.ServiceClient.Location.String(),
+				localIP:    localIP,
+			}, nil
+		}
 	}
 
 	return nil, errors.New("UPnP not available")
+}
+
+// localIPv4ForGateway selects the source IPv4 for the gateway route without sending packets.
+func localIPv4ForGateway(location *url.URL) (net.IP, error) {
+	if location == nil || location.Hostname() == "" {
+		return nil, errors.New("missing UPnP gateway location")
+	}
+	port := location.Port()
+	if port == "" {
+		port = "80"
+		if location.Scheme == "https" {
+			port = "443"
+		}
+	}
+	conn, err := net.Dial("udp4", net.JoinHostPort(location.Hostname(), port))
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP.To4() == nil || addr.IP.IsUnspecified() {
+		return nil, errors.New("no local IPv4 route to UPnP gateway")
+	}
+	return addr.IP.To4(), nil
 }
 
 func discoverNATPMP() (*NATPMP, error) {
@@ -140,24 +182,38 @@ func (u *UPnPNAT) GetExternalAddress() (net.IP, error) {
 }
 
 // AddPortMapping adds a port mapping
-func (u *UPnPNAT) AddPortMapping(protocol string, externalPort, internalPort int, desc string, timeout time.Duration) error {
+func (u *UPnPNAT) AddPortMapping(protocol string, externalPort, internalPort int, desc string, timeout time.Duration) (int, time.Duration, error) {
+	if u.localIP.To4() == nil || u.localIP.IsUnspecified() {
+		return 0, 0, errors.New("no local IPv4 address for UPnP gateway")
+	}
+	if externalPort <= 0 || externalPort > 65535 || internalPort <= 0 || internalPort > 65535 {
+		return 0, 0, errors.New("UPnP mapping ports must be between 1 and 65535")
+	}
+	seconds := timeout / time.Second
+	if timeout < 0 || seconds > 1<<32-1 || (timeout > 0 && seconds == 0) {
+		return 0, 0, errors.New("invalid UPnP lease duration")
+	}
 	var err error
-	leaseDuration := uint32(timeout.Seconds())
+	leaseDuration := uint32(seconds)
+	protocol = strings.ToUpper(protocol)
 
 	if u.ipService != nil {
-		err = u.ipService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), "", true, desc, leaseDuration)
+		err = u.ipService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), u.localIP.String(), true, desc, leaseDuration)
 	} else if u.pppService != nil {
-		err = u.pppService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), "", true, desc, leaseDuration)
+		err = u.pppService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), u.localIP.String(), true, desc, leaseDuration)
 	} else {
-		return errors.New("no UPnP service available")
+		return 0, 0, errors.New("no UPnP service available")
 	}
-
-	return err
+	if err != nil {
+		return 0, 0, err
+	}
+	return externalPort, time.Duration(leaseDuration) * time.Second, nil
 }
 
 // DeletePortMapping removes a port mapping
 func (u *UPnPNAT) DeletePortMapping(protocol string, externalPort, internalPort int) error {
 	var err error
+	protocol = strings.ToUpper(protocol)
 
 	if u.ipService != nil {
 		err = u.ipService.DeletePortMapping("", uint16(externalPort), protocol)
@@ -185,7 +241,7 @@ func (n *NATPMP) GetExternalAddress() (net.IP, error) {
 }
 
 // AddPortMapping adds a port mapping
-func (n *NATPMP) AddPortMapping(protocol string, externalPort, internalPort int, desc string, timeout time.Duration) error {
+func (n *NATPMP) AddPortMapping(protocol string, externalPort, internalPort int, desc string, timeout time.Duration) (int, time.Duration, error) {
 	var lifetime int
 	if timeout > 0 {
 		lifetime = int(timeout.Seconds())
@@ -193,8 +249,14 @@ func (n *NATPMP) AddPortMapping(protocol string, externalPort, internalPort int,
 		lifetime = 3600 // Default 1 hour
 	}
 
-	_, err := n.client.AddPortMapping(protocol, internalPort, externalPort, lifetime)
-	return err
+	resp, err := n.client.AddPortMapping(protocol, internalPort, externalPort, lifetime)
+	if err != nil {
+		return 0, 0, err
+	}
+	if resp.MappedExternalPort == 0 || resp.PortMappingLifetimeInSeconds == 0 || int(resp.InternalPort) != internalPort {
+		return 0, 0, errors.New("invalid NAT-PMP mapping response")
+	}
+	return int(resp.MappedExternalPort), time.Duration(resp.PortMappingLifetimeInSeconds) * time.Second, nil
 }
 
 // DeletePortMapping removes a port mapping
@@ -253,20 +315,27 @@ func (am *AutoMap) Map(protocol string, externalPort, internalPort int, desc str
 		return nil, err
 	}
 
-	// Add mapping with 1 hour timeout
-	timeout := time.Hour
-	err = am.nat.AddPortMapping(protocol, externalPort, internalPort, desc, timeout)
+	// Request one hour, but track the lease and port actually granted by the gateway.
+	external, lease, err := am.nat.AddPortMapping(protocol, externalPort, internalPort, desc, time.Hour)
 	if err != nil {
 		return nil, err
+	}
+	if external <= 0 || external > 65535 || lease < 0 {
+		return nil, errors.New("invalid port mapping response")
+	}
+	expires := time.Time{}
+	if lease > 0 {
+		expires = time.Now().Add(lease)
 	}
 
 	m := &Mapping{
 		Protocol:   protocol,
 		ExternalIP: extIP,
-		External:   externalPort,
+		External:   external,
 		Internal:   internalPort,
 		Desc:       desc,
-		Expires:    time.Now().Add(timeout),
+		Expires:    expires,
+		lease:      lease,
 	}
 
 	am.mappings[key] = m
@@ -289,11 +358,12 @@ func (am *AutoMap) Unmap(protocol string, externalPort, internalPort int) error 
 	defer am.mu.Unlock()
 
 	key := mappingKey(protocol, externalPort, internalPort)
-	if _, ok := am.mappings[key]; !ok {
+	m, ok := am.mappings[key]
+	if !ok {
 		return nil
 	}
 
-	err := am.nat.DeletePortMapping(protocol, externalPort, internalPort)
+	err := am.nat.DeletePortMapping(m.Protocol, m.External, m.Internal)
 	if err != nil {
 		return err
 	}
@@ -338,7 +408,7 @@ func (am *AutoMap) Stop() {
 }
 
 func (am *AutoMap) refreshLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -364,17 +434,25 @@ func (am *AutoMap) refreshMappings() {
 	}
 	now := time.Now()
 	for key, m := range am.mappings {
-		// Refresh if expiring within 10 minutes
-		if m.Expires.Before(now.Add(10 * time.Minute)) {
-			timeout := time.Hour
-			err := am.nat.AddPortMapping(m.Protocol, m.External, m.Internal, m.Desc, timeout)
-			if err != nil {
-				log.Printf("[NAT] Failed to refresh mapping %s: %v", key, err)
-				continue
-			}
-			m.Expires = now.Add(timeout)
-			log.Printf("[NAT] Refreshed mapping %s", key)
+		// A zero lease is permanent (UPnP). Renew finite leases halfway through.
+		if m.Expires.IsZero() || now.Before(m.Expires.Add(-m.lease/2)) {
+			continue
 		}
+		external, lease, err := am.nat.AddPortMapping(m.Protocol, m.External, m.Internal, m.Desc, m.lease)
+		if err == nil && (external <= 0 || external > 65535 || lease < 0) {
+			err = errors.New("invalid port mapping response")
+		}
+		if err != nil {
+			log.Printf("[NAT] Failed to refresh mapping %s: %v", key, err)
+			continue
+		}
+		m.External = external
+		m.lease = lease
+		m.Expires = time.Time{}
+		if lease > 0 {
+			m.Expires = time.Now().Add(lease)
+		}
+		log.Printf("[NAT] Refreshed mapping %s at external port %d", key, external)
 	}
 }
 

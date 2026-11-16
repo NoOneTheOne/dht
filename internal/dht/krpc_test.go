@@ -197,36 +197,136 @@ func addKRPCTestTransaction(t *testing.T, d *DHT, addr *net.UDPAddr, queryType s
 }
 
 func TestKRPCGetPeersMixedValues(t *testing.T) {
-	d, remote := newKRPCTestDHT(t)
-	addr := remote.LocalAddr().(*net.UDPAddr)
-	trans := addKRPCTestTransaction(t, d, addr, getPeersType)
-	valid := newPeer(net.IPv4(127, 0, 0, 2), 6881, "token").CompactIPPortInfo()
-	zeroPort := newPeer(net.IPv4(127, 0, 0, 3), 0, "token").CompactIPPortInfo()
-	calls := 0
-	d.OnGetPeersResponse = func(hash string, p *Peer) {
-		calls++
-		if hash != strings.Repeat("h", 20) || p.Port != 6881 || p.Token != "token" {
-			t.Errorf("unexpected peer callback: %q %+v", hash, p)
+	for _, mode := range []string{"StandardMode", "CrawlMode"} {
+		t.Run(mode, func(t *testing.T) {
+			d, remote := newKRPCTestDHT(t)
+			d.Mode = mode
+			addr := remote.LocalAddr().(*net.UDPAddr)
+			trans := addKRPCTestTransaction(t, d, addr, getPeersType)
+			valid := newPeer(net.IPv4(127, 0, 0, 2), 6881, "token").CompactIPPortInfo()
+			zeroPort := newPeer(net.IPv4(127, 0, 0, 3), 0, "token").CompactIPPortInfo()
+			calls := 0
+			d.OnGetPeersResponse = func(hash string, p *Peer) {
+				calls++
+				if hash != strings.Repeat("h", 20) || p.Port != 6881 || p.Token != "token" || p.CompactIPPortInfo() != valid {
+					t.Errorf("unexpected peer callback: %q %+v", hash, p)
+				}
+			}
+			r := map[string]interface{}{
+				"id": strings.Repeat("r", 20), "token": "token",
+				"values": []interface{}{1, []interface{}{}, map[string]interface{}{}, "short", zeroPort, valid, 2},
+			}
+			if !handleResponse(d, addr, makeResponse(trans.id, r)) {
+				t.Fatal("mixed values response rejected instead of skipping invalid peers")
+			}
+			peers := d.peersManager.GetPeers(strings.Repeat("h", 20), 8)
+			if calls != 1 {
+				t.Fatalf("peer callback count = %d, want 1", calls)
+			}
+			if mode == "CrawlMode" {
+				if len(peers) != 0 || d.peersManager.table.Len() != 0 {
+					t.Fatal("crawl mode cached response peers")
+				}
+			} else if len(peers) != 1 || peers[0].CompactIPPortInfo() != valid {
+				t.Fatal("invalid values inserted or valid peer skipped")
+			}
+			if len(trans.response) != 1 {
+				t.Fatal("transaction not notified")
+			}
+		})
+	}
+}
+
+func TestKRPCFindOnFiltersRecommendedEndpoints(t *testing.T) {
+	for _, mode := range []string{"StandardMode", "CrawlMode"} {
+		for _, queryType := range []string{findNodeType, getPeersType} {
+			for _, endpoint := range []string{
+				"10.0.0.1:6881", "172.16.0.1:6881", "192.168.1.1:6881",
+				"127.0.0.1:6881", "169.254.1.1:6881", "100.64.0.1:6881",
+				"192.0.2.1:6881", "0.0.0.0:6881", "224.0.0.1:6881", "8.8.8.8:0",
+				"8.8.8.8:6881",
+			} {
+				for _, withNeighbor := range []bool{false, true} {
+					name := mode + "/" + queryType + "/" + endpoint + "/target-only"
+					if withNeighbor {
+						name = mode + "/" + queryType + "/" + endpoint + "/with-neighbor"
+					}
+					t.Run(name, func(t *testing.T) {
+						d, remote := newKRPCTestDHT(t)
+						d.Mode = mode
+						addr := remote.LocalAddr().(*net.UDPAddr)
+						trans := addKRPCTestTransaction(t, d, addr, queryType)
+						target, err := newNode(strings.Repeat("h", 20), "udp4", endpoint)
+						if err != nil {
+							t.Fatal(err)
+						}
+						neighbor, err := newNode(strings.Repeat("n", 20), "udp4", "1.1.1.1:6881")
+						if err != nil {
+							t.Fatal(err)
+						}
+						compact := target.CompactNodeInfo()
+						if withNeighbor {
+							compact += neighbor.CompactNodeInfo()
+						}
+						r := map[string]interface{}{
+							"id": strings.Repeat("r", 20), "token": "token", "nodes": compact,
+						}
+						if !handleResponse(d, addr, makeResponse(trans.id, r)) {
+							t.Fatal("valid compact response rejected")
+						}
+						publicTarget := endpoint == "8.8.8.8:6881"
+						gotTarget, _ := d.routingTable.GetNodeKBucketByID(target.id)
+						if (gotTarget != nil) != publicTarget {
+							t.Fatal("recommended target endpoint filtering failed")
+						}
+						gotNeighbor, _ := d.routingTable.GetNodeKBucketByID(neighbor.id)
+						if (gotNeighbor != nil) != withNeighbor {
+							t.Fatal("public neighbor not retained")
+						}
+						// Directly contacted loopback responders must remain usable.
+						responder, _ := d.routingTable.GetNodeKBucketByID(trans.node.id)
+						if responder == nil || responder.addr.String() != addr.String() {
+							t.Fatal("direct local responder was filtered")
+						}
+						wantNodes := 1
+						if publicTarget {
+							wantNodes++
+						}
+						if withNeighbor {
+							wantNodes++
+						}
+						if d.routingTable.Len() != wantNodes {
+							t.Fatalf("routing table size = %d, want %d", d.routingTable.Len(), wantNodes)
+						}
+						wantQueries := 0
+						if withNeighbor && !publicTarget {
+							wantQueries = 1
+						}
+						if len(d.transactionManager.queryChan) != wantQueries {
+							t.Fatalf("queued queries = %d, want %d", len(d.transactionManager.queryChan), wantQueries)
+						}
+						if wantQueries != 0 {
+							q := <-d.transactionManager.queryChan
+							if q.node.addr.String() != neighbor.addr.String() || q.data["q"] != queryType {
+								t.Fatal("query did not continue to the public neighbor")
+							}
+							key := "target"
+							if queryType == getPeersType {
+								key = "info_hash"
+							}
+							if q.data["a"].(map[string]interface{})[key] != target.id.RawString() {
+								t.Fatal("continued query changed its target")
+							}
+						}
+					})
+				}
+			}
 		}
-	}
-	r := map[string]interface{}{
-		"id": strings.Repeat("r", 20), "token": "token",
-		"values": []interface{}{1, []interface{}{}, map[string]interface{}{}, "short", zeroPort, valid, 2},
-	}
-	if !handleResponse(d, addr, makeResponse(trans.id, r)) {
-		t.Fatal("mixed values response rejected instead of skipping invalid peers")
-	}
-	peers := d.peersManager.GetPeers(strings.Repeat("h", 20), 8)
-	if calls != 1 || len(peers) != 1 || peers[0].CompactIPPortInfo() != valid {
-		t.Fatal("invalid values inserted or valid peer skipped")
-	}
-	if len(trans.response) != 1 {
-		t.Fatal("transaction not notified")
 	}
 }
 
 func TestKRPCFindOnRejectsInvalidCompactNodes(t *testing.T) {
-	compact := strings.Repeat("n", 20) + "\x7f\x00\x00\x01\x1a\xe1"
+	compact := strings.Repeat("n", 20) + "\x08\x08\x08\x08\x1a\xe1"
 	tests := []struct {
 		name    string
 		network string

@@ -95,32 +95,43 @@ func (p *Peer) CompactIPPortInfo() string {
 	return info
 }
 
+// maxPeerHashes bounds the standard-mode peer cache independently of K.
+const maxPeerHashes = 4096
+
 // peersManager represents a proxy that manipulates peers.
 type peersManager struct {
 	sync.RWMutex
-	table *syncedMap
+	table *keyedDeque
 	dht   *DHT
 }
 
 // newPeersManager returns a new peersManager.
 func newPeersManager(dht *DHT) *peersManager {
 	return &peersManager{
-		table: newSyncedMap(),
+		table: newKeyedDeque(),
 		dht:   dht,
 	}
 }
 
-// Insert adds a peer into peersManager.
+// Insert adds a peer into peersManager. Crawl mode leaves peer storage to the scheduler.
 func (pm *peersManager) Insert(infoHash string, peer *Peer) {
+	if pm.dht.IsCrawlMode() {
+		return
+	}
+
 	pm.Lock()
 	defer pm.Unlock()
 
-	v, ok := pm.table.Get(infoHash)
-	if !ok {
-		pm.table.Set(infoHash, newKeyedDeque())
-		v, _ = pm.table.Get(infoHash)
+	var queue *keyedDeque
+	if e, ok := pm.table.Get(infoHash); ok {
+		queue = e.Value.(*keyedDeque)
+	} else {
+		if pm.table.Len() >= maxPeerHashes {
+			pm.table.Remove(pm.table.Front())
+		}
+		queue = newKeyedDeque()
 	}
-	queue := v.(*keyedDeque)
+	pm.table.Push(infoHash, queue)
 
 	queue.Push(peer.CompactIPPortInfo(), peer)
 	if queue.Len() > pm.dht.K {
@@ -130,14 +141,19 @@ func (pm *peersManager) Insert(infoHash string, peer *Peer) {
 
 // GetPeers returns size-length peers who announce having infoHash.
 func (pm *peersManager) GetPeers(infoHash string, size int) []*Peer {
+	pm.Lock()
+	defer pm.Unlock()
+
 	peers := make([]*Peer, 0, size)
 
-	v, ok := pm.table.Get(infoHash)
+	e, ok := pm.table.Get(infoHash)
 	if !ok {
 		return peers
 	}
+	queue := e.Value.(*keyedDeque)
+	pm.table.Push(infoHash, queue)
 
-	for e := range v.(*keyedDeque).Iter() {
+	for e := range queue.Iter() {
 		peers = append(peers, e.Value.(*Peer))
 	}
 

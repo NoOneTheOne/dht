@@ -1,10 +1,52 @@
 package metrics
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+func TestMiddlewareBoundsMethodLabels(t *testing.T) {
+	router := gin.New()
+	router.Use(Middleware())
+	router.NoRoute(func(c *gin.Context) { c.String(http.StatusNotFound, "missing") })
+	for i := 0; i < 100; i++ {
+		request := httptest.NewRequest(fmt.Sprintf("CUSTOM%d", i), "/metrics-method-test", strings.NewReader("body"))
+		router.ServeHTTP(httptest.NewRecorder(), request)
+	}
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(httpRequestsTotal, httpRequestDuration, httpRequestSize, httpResponseSize)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 4 {
+		t.Fatalf("got %d metric families, want 4", len(families))
+	}
+	for _, family := range families {
+		count := 0
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				if label.GetName() == "method" {
+					if strings.HasPrefix(label.GetValue(), "CUSTOM") {
+						t.Fatalf("unbounded method label: %s", label.GetValue())
+					}
+					if label.GetValue() == "OTHER" {
+						count++
+					}
+				}
+			}
+		}
+		if count != 1 {
+			t.Fatalf("%s: got %d OTHER metrics, want 1", family.GetName(), count)
+		}
+	}
+}
 
 func TestProtocolCollector(t *testing.T) {
 	previous := dhtStatsGetter
