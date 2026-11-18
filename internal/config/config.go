@@ -19,12 +19,6 @@ type Config struct {
 		Database  string `yaml:"database"`
 		Table     string `yaml:"table"`
 	}
-	Elasticsearch struct {
-		Addresses []string `yaml:"addresses"`
-		Username  string   `yaml:"username"`
-		Password  string   `yaml:"password"`
-		Index     string   `yaml:"index"`
-	}
 	Tracker struct {
 		List []string `yaml:"list"`
 	}

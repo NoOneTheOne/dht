@@ -241,3 +241,42 @@ func TestHashSchedulerRunDrainsOnStop(t *testing.T) {
 		t.Fatal("metadata without a filelist was cached as a success")
 	}
 }
+
+func TestHashSchedulerLookupRefusals(t *testing.T) {
+	now := time.Now()
+	t.Run("still running refunds the slot", func(t *testing.T) {
+		calls := 0
+		s := newHashScheduler(1, func(hash string) error {
+			calls++
+			if hash < strings.Repeat("m", 20) {
+				return dht.ErrLookupActive // Half the hashes already have a lookup in flight.
+			}
+			return nil
+		}, func([]byte, string, int) bool { return false })
+		for i := 0; i < 20; i++ {
+			s.add(hashDiscovery{hash: strings.Repeat(string(rune('a'+i)), 20), source: "get_peers"}, now)
+		}
+		s.tick(now)
+		started := 0
+		for _, element := range s.pending {
+			if element.Value.(*pendingHash).lookups == 1 {
+				started++
+			}
+		}
+		// Running lookups must not consume the 8 per-tick slots.
+		if started != 8 || calls != 20 {
+			t.Fatalf("started=%d calls=%d; refused-as-running lookups consumed slots", started, calls)
+		}
+	})
+	t.Run("capacity stops the tick", func(t *testing.T) {
+		calls := 0
+		s := newHashScheduler(1, func(string) error { calls++; return dht.ErrLookupCapacity }, func([]byte, string, int) bool { return false })
+		for i := 0; i < 20; i++ {
+			s.add(hashDiscovery{hash: strings.Repeat(string(rune('a'+i)), 20), source: "get_peers"}, now)
+		}
+		s.tick(now)
+		if calls != 1 {
+			t.Fatalf("calls=%d; a full lookup table must end this tick's lookups", calls)
+		}
+	})
+}

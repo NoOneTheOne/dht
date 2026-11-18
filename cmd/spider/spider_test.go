@@ -214,17 +214,6 @@ func TestTorrentFiles(t *testing.T) {
 			if err := json.Unmarshal(mysqlJSON, &mysqlDecoded); err != nil || !reflect.DeepEqual(mysqlDecoded.Files, files) {
 				t.Fatal("MySQL file list did not survive JSON serialization")
 			}
-			esData, err := json.Marshal(bitTorrent{Files: files, Length: length})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var decoded bitTorrent
-			if err := json.Unmarshal(esData, &decoded); err != nil {
-				t.Fatal(err)
-			}
-			if decoded.Length != mysqlData.Length || !reflect.DeepEqual(decoded.Files, mysqlData.Files) {
-				t.Fatal("backend totals or file lists differ")
-			}
 		})
 	}
 }

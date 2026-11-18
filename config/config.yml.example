@@ -1,4 +1,4 @@
-# storage type: "mysql" or "elasticsearch"
+# storage type: only "mysql" is supported
 storage:
   type: mysql
 
@@ -9,13 +9,6 @@ mysql:
   password: "YOUR_MYSQL_PASSWORD"
   database: "YOUR_MYSQL_DATABASE"
   table: "YOUR_MYSQL_TABLE"
-
-# Elasticsearch — 外置服务，storage.type 为 elasticsearch 时使用
-elasticsearch:
-  addresses: [ "http://YOUR_ES_HOST:9200" ]
-  username: "YOUR_ES_USERNAME"
-  password: "YOUR_ES_PASSWORD"
-  index: "YOUR_ES_INDEX"
 
 # DHT 引导节点仅支持 host:port，不是 Tracker announce URL；空列表使用内置节点。
 tracker:

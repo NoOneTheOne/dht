@@ -1,12 +1,19 @@
 package dht
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
 
+// Reasons a lookup was not started. Both wrap ErrQueryNotQueued.
+var (
+	ErrLookupActive   = fmt.Errorf("%w: a lookup for this hash is already running", ErrQueryNotQueued)
+	ErrLookupCapacity = fmt.Errorf("%w: concurrent lookup limit reached", ErrQueryNotQueued)
+)
+
 const (
-	maxPeerLookups       = 128
+	maxPeerLookups       = 192
 	peerLookupAlpha      = 3
 	peerLookupBudget     = 24
 	peerLookupCandidates = 64
@@ -44,12 +51,12 @@ func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
 	if existing := d.lookups[hash]; existing != nil {
 		d.lookupMu.Unlock()
 		RecordProtocolEvent("peer_lookup", "not_queued_active")
-		return ErrQueryNotQueued
+		return ErrLookupActive
 	}
 	if len(d.lookups) >= maxPeerLookups {
 		d.lookupMu.Unlock()
 		RecordProtocolEvent("peer_lookup", "not_queued_capacity")
-		return ErrQueryNotQueued
+		return ErrLookupCapacity
 	}
 	lookup := &peerLookup{dht: d, hash: hash, deadline: time.Now().Add(peerLookupTimeout), visited: make(map[string]bool)}
 	d.lookups[hash] = lookup

@@ -168,7 +168,16 @@ func (s *hashScheduler) tick(now time.Time) {
 			if err := s.lookup(entry.hash); err != nil {
 				entry.nextLookup = now.Add(5 * time.Second)
 				reason := "not_ready"
-				if errors.Is(err, dht.ErrQueryNotQueued) {
+				switch {
+				case errors.Is(err, dht.ErrLookupActive):
+					// Still running: not a failure, and it must not cost a slot.
+					lookups++
+					reason = "still_running"
+				case errors.Is(err, dht.ErrLookupCapacity):
+					// Every further lookup this tick would be refused too.
+					lookups = 0
+					reason = "capacity"
+				case errors.Is(err, dht.ErrQueryNotQueued):
 					reason = "not_queued"
 				}
 				dht.RecordProtocolEvent("hash_lookup", reason)

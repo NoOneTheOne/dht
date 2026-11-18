@@ -2,6 +2,7 @@ package dht
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -187,7 +188,7 @@ func TestGetPeersValidatesHashAndBoundsFanout(t *testing.T) {
 	if err := d.GetPeers(strings.Repeat("a", 20)); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.GetPeers(strings.Repeat("61", 20)); err != ErrQueryNotQueued {
+	if err := d.GetPeers(strings.Repeat("61", 20)); !errors.Is(err, ErrLookupActive) || !errors.Is(err, ErrQueryNotQueued) {
 		t.Fatalf("duplicate query must report no admission: %v", err)
 	}
 	if got := len(d.transactionManager.queryChan); got != peerLookupAlpha {

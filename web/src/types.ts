@@ -5,6 +5,8 @@ export interface TorrentItem {
   length: number;
   count: number;
   has_files: boolean;
+  /** Search only: matched in file names but not in the name. */
+  matched_files?: boolean;
 }
 
 export interface TorrentDetail extends TorrentItem {
@@ -16,4 +18,6 @@ export interface SearchResponse {
   items: TorrentItem[];
   page: number;
   page_size: number;
+  /** False when only names were searched (file index not ready, or words too common). */
+  files_searched: boolean;
 }

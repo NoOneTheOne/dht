@@ -109,7 +109,7 @@ MySQL 写入失败的批次会暂存在 `RECOVERY_FILE_PATH`（容器内默认 `
 
 | 字段 | 说明 |
 |------|------|
-| `storage.type` | 存储类型：`mysql` |
+| `storage.type` | 存储类型：仅支持 `mysql` |
 | `mysql.addresses` | MySQL 地址（host:port） |
 | `mysql.username` | MySQL 用户名 |
 | `mysql.password` | MySQL 密码 |
@@ -132,12 +132,19 @@ GET /search?name={keyword}&page={page}
 - `name`（必填）：搜索关键词，最大 200 字节
 - `page`（可选）：页码，从 1 开始，默认 1；每页固定 50 条
 
+**匹配规则**：
+- 关键词按空格拆分，每个词都必须出现在**资源名称或文件名**中（不分先后、可分别出现在两处），不区分大小写；名称命中的结果排在仅文件名命中的结果之前，同组内按收录时间倒序。
+- 仅在文件名中命中的结果带 `"matched_files": true`。每个种子索引去重后的目录名与文件名，最多 2000 个字符，超大文件列表只索引靠前部分。
+- 文件名检索单条语句限时 1.5 秒；关键词过于常见导致超时时自动改为仅匹配名称，此时响应中 `"files_searched": false`，前端会给出提示。
+- 依赖 MySQL 5.7.6+ 的 ngram 全文索引，由 Search 服务启动后在后台自动创建（含存量数据回填），期间搜索自动降级为仅匹配名称；建索引会短暂阻塞写入，Spider 的写入会进入恢复文件并自动重放。数据库不支持 ngram（如 MariaDB）时回退为名称子串匹配。
+
 **响应**：
 ```json
 {
   "total": 100,
   "page": 1,
   "page_size": 50,
+  "files_searched": true,
   "items": [
     {
       "name": "示例文件名",
@@ -167,6 +174,14 @@ GET /api/trending?window={1h|24h|7d}&limit={1..100}
 ```
 
 按时间窗口内的采集次数排序，默认 `window=24h`、`limit=10`。返回 `items`（字段同搜索结果，`count` 为窗口内次数）及 `window`、`limit`、`since`、`until`。
+
+### 最近收录接口
+
+```
+GET /api/recent?limit={1..100}
+```
+
+按首次收录时间倒序返回最新采集的资源，默认 `limit=10`。返回 `items`（字段同搜索结果）及 `limit`。
 
 ### 资源详情接口
 
@@ -319,13 +334,11 @@ DHT_IMAGE_TAG=v1.0.3 docker compose build
 │   ├── spider/          # DHT Spider 嗅探器
 │   └── getpeers/        # 获取 Peer 工具
 ├── internal/
-│   ├── basic/           # 基础工具
 │   ├── config/          # 配置管理
 │   ├── dht/             # DHT 协议实现
 │   ├── metrics/         # Prometheus 指标
 │   ├── nat/             # NAT 端口映射
 │   └── storage/
-│       ├── es/          # Elasticsearch 存储
 │       └── mysql/       # MySQL 存储
 ├── web/                 # React 前端
 ├── config/

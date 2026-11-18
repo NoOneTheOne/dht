@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/NoOneTheOne/dht/internal/config"
 	mysqlDriver "github.com/go-sql-driver/mysql"
@@ -371,8 +372,8 @@ func TestOperationsPropagateInitializationError(t *testing.T) {
 	if err := Write(&Data{Name: "test", InfoHash: strings.Repeat("a", 40)}); !errors.Is(err, failure) {
 		t.Fatalf("Write error = %v, want initialization failure", err)
 	}
-	if results, total, err := Search(context.Background(), "test", 1); results != nil || total != 0 || !errors.Is(err, failure) {
-		t.Fatalf("Search = (%v, %d, %v), want nil, zero and initialization failure", results, total, err)
+	if result, err := Search(context.Background(), "test", 1); result.Items != nil || result.Total != 0 || !errors.Is(err, failure) {
+		t.Fatalf("Search = (%v, %d, %v), want nil, zero and initialization failure", result.Items, result.Total, err)
 	}
 	if result, err := Detail(context.Background(), strings.Repeat("a", 40)); result != nil || !errors.Is(err, failure) {
 		t.Fatalf("Detail = (%v, %v), want nil and initialization failure", result, err)
@@ -387,7 +388,7 @@ func TestOperationInitializationHasTimeout(t *testing.T) {
 		{"write", func(context.Context) error {
 			return WriteBatchWithID("test", []Data{{InfoHash: strings.Repeat("a", 40)}})
 		}},
-		{"search", func(ctx context.Context) error { _, _, err := Search(ctx, "test", 1); return err }},
+		{"search", func(ctx context.Context) error { _, err := Search(ctx, "test", 1); return err }},
 		{"trending", func(ctx context.Context) error {
 			_, err := Trending(ctx, time.Hour, 10, time.Now())
 			return err
@@ -685,24 +686,35 @@ func TestSearchQueries(t *testing.T) {
 				if _, ok := tx.Statement.Context.Deadline(); !ok {
 					t.Fatal("query has no timeout")
 				}
-				if got := tx.Statement.Vars; len(got) == 0 || got[0] != "%a|%|_||%" {
-					t.Fatalf("LIKE input was not escaped: %v", got)
+				// LIKE wildcards are literal inside a quoted boolean-mode phrase.
+				if got := tx.Statement.Vars; len(got) == 0 || got[0] != `+"a%_|"` {
+					t.Fatalf("full-text phrase not built from the input: %v", got)
 				}
 				sql := tx.Statement.SQL.String()
+				if !strings.HasPrefix(sql, "SELECT /*+ MAX_EXECUTION_TIME(1500) */ ") {
+					t.Fatalf("file-name search is not time-bounded: %s", sql)
+				}
+				if !strings.Contains(sql, "MATCH(`name`, `file_names`) AGAINST (? IN BOOLEAN MODE)") || strings.Contains(sql, "LIKE") {
+					t.Fatalf("search did not use the name and file-name index: %s", sql)
+				}
 				switch dest := tx.Statement.Dest.(type) {
 				case *[]Data:
-					if strings.Contains(sql, "SELECT *") || !strings.Contains(sql, "AS has_files") {
+					if strings.Contains(sql, "SELECT *") || !strings.Contains(sql, "AS has_files") || strings.Contains(sql, "`files`,") {
 						t.Fatalf("search must return availability without the file list: %s", sql)
 					}
-					if !strings.Contains(sql, "ORDER BY `time` DESC, `infohash` DESC LIMIT ?") {
+					if !strings.Contains(sql, "NOT (MATCH(`name`) AGAINST (? IN BOOLEAN MODE)) AS matched_files") {
+						t.Fatalf("missing name-hit ranking column: %s", sql)
+					}
+					if !strings.Contains(sql, "ORDER BY matched_files ASC, `time` DESC, `infohash` DESC LIMIT ?") {
 						t.Fatalf("missing bounded deterministic sort: %s", sql)
 					}
+					// Vars: select phrase, where phrase, limit[, offset].
 					vars := tx.Statement.Vars
-					if len(vars) < 2 || vars[1] != SearchPageSize {
+					if len(vars) < 3 || vars[2] != SearchPageSize {
 						t.Fatalf("incorrect page limit: %v", vars)
 					}
 					if tt.page > 1 {
-						if !strings.Contains(sql, "OFFSET ?") || len(vars) != 3 || vars[2] != (tt.page-1)*SearchPageSize {
+						if !strings.Contains(sql, "OFFSET ?") || len(vars) != 4 || vars[3] != (tt.page-1)*SearchPageSize {
 							t.Fatalf("incorrect page offset: %s %v", sql, vars)
 						}
 					} else if strings.Contains(sql, "OFFSET") {
@@ -722,7 +734,8 @@ func TestSearchQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 			stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
-			rows, total, err := Search(parent, "a%_|", tt.page)
+			result, err := Search(parent, "a%_|", tt.page)
+			rows, total := result.Items, result.Total
 			wantTotal, wantQueries := int64(n), 1
 			if tt.page > 1 || n == SearchPageSize {
 				wantTotal, wantQueries = 123, 2
@@ -776,7 +789,8 @@ func TestSearchCanceledRequest(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	rows, total, err := Search(ctx, "test", 1)
+	result, err := Search(ctx, "test", 1)
+	rows, total := result.Items, result.Total
 	if !errors.Is(err, context.Canceled) || rows != nil || total != 0 || calls != 0 || initializations != 0 {
 		t.Fatalf("canceled search = %v, %d, %v; queries=%d initializations=%d", rows, total, err, calls, initializations)
 	}
@@ -1098,5 +1112,151 @@ func TestRecentQuery(t *testing.T) {
 		if _, err := Recent(context.Background(), limit); err == nil {
 			t.Fatalf("limit %d accepted", limit)
 		}
+	}
+}
+
+func TestFulltextTerms(t *testing.T) {
+	for _, tc := range []struct {
+		input          string
+		indexed, short []string
+		phrases        string
+	}{
+		{"ubuntu", []string{"ubuntu"}, nil, `+"ubuntu"`},
+		{"  Ubuntu   26.04 ", []string{"Ubuntu", "26.04"}, nil, `+"Ubuntu" +"26.04"`},
+		{`say "hi" a`, []string{"say", "hi"}, []string{"a"}, `+"say" +"hi"`},
+		{"赘婿 第", []string{"赘婿"}, []string{"第"}, `+"赘婿"`},
+		{`""`, nil, nil, ""},
+		{"x", nil, []string{"x"}, ""},
+	} {
+		indexed, short := fulltextTerms(tc.input)
+		if fmt.Sprint(indexed) != fmt.Sprint(tc.indexed) || fmt.Sprint(short) != fmt.Sprint(tc.short) || booleanPhrases(indexed) != tc.phrases {
+			t.Errorf("%q: indexed=%q short=%q phrases=%q", tc.input, indexed, short, booleanPhrases(indexed))
+		}
+	}
+}
+
+func TestSearchPlan(t *testing.T) {
+	for _, tc := range []struct {
+		input   string
+		mode    searchMode
+		filter  string
+		args    []interface{}
+		nameHit string
+	}{
+		{"ubuntu iso", searchNameAndFiles, "MATCH(`name`, `file_names`) AGAINST (? IN BOOLEAN MODE)", []interface{}{`+"ubuntu" +"iso"`},
+			"MATCH(`name`) AGAINST (? IN BOOLEAN MODE)"},
+		// A one-character word must appear in the name or a file name.
+		{"赘婿 第", searchNameAndFiles, "MATCH(`name`, `file_names`) AGAINST (? IN BOOLEAN MODE) AND (name LIKE ? ESCAPE '|' OR `file_names` LIKE ? ESCAPE '|')",
+			[]interface{}{`+"赘婿"`, "%第%", "%第%"}, "MATCH(`name`) AGAINST (? IN BOOLEAN MODE) AND name LIKE ? ESCAPE '|'"},
+		{"x", searchNameAndFiles, "(name LIKE ? ESCAPE '|' OR `file_names` LIKE ? ESCAPE '|')", []interface{}{"%x%", "%x%"}, "name LIKE ? ESCAPE '|'"},
+		{"ubuntu iso", searchNameOnly, "MATCH(`name`) AGAINST (? IN BOOLEAN MODE)", []interface{}{`+"ubuntu" +"iso"`}, ""},
+		{"x", searchNameOnly, "name LIKE ? ESCAPE '|'", []interface{}{"%x%"}, ""},
+		{"a%_|", searchLike, "name LIKE ? ESCAPE '|'", []interface{}{"%a|%|_||%"}, ""},
+	} {
+		filter, nameHit := searchPlan(tc.input, tc.mode)
+		if filter.sql != tc.filter || fmt.Sprint(filter.args) != fmt.Sprint(tc.args) || nameHit.sql != tc.nameHit {
+			t.Errorf("%q mode %d: filter=%q %v nameHit=%q", tc.input, tc.mode, filter.sql, filter.args, nameHit.sql)
+		}
+	}
+}
+
+func TestSearchStepsDownWhenSchemaIsMissing(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// file_names column missing (1054), then no name index (1191): LIKE answers.
+	var sqls []string
+	if err := candidate.Callback().Query().After("gorm:query").Register("capture_fallback", func(tx *gorm.DB) {
+		sql := tx.Statement.SQL.String()
+		sqls = append(sqls, sql)
+		switch {
+		case strings.Contains(sql, "file_names"):
+			tx.AddError(&mysqlDriver.MySQLError{Number: 1054, Message: "Unknown column 'file_names'"})
+		case strings.Contains(sql, "MATCH("):
+			tx.AddError(&mysqlDriver.MySQLError{Number: 1191, Message: "Can't find FULLTEXT index"})
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
+	if result, err := Search(context.Background(), "ubuntu", 1); err != nil || result.FilesSearched {
+		t.Fatalf("fallback search failed: %v", err)
+	}
+	if len(sqls) != 3 || !strings.Contains(sqls[0], "file_names") || !strings.Contains(sqls[1], "MATCH(`name`)") || !strings.Contains(sqls[2], "LIKE") {
+		t.Fatalf("expected name+files, name-only, then LIKE; got %q", sqls)
+	}
+}
+
+func TestMySQLDSNDisablesFulltextStopwords(t *testing.T) {
+	parsed, err := mysqlDriver.ParseDSN(mysqlDSN(&config.Config{}))
+	if err != nil || parsed.Params["innodb_ft_enable_stopword"] != "0" {
+		t.Fatal("with stopwords enabled, words such as \"to\" or \"the\" never match")
+	}
+}
+
+func TestFileNamesText(t *testing.T) {
+	text := func(files []File) string {
+		if v := fileNamesText(files); v != nil {
+			return *v
+		}
+		return "<nil>"
+	}
+	if got := text(nil); got != "<nil>" {
+		t.Fatalf("empty list = %q", got)
+	}
+	pack := []File{
+		{Path: []string{"第3季 Season", "E01.mkv"}}, {Path: []string{"第3季 Season", "E02.mkv"}},
+		{Path: []string{"第3季 Season", "Subs", "E01  zh.ass"}}, {Path: []string{"", "README"}},
+	}
+	// Each directory once, whitespace collapsed, one name per line.
+	if got, want := text(pack), "第3季 Season\nE01.mkv\nE02.mkv\nSubs\nE01 zh.ass\nREADME"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	var big []File
+	for i := 0; i < 2000; i++ {
+		big = append(big, File{Path: []string{fmt.Sprintf("episode-%04d-名称.mkv", i)}})
+	}
+	got := text(big)
+	if n := utf8.RuneCountInString(got); n > fileNamesMaxRunes || n < fileNamesMaxRunes-40 {
+		t.Fatalf("cap not applied: %d runes", n)
+	}
+	if !strings.HasSuffix(got, ".mkv") {
+		t.Fatal("cap must not cut a file name in half")
+	}
+}
+
+func TestSearchFallsBackToNamesWhenFileSearchTimesOut(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sqls []string
+	if err := candidate.Callback().Query().After("gorm:query").Register("capture_timeout", func(tx *gorm.DB) {
+		sql := tx.Statement.SQL.String()
+		sqls = append(sqls, sql)
+		if strings.Contains(sql, "file_names") {
+			tx.AddError(&mysqlDriver.MySQLError{Number: 3024, Message: "maximum statement execution time exceeded"})
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
+	result, err := Search(context.Background(), "mkv", 1)
+	if err != nil || result.FilesSearched {
+		t.Fatalf("result=%+v err=%v; a timed-out file search must answer from names", result, err)
+	}
+	if len(sqls) != 2 || !strings.Contains(sqls[1], "MATCH(`name`) AGAINST") || strings.Contains(sqls[1], "MAX_EXECUTION_TIME") {
+		t.Fatalf("expected an unbounded name-only retry, got %q", sqls)
 	}
 }

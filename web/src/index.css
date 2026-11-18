@@ -83,6 +83,8 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
 .hash-copy:hover { color: var(--text); }
 .size-cell { color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .time-cell { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.match-badge { display: inline-block; margin: 2px 0 2px; padding: 2px 7px; border: 1px solid var(--border); border-radius: 5px; color: var(--accent); background: var(--soft); font-size: 10px; letter-spacing: .04em; }
+.search-scope-note { margin: 0 0 12px; padding: 10px 14px; border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); font-size: 12px; background: var(--surface); }
 .count-badge { background: var(--soft); color: var(--accent); border: 1px solid var(--border); padding: 4px 9px; border-radius: 5px; font-variant-numeric: tabular-nums; }
 .magnet-button { border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; color: var(--accent); white-space: nowrap; font-size: 11px; min-height: 44px; }
 .magnet-button:hover { background: var(--soft); border-color: var(--accent); }
@@ -140,27 +142,11 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
 .trending-hits { text-align: right; font-variant-numeric: tabular-nums; }
 .trending-hits strong { display: block; color: var(--accent); font-size: 19px; font-weight: 650; }
 .trending-hits span { display: block; color: var(--subtle); font-size: 10px; margin-top: 5px; }
-.trending-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 28px; align-items: start; }
-.trending-main { min-width: 0; }
-.recent-panel { position: sticky; top: 16px; min-width: 0; padding: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: 13px; }
-.recent-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
-.recent-header h2 { font-size: 20px; font-weight: 600; margin: 8px 0 0; }
-.recent-live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.recent-live { display: inline-flex; align-items: center; gap: 7px; color: var(--accent); font-size: 11px; white-space: nowrap; }
 .recent-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px var(--green-bg); }
-.recent-limit { margin-top: 18px; }
-.recent-limit .page-button { margin-left: auto; }
-.recent-panel .trending-hint, .recent-panel .validation-error { margin: 10px 0 14px; }
-.recent-panel .state-panel { min-height: 160px; margin: 0; padding: 28px 12px; border-radius: 11px; }
-.recent-list { list-style: none; margin: 0; padding: 0; max-height: calc(100vh - 240px); overflow-y: auto; overscroll-behavior: contain; }
-.recent-row { padding: 13px 2px; border-top: 1px solid var(--border); min-width: 0; }
-.recent-row .resource-name { font-size: 13px; line-height: 1.55; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.recent-row .hash-line { margin-top: 6px; }
-.recent-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 6px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-@media (max-width: 1000px) {
-  .trending-layout { grid-template-columns: minmax(0, 1fr); }
-  .recent-panel { position: static; }
-  .recent-list { max-height: none; overflow: visible; }
-}
+.recent-status { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.recent-row { grid-template-columns: 76px minmax(0, 1fr) 100px; }
+.recent-age { color: var(--accent); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .status-section { padding: 30px 0 42px; }
 .status-banner { display: flex; align-items: center; gap: 18px; padding: 22px 26px; border-radius: 12px; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
 .status-banner.operational { color: var(--green); background: var(--green-bg); }
@@ -291,6 +277,11 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
   .trending-limit .page-button { margin-left: auto; }
   .trending-row { grid-template-columns: 28px minmax(0, 1fr) 70px; padding: 16px 12px; gap: 10px; }
   .trending-row .magnet-button { grid-column: 2 / 4; }
+  .recent-row { grid-template-columns: 64px minmax(0, 1fr); }
+  .recent-row .magnet-button { grid-column: 1 / 3; }
+  .recent-live { display: none; }
+  .recent-status { width: 100%; justify-content: space-between; }
+  .header-nav a > svg { display: none; }
   .trending-hits strong { font-size: 16px; }
   .status-section { padding-top: 20px; }
   .status-banner { padding: 18px; gap: 12px; align-items: flex-start; }

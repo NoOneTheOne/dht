@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/NoOneTheOne/dht/internal/config"
 	mysqlDriver "github.com/go-sql-driver/mysql"
@@ -46,7 +48,11 @@ type Data struct {
 	Length   int64     `gorm:"column:length;default:0" json:"length"`
 	Count    int64     `gorm:"column:count;default:1" json:"count"`
 	Files    []File    `gorm:"column:files;type:json;serializer:json" json:"files,omitempty"`
-	HasFiles bool      `gorm:"column:has_files;->;-:migration" json:"has_files"`
+	// FileNames is the searchable text of Files, see fileNamesText.
+	FileNames *string `gorm:"column:file_names;type:mediumtext" json:"-"`
+	HasFiles  bool    `gorm:"column:has_files;->;-:migration" json:"has_files"`
+	// MatchedFiles marks search hits found only in file names, not the name.
+	MatchedFiles bool `gorm:"column:matched_files;->;-:migration" json:"matched_files,omitempty"`
 }
 
 func (Data) TableName() string {
@@ -82,7 +88,10 @@ func mysqlDSN(c *config.Config) string {
 	dsn.Net = "tcp"
 	dsn.Addr = c.MySQL.Addresses
 	dsn.DBName = c.MySQL.Database
-	dsn.Params = map[string]string{"charset": "utf8mb4"}
+	// With InnoDB's default stopwords, words that are themselves stopwords
+	// ("to", "be", "the", "of", ...) never match a full-text search. The
+	// index and every query use this session setting.
+	dsn.Params = map[string]string{"charset": "utf8mb4", "innodb_ft_enable_stopword": "0"}
 	dsn.ParseTime = true
 	// UTC in every process: trending windows and per-run counts compare
 	// DATETIMEs written by the spider with times computed by the search API.
@@ -295,12 +304,16 @@ func WriteBatch(items []Data) error {
 }
 
 func upsertRows(tx *gorm.DB, values []Data) error {
+	for i := range values {
+		values[i].FileNames = fileNamesText(values[i].Files)
+	}
 	return tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "infohash"}},
 		// MySQL evaluates assignments left to right; inspect the old files before replacing them.
 		DoUpdates: clause.Set{
 			{Column: clause.Column{Name: "count"}, Value: gorm.Expr("COALESCE(`count`, 0) + VALUES(`count`)")},
 			{Column: clause.Column{Name: "length"}, Value: gorm.Expr("IF((`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL') AND JSON_LENGTH(VALUES(`files`)) > 0, VALUES(`length`), `length`)")},
+			{Column: clause.Column{Name: "file_names"}, Value: gorm.Expr("IF((`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL') AND JSON_LENGTH(VALUES(`files`)) > 0, VALUES(`file_names`), `file_names`)")},
 			{Column: clause.Column{Name: "files"}, Value: gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)")},
 		},
 	}).Create(&values).Error
@@ -343,7 +356,11 @@ func WriteBatchWithID(batchID string, items []Data) error {
 			if err := upsertRows(tx, pendingRows); err != nil {
 				return err
 			}
-			return tx.Model(&Observation{}).Where("batch_id = ? AND applied = ?", batchID, false).Update("applied", true).Error
+			// Once applied, an observation only serves idempotency (batch_id,
+			// infohash, applied) and trending (time, count); its file list was
+			// copied to the resource above and would otherwise dominate the table.
+			return tx.Model(&Observation{}).Where("batch_id = ? AND applied = ?", batchID, false).
+				Updates(map[string]interface{}{"applied": true, "files": gorm.Expr("NULL")}).Error
 		})
 		var mysqlErr *mysqlDriver.MySQLError
 		return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1213 || mysqlErr.Number == 1205), err
@@ -393,27 +410,308 @@ func PruneObservations(parent context.Context, before time.Time) (int64, error) 
 
 const SearchPageSize = 50
 
-func Search(parent context.Context, name string, page int) ([]Data, int64, error) {
-	if page < 1 || page > int(^uint(0)>>1)/SearchPageSize {
-		return nil, 0, fmt.Errorf("invalid search page")
-	}
-	results := make([]Data, 0, SearchPageSize)
+// Full-text search schema, built by EnsureSearchIndexes.
+const (
+	nameFulltextIndex   = "idx_name_fulltext"   // (name): ranks name hits first
+	searchFulltextIndex = "idx_search_fulltext" // (name, file_names): filters
+	fileNamesColumn     = "file_names"
+	// fileNamesMaxRunes bounds the file-list text indexed per torrent, so a
+	// few huge episode packs cannot dominate index size and query cost.
+	fileNamesMaxRunes = 2000
+	backfillBatch     = 200
+	searchIndexLock   = "dht_search_indexes"
+)
 
+// EnsureSearchIndexes builds the full-text search schema: an ngram index on
+// name, file_names for rows written before the column existed, and an ngram
+// index over both. Building an index blocks writes for a while (the spider
+// spools and replays them), so call this in the background from one service.
+// A MySQL named lock makes concurrent callers skip. Until it finishes,
+// Search degrades gracefully.
+func EnsureSearchIndexes(ctx context.Context) error {
+	if _, err := GetDBContext(ctx); err != nil { // Runs AutoMigrate: the table must exist.
+		return err
+	}
+	dsn, err := mysqlDriver.ParseDSN(mysqlDSN(getCfg()))
+	if err != nil {
+		return err
+	}
+	dsn.ReadTimeout, dsn.WriteTimeout = 0, 0 // DDL may run far longer than queries.
+	pool, err := sql.Open("mysql", dsn.FormatDSN())
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	pool.SetMaxOpenConns(1) // GET_LOCK is per connection.
+	db, err := gorm.Open(mysql.New(mysql.Config{Conn: pool}), &gorm.Config{Logger: newGORMLogger(), DisableAutomaticPing: true})
+	if err != nil {
+		return err
+	}
+	db = db.WithContext(ctx)
+	var locked int
+	if err := db.Raw("SELECT GET_LOCK(?, 0)", searchIndexLock).Scan(&locked).Error; err != nil {
+		return err
+	}
+	if locked != 1 {
+		slog.Info("search index build already running elsewhere", "component", "mysql")
+		return nil
+	}
+	defer db.Exec("SELECT RELEASE_LOCK(?)", searchIndexLock)
+
+	table := clause.Table{Name: (Data{}).TableName()}
+	step := func(event, sql string, args ...interface{}) error {
+		started := time.Now()
+		if err := db.Exec(sql, args...).Error; err != nil {
+			var mysqlErr *mysqlDriver.MySQLError
+			if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1060 || mysqlErr.Number == 1061) {
+				return nil // Column or index created concurrently.
+			}
+			return fmt.Errorf("%s: %w", event, err)
+		}
+		slog.Info("search index step finished", "component", "mysql", "event", event, "duration_ms", time.Since(started).Milliseconds())
+		return nil
+	}
+	migrator := db.Migrator()
+	if !migrator.HasIndex(&Data{}, nameFulltextIndex) {
+		if err := step("name_fulltext_created", "CREATE FULLTEXT INDEX `"+nameFulltextIndex+"` ON ? (`name`) WITH PARSER ngram", table); err != nil {
+			return err
+		}
+	}
+	if err := backfillFileNames(ctx, db); err != nil {
+		return err
+	}
+	if !migrator.HasIndex(&Data{}, searchFulltextIndex) {
+		if err := step("search_fulltext_created", "CREATE FULLTEXT INDEX `"+searchFulltextIndex+"` ON ? (`name`, `"+fileNamesColumn+"`) WITH PARSER ngram", table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fileNamesText renders a file list as searchable text: every distinct
+// directory and file name once, one per line, capped at fileNamesMaxRunes.
+// Deduplication matters: an episode pack repeats its directory per file.
+func fileNamesText(files []File) *string {
+	if len(files) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var b strings.Builder
+	runes := 0
+	for _, file := range files {
+		for _, segment := range file.Path {
+			segment = strings.Join(strings.Fields(segment), " ") // Keep one name per line.
+			if segment == "" || seen[segment] {
+				continue
+			}
+			seen[segment] = true
+			n := utf8.RuneCountInString(segment)
+			if runes+n > fileNamesMaxRunes {
+				text := b.String()
+				return &text
+			}
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(segment)
+			runes += n + 1
+		}
+	}
+	text := b.String()
+	return &text
+}
+
+// backfillFileNames fills file_names for rows written before it existed.
+func backfillFileNames(ctx context.Context, db *gorm.DB) error {
+	started, filled := time.Now(), 0
+	for {
+		var rows []struct {
+			InfoHash string `gorm:"column:infohash"`
+			Files    []File `gorm:"column:files;serializer:json"`
+		}
+		if err := db.Model(&Data{}).Select("`infohash`, `files`").
+			Where("`file_names` IS NULL AND JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0").
+			Limit(backfillBatch).Find(&rows).Error; err != nil {
+			return fmt.Errorf("backfill file names: %w", err)
+		}
+		for _, row := range rows {
+			text := fileNamesText(row.Files)
+			if text == nil {
+				empty := ""
+				text = &empty // Never revisit rows without usable names.
+			}
+			if err := db.Model(&Data{}).Where("`infohash` = ?", row.InfoHash).Update("file_names", *text).Error; err != nil {
+				return fmt.Errorf("backfill file names: %w", err)
+			}
+		}
+		filled += len(rows)
+		if len(rows) < backfillBatch {
+			if filled > 0 {
+				slog.Info("search index step finished", "component", "mysql", "event", "file_names_backfilled", "rows", filled, "duration_ms", time.Since(started).Milliseconds())
+			}
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
+
+// fulltextTerms splits a search into words for MATCH ... AGAINST, and the
+// words shorter than an ngram token, which only LIKE can match.
+func fulltextTerms(name string) (indexed, short []string) {
+	for _, word := range strings.Fields(name) {
+		word = strings.ReplaceAll(word, `"`, "") // Quotes delimit boolean-mode phrases.
+		switch n := utf8.RuneCountInString(word); {
+		case n == 0:
+		case n < 2:
+			short = append(short, word)
+		default:
+			indexed = append(indexed, word)
+		}
+	}
+	return indexed, short
+}
+
+// booleanPhrases requires every word, each as an ngram phrase: +"a" +"b".
+func booleanPhrases(words []string) string {
+	var b strings.Builder
+	for i, word := range words {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(`+"`)
+		b.WriteString(word)
+		b.WriteByte('"')
+	}
+	return b.String()
+}
+
+// searchMode is how much of the full-text schema a search relies on; Search
+// steps down a mode when the schema is missing (not built yet, or MariaDB).
+type searchMode int
+
+const (
+	searchNameAndFiles searchMode = iota // every word in the name or file names
+	searchNameOnly                       // every word in the name
+	searchLike                           // the whole input as a name substring
+)
+
+// searchClause is a SQL condition with its arguments.
+type searchClause struct {
+	sql  string
+	args []interface{}
+}
+
+func (c *searchClause) and(sql string, args ...interface{}) {
+	if c.sql != "" {
+		c.sql += " AND "
+	}
+	c.sql += sql
+	c.args = append(c.args, args...)
+}
+
+// searchPlan returns the row filter and, when file names are searched, the
+// condition for "matched in the name" used to rank name hits first.
+func searchPlan(name string, mode searchMode) (filter, nameHit searchClause) {
+	indexed, short := fulltextTerms(name)
+	if mode == searchLike || len(indexed) == 0 && mode == searchNameOnly {
+		filter.and("name LIKE ? ESCAPE '|'", "%"+escapeLike(name)+"%")
+		return filter, searchClause{}
+	}
+	files := mode == searchNameAndFiles
+	if len(indexed) == 0 { // Only one-character words.
+		like := "%" + escapeLike(name) + "%"
+		filter.and("(name LIKE ? ESCAPE '|' OR `"+fileNamesColumn+"` LIKE ? ESCAPE '|')", like, like)
+		nameHit.and("name LIKE ? ESCAPE '|'", like)
+		return filter, nameHit
+	}
+	phrases := booleanPhrases(indexed)
+	if files {
+		filter.and("MATCH(`name`, `"+fileNamesColumn+"`) AGAINST (? IN BOOLEAN MODE)", phrases)
+		nameHit.and("MATCH(`name`) AGAINST (? IN BOOLEAN MODE)", phrases)
+	} else {
+		filter.and("MATCH(`name`) AGAINST (? IN BOOLEAN MODE)", phrases)
+	}
+	for _, word := range short {
+		like := "%" + escapeLike(word) + "%"
+		if files {
+			filter.and("(name LIKE ? ESCAPE '|' OR `"+fileNamesColumn+"` LIKE ? ESCAPE '|')", like, like)
+			nameHit.and("name LIKE ? ESCAPE '|'", like)
+		} else {
+			filter.and("name LIKE ? ESCAPE '|'", like)
+		}
+	}
+	if !files {
+		return filter, searchClause{}
+	}
+	return filter, nameHit
+}
+
+// fileSearchBudget bounds each statement that searches file names. Words
+// found in almost every file list ("mkv", "1080p") make ngram phrase search
+// expensive; past the budget, Search answers from names only instead.
+const fileSearchBudget = 1500 * time.Millisecond
+
+// stepDown reports errors after which Search retries in a simpler mode: an
+// absent full-text index (1191) or column (1054), or a file-name search that
+// exceeded its execution budget (3024).
+func stepDown(err error) bool {
+	var mysqlErr *mysqlDriver.MySQLError
+	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1191 || mysqlErr.Number == 1054 || mysqlErr.Number == 3024)
+}
+
+// SearchResult is one page of search results.
+type SearchResult struct {
+	Items []Data
+	Total int64
+	// FilesSearched is false when only names were matched: the file-name
+	// index is not built yet, or the words were too common to search in time.
+	FilesSearched bool
+}
+
+func Search(parent context.Context, name string, page int) (SearchResult, error) {
+	if page < 1 || page > int(^uint(0)>>1)/SearchPageSize {
+		return SearchResult{}, fmt.Errorf("invalid search page")
+	}
 	ctx, cancel := context.WithTimeout(parent, operationTimeout)
 	defer cancel()
 	db, err := GetDBContext(ctx)
 	if err != nil {
-		return nil, 0, err
+		return SearchResult{}, err
 	}
-	escaped := escapeLike(name)
-	query := db.WithContext(ctx).Model(&Data{}).Where("name LIKE ? ESCAPE '|'", "%"+escaped+"%")
+	for mode := searchNameAndFiles; ; mode++ {
+		results, total, err := searchWith(db.WithContext(ctx), name, page, mode)
+		if mode == searchLike || !stepDown(err) {
+			return SearchResult{Items: results, Total: total, FilesSearched: err == nil && mode == searchNameAndFiles}, err
+		}
+	}
+}
 
-	if err := query.Session(&gorm.Session{}).Select("`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files").Order("`time` DESC, `infohash` DESC").Limit(SearchPageSize).Offset((page - 1) * SearchPageSize).Find(&results).Error; err != nil {
+func searchWith(db *gorm.DB, name string, page int, mode searchMode) ([]Data, int64, error) {
+	results := make([]Data, 0, SearchPageSize)
+	filter, nameHit := searchPlan(name, mode)
+	query := db.Model(&Data{}).Where(filter.sql, filter.args...)
+	columns := "`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files"
+	order := "`time` DESC, `infohash` DESC"
+	hint := ""
+	if mode == searchNameAndFiles {
+		hint = fmt.Sprintf("/*+ MAX_EXECUTION_TIME(%d) */ ", fileSearchBudget.Milliseconds())
+	}
+	selection := query.Session(&gorm.Session{})
+	if nameHit.sql != "" {
+		// Name hits first; within each group, newest first.
+		selection = selection.Select(hint+columns+", NOT ("+nameHit.sql+") AS matched_files", nameHit.args...)
+		order = "matched_files ASC, " + order
+	} else {
+		selection = selection.Select(hint + columns)
+	}
+	if err := selection.Order(order).Limit(SearchPageSize).Offset((page - 1) * SearchPageSize).Find(&results).Error; err != nil {
 		return nil, 0, err
 	}
 	total := int64(len(results))
 	if page > 1 || len(results) == SearchPageSize {
-		if err := query.Count(&total).Error; err != nil {
+		if err := query.Session(&gorm.Session{}).Select(hint + "COUNT(*)").Find(&total).Error; err != nil {
 			return nil, 0, err
 		}
 	}

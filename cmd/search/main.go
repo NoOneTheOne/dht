@@ -92,6 +92,8 @@ func main() {
 		slog.Warn("web directory unavailable; serving API only", "path", webDir)
 	}
 
+	go buildSearchIndexes()
+
 	port := os.Getenv("SEARCH_API_PORT")
 	if port == "" {
 		port = "30080"
@@ -132,6 +134,22 @@ func staticHandler(webDir string) gin.HandlerFunc {
 	}
 }
 
+// buildSearchIndexes creates the full-text search schema in the background,
+// retrying until it succeeds; searches degrade gracefully meanwhile.
+func buildSearchIndexes() {
+	for delay := time.Minute; ; delay = min(2*delay, 30*time.Minute) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		err := mysql.EnsureSearchIndexes(ctx)
+		cancel()
+		if err == nil {
+			slog.Info("search indexes ready", "component", "mysql", "event", "search_indexes_ready")
+			return
+		}
+		slog.Warn("search index build failed; retrying", "component", "mysql", "event", "search_indexes_failed", "retry_in", delay.String(), "error", err)
+		time.Sleep(delay)
+	}
+}
+
 func searchHandler(c *gin.Context) {
 	name := c.Query("name")
 	if name == "" {
@@ -156,7 +174,7 @@ func searchHandler(c *gin.Context) {
 	}
 
 	start := time.Now()
-	results, total, err := mysql.Search(c.Request.Context(), name, int(page))
+	result, err := mysql.Search(c.Request.Context(), name, int(page))
 	metrics.RecordMySQLQuery("search", time.Since(start), err)
 	if err != nil {
 		metrics.RecordSearchError("mysql_error")
@@ -164,10 +182,14 @@ func searchHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
-	metrics.RecordSearch(len(results))
+	if result.Items == nil {
+		result.Items = []mysql.Data{}
+	}
+	metrics.RecordSearch(len(result.Items))
 	c.JSON(http.StatusOK, gin.H{
-		"total": total, "items": results,
+		"total": result.Total, "items": result.Items,
 		"page": page, "page_size": mysql.SearchPageSize,
+		"files_searched": result.FilesSearched,
 	})
 }
 

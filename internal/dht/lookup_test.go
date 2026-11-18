@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -109,8 +110,8 @@ func TestPeerLookupDeadlineAndCapacity(t *testing.T) {
 	for i := 0; i < maxPeerLookups; i++ {
 		d.lookups[fmt.Sprintf("%020d", i)] = &peerLookup{}
 	}
-	if err := d.startPeerLookup(hash, nodes); err != ErrQueryNotQueued {
-		t.Fatal("active lookup capacity exceeded")
+	if err := d.startPeerLookup(hash, nodes); !errors.Is(err, ErrLookupCapacity) || !errors.Is(err, ErrQueryNotQueued) {
+		t.Fatalf("active lookup capacity exceeded: %v", err)
 	}
 }
 

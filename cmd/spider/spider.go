@@ -18,23 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NoOneTheOne/dht/internal/basic"
 	"github.com/NoOneTheOne/dht/internal/config"
 	"github.com/NoOneTheOne/dht/internal/dht"
 	"github.com/NoOneTheOne/dht/internal/logging"
 	"github.com/NoOneTheOne/dht/internal/metrics"
 	"github.com/NoOneTheOne/dht/internal/nat"
-	"github.com/NoOneTheOne/dht/internal/storage/es"
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
-
-type bitTorrent struct {
-	Time     time.Time    `json:"@timestamp"`
-	InfoHash string       `json:"infohash"`
-	Name     string       `json:"name"`
-	Files    []mysql.File `json:"files,omitempty"`
-	Length   int64        `json:"length,omitempty"`
-}
 
 func metadataLength(value interface{}) (int64, bool) {
 	switch length := value.(type) {
@@ -281,8 +271,8 @@ func main() {
 		logging.Fatal("port must be 1..65535, worker limits and query timeout must be positive")
 	}
 	var c = config.GetConfig()
-	if c.Storage.Type != "mysql" && c.Storage.Type != "elasticsearch" {
-		logging.Fatalf("unknown storage type %q: use mysql or elasticsearch", c.Storage.Type)
+	if c.Storage.Type != "mysql" {
+		logging.Fatalf("unsupported storage type %q: only mysql is supported", c.Storage.Type)
 	}
 
 	natStop := make(chan struct{})
@@ -301,53 +291,23 @@ func main() {
 	responseDone := make(chan struct{})
 	writeDone := make(chan struct{})
 	pruneDone := make(chan struct{})
-	if c.Storage.Type == "mysql" {
-		spool := recoveryStore()
-		go func() {
-			defer close(pruneDone)
-			pruneObservations(stopping, spool)
-		}()
-		go func() {
-			defer close(writeDone)
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			writeMySQLBatchesToStore(mysqlWrites, ticker.C, nil, mysql.WriteBatchWithID, spool)
-		}()
-	} else {
-		close(pruneDone)
-		close(writeDone)
-	}
+	spool := recoveryStore()
+	go func() {
+		defer close(pruneDone)
+		pruneObservations(stopping, spool)
+	}()
+	go func() {
+		defer close(writeDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		writeMySQLBatchesToStore(mysqlWrites, ticker.C, nil, mysql.WriteBatchWithID, spool)
+	}()
 	items := make(chan mysql.Data, 100)
 	go func() {
 		defer close(responseDone)
 		defer close(mysqlWrites)
 		for item := range items {
-			switch c.Storage.Type {
-			case "mysql":
-				mysqlWrites <- item
-
-			case "elasticsearch":
-				bt := bitTorrent{
-					Time:     item.Time,
-					InfoHash: item.InfoHash,
-					Name:     item.Name,
-					Files:    item.Files,
-					Length:   item.Length,
-				}
-
-				if data, err := json.Marshal(bt); err != nil {
-					basic.CheckError(err)
-				} else {
-					if _, err := es.Write(c.Elasticsearch.Index, "_doc", data); err != nil {
-						basic.CheckError(err)
-					} else {
-						slog.Info("Elasticsearch metadata persisted", "component", "elasticsearch", "infohash", item.InfoHash, "length", item.Length)
-					}
-				}
-
-			default:
-				logging.Fatalf("unknown storage type: %s", c.Storage.Type)
-			}
+			mysqlWrites <- item
 		}
 	}()
 	go w.Run()

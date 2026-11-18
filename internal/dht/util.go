@@ -4,13 +4,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/NoOneTheOne/dht/internal/basic"
 	"github.com/NoOneTheOne/dht/internal/logging"
 )
 
@@ -180,7 +180,7 @@ func getRemoteIP(timeout time.Duration) (ip string, err error) {
 	defer func(Body io.ReadCloser) {
 		closeErr := Body.Close()
 		if closeErr != nil {
-			basic.CheckError(closeErr)
+			slog.Error("close public IP lookup response", "error", closeErr)
 		}
 	}(res.Body)
 
