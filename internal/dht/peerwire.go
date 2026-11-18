@@ -596,11 +596,6 @@ func (wire *Wire) fetchMetadataOnce(r Request, deadline time.Time, encrypt bool)
 	return wire.fetchMetadataConnMode(conn, r, deadline, encrypt)
 }
 
-// fetchMetadataConn runs a plaintext download with a fixed deadline.
-func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) error {
-	return wire.fetchMetadataConnMode(raw, r, deadline, false)
-}
-
 // fetchMetadataConnMode runs a download with a fixed deadline, including writes.
 func (wire *Wire) fetchMetadataConnMode(raw net.Conn, r Request, deadline time.Time, encrypt bool) (result error) {
 	stage, started := "handshake", time.Now()

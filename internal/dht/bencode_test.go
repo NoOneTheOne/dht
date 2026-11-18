@@ -86,19 +86,19 @@ func TestDecodeInt(t *testing.T) {
 }
 
 func TestDecodeList(t *testing.T) {
-	result, _, err := DecodeList([]byte("l5:helloi42ee"), 0)
+	result, err := Decode([]byte("l5:helloi42ee"))
 	if err != nil {
-		t.Fatalf("DecodeList() error = %v", err)
+		t.Fatalf("Decode(list) error = %v", err)
 	}
 	list := result.([]interface{})
 	if len(list) != 2 {
-		t.Fatalf("DecodeList() len = %d, want 2", len(list))
+		t.Fatalf("Decode(list) len = %d, want 2", len(list))
 	}
 	if list[0].(string) != "hello" {
-		t.Errorf("DecodeList()[0] = %v, want hello", list[0])
+		t.Errorf("Decode(list)[0] = %v, want hello", list[0])
 	}
 	if list[1].(int) != 42 {
-		t.Errorf("DecodeList()[1] = %v, want 42", list[1])
+		t.Errorf("Decode(list)[1] = %v, want 42", list[1])
 	}
 }
 
@@ -148,20 +148,20 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 }
 
 func TestEncodeString(t *testing.T) {
-	if got := EncodeString("hello"); got != "5:hello" {
-		t.Errorf("EncodeString(hello) = %v, want 5:hello", got)
+	if got := Encode("hello"); got != "5:hello" {
+		t.Errorf("Encode(hello) = %v, want 5:hello", got)
 	}
-	if got := EncodeString(""); got != "0:" {
-		t.Errorf("EncodeString() = %v, want 0:", got)
+	if got := Encode(""); got != "0:" {
+		t.Errorf("Encode(\"\") = %v, want 0:", got)
 	}
 }
 
 func TestEncodeInt(t *testing.T) {
-	if got := EncodeInt(42); got != "i42e" {
-		t.Errorf("EncodeInt(42) = %v, want i42e", got)
+	if got := Encode(42); got != "i42e" {
+		t.Errorf("Encode(42) = %v, want i42e", got)
 	}
-	if got := EncodeInt(0); got != "i0e" {
-		t.Errorf("EncodeInt(0) = %v, want i0e", got)
+	if got := Encode(0); got != "i0e" {
+		t.Errorf("Encode(0) = %v, want i0e", got)
 	}
 }
 
@@ -512,4 +512,9 @@ func TestEncodeDecodeTypes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// DecodeList was moved from production code: only tests decode a list prefix directly.
+func DecodeList(data []byte, start int) (result interface{}, index int, err error) {
+	return decodeList(data, start, 0)
 }

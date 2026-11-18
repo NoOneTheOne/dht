@@ -113,12 +113,6 @@ func decodeItem(data []byte, i, depth int) (
 	}
 }
 
-// DecodeList decodes a list prefix and returns the position after its closing 'e'.
-func DecodeList(data []byte, start int) (
-	result interface{}, index int, err error) {
-	return decodeList(data, start, 0)
-}
-
 func decodeList(data []byte, start, depth int) (
 	result interface{}, index int, err error) {
 
@@ -229,16 +223,6 @@ func Decode(data []byte) (result interface{}, err error) {
 		return nil, errors.New("trailing data after bencode value")
 	}
 	return result, nil
-}
-
-// EncodeString encodes a string value.
-func EncodeString(data string) string {
-	return strconv.Itoa(len(data)) + ":" + data
-}
-
-// EncodeInt encodes a int value.
-func EncodeInt(data int) string {
-	return "i" + strconv.Itoa(data) + "e"
 }
 
 // Encode encodes a string, int, dict or list value to a bencoded string.

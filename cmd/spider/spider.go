@@ -129,22 +129,12 @@ func torrentMetadata(info map[string]interface{}) (mysql.Data, bool) {
 	return mysql.Data{Name: name, Files: files, Length: length}, true
 }
 
-func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
-	writeMySQLBatchesWithRecovery(input, ticks, nil, func(_ string, items []mysql.Data) error {
-		return write(items)
-	})
-}
-
 func recoveryStore() *mysql.RecoveryStore {
 	path := os.Getenv("RECOVERY_FILE_PATH")
 	if path == "" {
 		path = filepath.Join(os.TempDir(), "dht-spider-recovery.jsonl")
 	}
 	return mysql.NewRecoveryStore(path)
-}
-
-func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
-	writeMySQLBatchesToStore(input, ticks, stop, write, recoveryStore())
 }
 
 // writeSplit retries a permanently rejected batch item by item, so one bad

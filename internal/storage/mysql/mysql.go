@@ -198,10 +198,6 @@ func openDB(parent context.Context) (*gorm.DB, error) {
 	return candidate, nil
 }
 
-func Write(d *Data) error {
-	return WriteBatch([]Data{*d})
-}
-
 // ErrInvalidItem marks items rejected before reaching MySQL.
 var ErrInvalidItem = errors.New("invalid metadata item")
 
@@ -293,14 +289,6 @@ func NewBatchID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(id[:]), nil
-}
-
-func WriteBatch(items []Data) error {
-	batchID, err := NewBatchID()
-	if err != nil {
-		return err
-	}
-	return WriteBatchWithID(batchID, items)
 }
 
 // upsertRows writes one INSERT ... ON DUPLICATE KEY UPDATE statement per row.

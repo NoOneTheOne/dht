@@ -77,10 +77,6 @@ func (check *reachabilityCheck) wait(ctx context.Context) (*net.UDPAddr, bool) {
 	return addr, check.responses
 }
 
-func (check *reachabilityCheck) logStartup(port int) {
-	check.logStartupContext(context.Background(), port)
-}
-
 func (check *reachabilityCheck) logStartupContext(parent context.Context, port int) {
 	log.Printf("[DHT Reachability] Checking public UDP ingress to local port %d for 30s", port)
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)

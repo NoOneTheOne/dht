@@ -154,3 +154,9 @@ func TestReachabilityConcurrent(t *testing.T) {
 	check.wait(ctx)
 	wg.Wait()
 }
+
+// Test helpers moved from production code: only tests call them.
+
+func (check *reachabilityCheck) logStartup(port int) {
+	check.logStartupContext(context.Background(), port)
+}

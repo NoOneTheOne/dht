@@ -1239,3 +1239,10 @@ func TestPeerWireMetadataFlowWithLargeBitfieldAndHash(t *testing.T) {
 		})
 	}
 }
+
+// Test helpers moved from production code: only tests call them.
+
+// fetchMetadataConn runs a plaintext download with a fixed deadline.
+func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) error {
+	return wire.fetchMetadataConnMode(raw, r, deadline, false)
+}

@@ -31,7 +31,6 @@ main { flex: 1; }
 .eyebrow { color: var(--accent); font-size: 10px; letter-spacing: .19em; font-weight: 650; }
 h1 { font-size: clamp(30px, 4vw, 46px); letter-spacing: -.04em; font-weight: 700; line-height: 1.4; margin: 18px 0 14px; }
 h1 span { color: var(--accent); }
-.hero-description { color: var(--muted); font-size: 14px; line-height: 1.8; margin: 0 0 30px; }
 .search-form { max-width: 740px; margin: auto; text-align: left; }
 .search-box { display: flex; align-items: center; gap: 14px; padding: 8px 8px 8px 22px; border: 1px solid var(--border); background: var(--surface); border-radius: 14px; box-shadow: 0 12px 45px var(--shadow); }
 .search-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--soft); }
@@ -235,7 +234,6 @@ a.resource-name { text-decoration: underline; text-decoration-color: var(--borde
   .hero { padding: 44px 0 28px; }
   .hero .eyebrow { font-size: 8px; }
   h1 { font-size: 29px; margin: 16px 0; }
-  .hero-description { font-size: 12px; margin-bottom: 24px; }
   .search-box { gap: 9px; padding: 6px 6px 6px 12px; border-radius: 11px; }
   .search-box > svg { width: 18px; }
   .search-box input { font-size: 16px; }

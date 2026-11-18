@@ -369,8 +369,8 @@ func TestGetDBContextWaitCanCancel(t *testing.T) {
 func TestOperationsPropagateInitializationError(t *testing.T) {
 	failure := errors.New("backend unavailable")
 	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return nil, failure })
-	if err := Write(&Data{Name: "test", InfoHash: strings.Repeat("a", 40)}); !errors.Is(err, failure) {
-		t.Fatalf("Write error = %v, want initialization failure", err)
+	if err := WriteBatch([]Data{{Name: "test", InfoHash: strings.Repeat("a", 40)}}); !errors.Is(err, failure) {
+		t.Fatalf("WriteBatch error = %v, want initialization failure", err)
 	}
 	if result, err := Search(context.Background(), "test", 1); result.Items != nil || result.Total != 0 || !errors.Is(err, failure) {
 		t.Fatalf("Search = (%v, %d, %v), want nil, zero and initialization failure", result.Items, result.Total, err)
@@ -1259,4 +1259,14 @@ func TestSearchFallsBackToNamesWhenFileSearchTimesOut(t *testing.T) {
 	if len(sqls) != 2 || !strings.Contains(sqls[1], "MATCH(`name`) AGAINST") || strings.Contains(sqls[1], "MAX_EXECUTION_TIME") {
 		t.Fatalf("expected an unbounded name-only retry, got %q", sqls)
 	}
+}
+
+// Test helpers moved from production code: only tests call them.
+
+func WriteBatch(items []Data) error {
+	batchID, err := NewBatchID()
+	if err != nil {
+		return err
+	}
+	return WriteBatchWithID(batchID, items)
 }

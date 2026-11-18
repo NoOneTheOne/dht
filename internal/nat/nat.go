@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -371,26 +370,6 @@ func (am *AutoMap) Map(protocol string, externalPort, internalPort int, desc str
 	return &copy, nil
 }
 
-// Unmap removes a port mapping
-func (am *AutoMap) Unmap(protocol string, externalPort, internalPort int) error {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	key := mappingKey(protocol, externalPort, internalPort)
-	m, ok := am.mappings[key]
-	if !ok {
-		return nil
-	}
-
-	err := am.nat.DeletePortMapping(m.Protocol, m.External, m.Internal)
-	if err != nil {
-		return err
-	}
-
-	delete(am.mappings, key)
-	return nil
-}
-
 // GetMapping returns a specific mapping
 func (am *AutoMap) GetMapping(protocol string, externalPort, internalPort int) (*Mapping, bool) {
 	am.mu.RLock()
@@ -403,19 +382,6 @@ func (am *AutoMap) GetMapping(protocol string, externalPort, internalPort int) (
 	}
 	copy := *m
 	return &copy, true
-}
-
-// GetAllMappings returns all active mappings
-func (am *AutoMap) GetAllMappings() []*Mapping {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
-
-	mappings := make([]*Mapping, 0, len(am.mappings))
-	for _, m := range am.mappings {
-		copy := *m
-		mappings = append(mappings, &copy)
-	}
-	return mappings
 }
 
 // Stop stops the auto-refresh loop
@@ -514,96 +480,4 @@ func (am *AutoMap) refreshMappings() {
 
 func mappingKey(protocol string, external, internal int) string {
 	return fmt.Sprintf("%s:%d:%d", protocol, external, internal)
-}
-
-// GetLocalIP returns the local IP address
-func GetLocalIP() (net.IP, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-
-			if ip.To4() != nil {
-				return ip, nil
-			}
-		}
-	}
-
-	return nil, errors.New("no local IP found")
-}
-
-// IsPrivateIP checks if an IP is in private range
-func IsPrivateIP(ip net.IP) bool {
-	privateRanges := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"fc00::/7",
-	}
-
-	for _, cidr := range privateRanges {
-		_, network, _ := net.ParseCIDR(cidr)
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// DetectNATType attempts to detect the NAT type
-func DetectNATType() string {
-	localIP, err := GetLocalIP()
-	if err != nil {
-		return "unknown"
-	}
-
-	if IsPrivateIP(localIP) {
-		nat, err := Discover()
-		if err != nil {
-			return "symmetric"
-		}
-
-		extIP, err := nat.GetExternalAddress()
-		if err != nil {
-			return "symmetric"
-		}
-
-		if extIP.Equal(localIP) {
-			return "none"
-		}
-		return "NAT"
-	}
-
-	return "none"
-}
-
-// ParsePort parses a port string to int
-func ParsePort(port string) (int, error) {
-	return strconv.Atoi(port)
 }

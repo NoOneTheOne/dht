@@ -217,3 +217,15 @@ func TestTorrentFiles(t *testing.T) {
 		})
 	}
 }
+
+// Test helpers moved from production code: only tests call them.
+
+func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
+	writeMySQLBatchesWithRecovery(input, ticks, nil, func(_ string, items []mysql.Data) error {
+		return write(items)
+	})
+}
+
+func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
+	writeMySQLBatchesToStore(input, ticks, stop, write, recoveryStore())
+}
