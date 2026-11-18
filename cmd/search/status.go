@@ -42,12 +42,18 @@ var (
 	statusTTL          = 10 * time.Second
 	statusFetchTimeout = 4 * time.Second
 	statusCountTimeout = 10 * time.Second
+	// statusStaleGrace is how long past its TTL a cached status may still be
+	// served instantly while it refreshes. Older caches (the first visit after
+	// an idle period) wait up to statusStaleWait for the fresh status instead,
+	// so the page never opens on data that may be hours old.
+	statusStaleGrace = 10 * time.Second
+	statusStaleWait  = 5 * time.Second
 )
 
 // statusHandler serves a cached system status. One background refresh runs
 // at a time on its own timeouts, so slow backends never hold a lock across
 // requests and a disconnecting client cannot abort or poison the refresh.
-// Requests are only made to wait when no status has been built yet.
+// Requests wait (bounded) only when the cache is missing or long expired.
 func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), count func(context.Context, time.Time) (mysql.ResourceCounts, error)) gin.HandlerFunc {
 	var mu sync.Mutex
 	var cached metrics.SystemStatus
@@ -55,10 +61,14 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 	var expires, countExpires, countedStart time.Time
 	var totals *mysql.ResourceCounts
 	var refreshing chan struct{}
+	// Read the budgets once: refreshes outlive requests, so tests may restore
+	// the package variables while one is still running.
+	ttl, fetchTimeout, countTimeout := statusTTL, statusFetchTimeout, statusCountTimeout
+	staleGrace, staleWait := statusStaleGrace, statusStaleWait
 
 	refresh := func(done chan struct{}) {
 		defer close(done)
-		fetchCtx, cancel := context.WithTimeout(context.Background(), statusFetchTimeout)
+		fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 		crawler, err := fetch(fetchCtx)
 		cancel()
 		if err != nil {
@@ -75,7 +85,7 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 		mu.Unlock()
 
 		if refreshCount {
-			countCtx, cancel := context.WithTimeout(context.Background(), statusCountTimeout)
+			countCtx, cancel := context.WithTimeout(context.Background(), countTimeout)
 			value, err := count(countCtx, startedAt)
 			cancel()
 			nextTotals = nil
@@ -106,7 +116,7 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 			}
 		}
 		cached, hasCache = next, true
-		expires = time.Now().Add(statusTTL)
+		expires = time.Now().Add(ttl)
 		refreshing = nil
 	}
 
@@ -128,16 +138,24 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 			go refresh(refreshing)
 		}
 		wait := refreshing
-		if hasCache {
-			// Serve the previous status while the refresh runs.
+		if hasCache && time.Now().Before(expires.Add(staleGrace)) {
+			// Recently expired: serve it while the refresh runs.
 			status := cached
 			mu.Unlock()
 			respond(c, status)
 			return
 		}
+		stale := hasCache
 		mu.Unlock()
+		var deadline <-chan time.Time
+		if stale {
+			timer := time.NewTimer(staleWait)
+			defer timer.Stop()
+			deadline = timer.C
+		}
 		select {
 		case <-wait:
+		case <-deadline: // Refresh is slow: fall back to the stale status.
 		case <-c.Request.Context().Done():
 			return
 		}

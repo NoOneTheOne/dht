@@ -29,7 +29,8 @@ export default function Trending() {
   useEffect(() => {
     const controller = new AbortController();
     let timedOut = false;
-    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+    // The first ranking of a window is computed on demand and may take a while; later ones are cached.
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 60000);
     setLoading(true); setError(''); setData(null);
     void (async () => {
       try {

@@ -139,6 +139,21 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 			t.Fatalf("index %s missing", index)
 		}
 	}
+	if !db.Migrator().HasIndex(&Observation{}, observationRankIndex) {
+		t.Fatal("trending covering index missing")
+	}
+	// The ranking must be an index-only range scan of the covering index.
+	var plan []struct {
+		Key   *string `gorm:"column:key"`
+		Extra *string `gorm:"column:Extra"`
+	}
+	if err := db.Raw("EXPLAIN SELECT infohash, SUM(count) FROM `"+(Observation{}).TableName()+"` FORCE INDEX ("+observationRankIndex+") WHERE applied = 1 AND time >= ? GROUP BY infohash", time.Now().Add(-time.Hour)).Scan(&plan).Error; err != nil ||
+		len(plan) != 1 || plan[0].Extra == nil || !strings.Contains(*plan[0].Extra, "Using index") {
+		t.Fatalf("trending plan is not index-only: %+v %v", plan, err)
+	}
+	if again, err := Trending(ctx, 7*24*time.Hour, 10, time.Now().Add(time.Minute)); err != nil || len(again) < len(trending) {
+		t.Fatalf("trending after covering index: %v %v", again, err)
+	}
 
 	for _, tc := range []struct {
 		query    string

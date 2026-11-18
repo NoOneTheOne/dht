@@ -62,12 +62,12 @@ func TestTrendingHandler(t *testing.T) {
 		t.Run(tc.query, func(t *testing.T) {
 			calls := 0
 			router := gin.New()
-			router.GET("/api/trending", trendingHandler(func(ctx context.Context, window time.Duration, limit int, until time.Time) ([]mysql.Data, error) {
+			router.GET("/api/trending", trendingHandler(func(ctx context.Context, window time.Duration, limit int) ([]mysql.Data, time.Time, error) {
 				calls++
-				if window != tc.window || limit != tc.limit || time.Since(until) > time.Second {
+				if window != tc.window || limit != tc.limit {
 					t.Fatal("invalid ranking bounds")
 				}
-				return nil, nil
+				return nil, time.Now(), nil
 			}))
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, httptest.NewRequest("GET", "/api/trending?"+tc.query, nil))
@@ -86,8 +86,8 @@ func TestTrendingHandler(t *testing.T) {
 
 func TestTrendingHandlerFailure(t *testing.T) {
 	router := gin.New()
-	router.GET("/api/trending", trendingHandler(func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error) {
-		return nil, errors.New("secret backend error")
+	router.GET("/api/trending", trendingHandler(func(context.Context, time.Duration, int) ([]mysql.Data, time.Time, error) {
+		return nil, time.Time{}, errors.New("secret backend error")
 	}))
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest("GET", "/api/trending", nil))

@@ -30,10 +30,17 @@ func stubInitialization(t *testing.T, init func(context.Context) (*gorm.DB, erro
 	previousDB, previousInit, previousRound := db, initDB, dbStarting
 	db, initDB, dbStarting = nil, init, nil
 	dbMu.Unlock()
+	analyticsMu.Lock()
+	previousAnalytics, previousOpenAnalytics := analyticsDB, openAnalytics
+	analyticsDB, openAnalytics = nil, func(base *gorm.DB) (*gorm.DB, error) { return base, nil }
+	analyticsMu.Unlock()
 	t.Cleanup(func() {
 		dbMu.Lock()
 		db, initDB, dbStarting = previousDB, previousInit, previousRound
 		dbMu.Unlock()
+		analyticsMu.Lock()
+		analyticsDB, openAnalytics = previousAnalytics, previousOpenAnalytics
+		analyticsMu.Unlock()
 	})
 }
 

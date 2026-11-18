@@ -52,7 +52,8 @@ func main() {
 
 	router.GET("/search", searchHandler)
 	router.GET("/api/status", statusHandler(crawlerStatusGetter(), mysql.CountResources))
-	router.GET("/api/trending", trendingHandler(mysql.Trending))
+	trending := newTrendingCache(mysql.Trending)
+	router.GET("/api/trending", trendingHandler(trending.lookup))
 	router.GET("/api/recent", recentHandler(mysql.Recent))
 	router.GET("/api/torrents/:infohash", detailHandler(mysql.Detail))
 
@@ -93,6 +94,7 @@ func main() {
 	}
 
 	go buildSearchIndexes()
+	go trending.warm()
 
 	port := os.Getenv("SEARCH_API_PORT")
 	if port == "" {
@@ -193,19 +195,20 @@ func searchHandler(c *gin.Context) {
 	})
 }
 
-func trendingHandler(lookup func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error)) gin.HandlerFunc {
+// trendingHandler serves rankings; lookup returns them with their computation time.
+func trendingHandler(lookup func(context.Context, time.Duration, int) ([]mysql.Data, time.Time, error)) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		period := c.DefaultQuery("window", "24h")
 		windows := map[string]time.Duration{"1h": time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour}
 		window, ok := windows[period]
 		limit, err := strconv.Atoi(c.DefaultQuery("limit", "10"))
-		if !ok || err != nil || limit < 1 || limit > 100 {
+		if !ok || err != nil || limit < 1 || limit > trendingLimitMax {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "window must be 1h, 24h or 7d; limit must be 1..100"})
 			return
 		}
-		until := time.Now()
-		items, err := lookup(c.Request.Context(), window, limit, until)
-		metrics.RecordMySQLQuery("trending", time.Since(until), err)
+		start := time.Now()
+		items, until, err := lookup(c.Request.Context(), window, limit)
+		metrics.RecordMySQLQuery("trending", time.Since(start), err)
 		if err != nil {
 			slog.ErrorContext(c.Request.Context(), "trending lookup failed", "component", "mysql", "event", "trending_failed", "window", period, "limit", limit, "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})

@@ -418,6 +418,8 @@ const (
 	fileNamesMaxRunes = 2000
 	backfillBatch     = 200
 	searchIndexLock   = "dht_search_indexes"
+	// observationRankIndex covers the trending aggregation.
+	observationRankIndex = "idx_observation_rank"
 	// searchIndexGeneration tags the full-text indexes (as their comment).
 	// Bump it to make EnsureSearchIndexes rebuild them. v2: rebuilt after the
 	// multi-row upsert bug left new rows out of the v1 indexes.
@@ -492,6 +494,20 @@ func EnsureSearchIndexes(ctx context.Context) error {
 			}
 		}
 		return step(event, "CREATE FULLTEXT INDEX `"+index+"` ON ? ("+columns+") WITH PARSER ngram COMMENT '"+searchIndexGeneration+"'", table)
+	}
+	// Trending aggregates (infohash, count) over a time range of applied
+	// observations; covering those columns makes it an index-only range scan
+	// instead of a primary-key lookup per observation. Built online.
+	var rankIndexes int64
+	observations := clause.Table{Name: (Observation{}).TableName()}
+	if err := db.Raw("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+		observations.Name, observationRankIndex).Scan(&rankIndexes).Error; err != nil {
+		return err
+	}
+	if rankIndexes == 0 {
+		if err := step("observation_rank_index_created", "CREATE INDEX `"+observationRankIndex+"` ON ? (`applied`, `time`, `infohash`, `count`) ALGORITHM=INPLACE LOCK=NONE", observations); err != nil {
+			return err
+		}
 	}
 	if err := ensureIndex(nameFulltextIndex, "`name`", "name_fulltext_created"); err != nil {
 		return err
@@ -736,9 +752,9 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 	if (window != time.Hour && window != 24*time.Hour && window != 7*24*time.Hour) || limit < 1 || limit > 100 {
 		return nil, fmt.Errorf("invalid trending parameters")
 	}
-	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	ctx, cancel := context.WithTimeout(parent, TrendingTimeout)
 	defer cancel()
-	db, err := GetDBContext(ctx)
+	db, err := analyticsDBContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -753,6 +769,59 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 		Joins("JOIN (?) AS ranked ON ranked.infohash = resources.infohash", ranked).
 		Order("ranked.hits DESC, resources.infohash ASC").Find(&items).Error
 	return items, err
+}
+
+// TrendingTimeout bounds one ranking query. Aggregating a 7-day window reads
+// every observation in it, which can exceed the 5s socket read timeout of the
+// main pool, so rankings run on a small pool of their own (analyticsDBContext)
+// and callers should cache the result rather than query per request.
+const TrendingTimeout = 2 * time.Minute
+
+var (
+	analyticsMu   sync.Mutex
+	analyticsDB   *gorm.DB
+	openAnalytics = openAnalyticsDB
+)
+
+// analyticsDBContext returns the pool for long aggregate queries, opening it
+// on first use after the main pool has migrated the schema.
+func analyticsDBContext(parent context.Context) (*gorm.DB, error) {
+	ctx, cancel := context.WithTimeout(parent, operationTimeout) // Initialization only.
+	defer cancel()
+	base, err := GetDBContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	analyticsMu.Lock()
+	defer analyticsMu.Unlock()
+	if analyticsDB == nil {
+		if analyticsDB, err = openAnalytics(base); err != nil {
+			return nil, err
+		}
+	}
+	return analyticsDB, nil
+}
+
+func openAnalyticsDB(*gorm.DB) (*gorm.DB, error) {
+	dsn, err := mysqlDriver.ParseDSN(mysqlDSN(getCfg()))
+	if err != nil {
+		return nil, err
+	}
+	// The query context, not the socket, bounds these queries.
+	dsn.ReadTimeout = TrendingTimeout + 10*time.Second
+	pool, err := sql.Open("mysql", dsn.FormatDSN())
+	if err != nil {
+		return nil, fmt.Errorf("open MySQL analytics pool: %w", err)
+	}
+	pool.SetMaxOpenConns(3)
+	pool.SetMaxIdleConns(1)
+	pool.SetConnMaxLifetime(time.Hour)
+	candidate, err := gorm.Open(mysql.New(mysql.Config{Conn: pool, SkipInitializeWithVersion: true}), &gorm.Config{Logger: newGORMLogger(), DisableAutomaticPing: true})
+	if err != nil {
+		_ = pool.Close()
+		return nil, fmt.Errorf("connect MySQL analytics pool: %w", err)
+	}
+	return candidate, nil
 }
 
 // RecentLimitMax bounds the recent-resources list.

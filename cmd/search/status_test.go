@@ -155,6 +155,47 @@ func TestStatusConcurrentRequestsShareOneRefresh(t *testing.T) {
 	}
 }
 
+func TestStatusLongExpiredCacheWaitsForRefresh(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalTTL, originalGrace, originalWait := statusTTL, statusStaleGrace, statusStaleWait
+	statusTTL, statusStaleGrace, statusStaleWait = time.Millisecond, 20*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { statusTTL, statusStaleGrace, statusStaleWait = originalTTL, originalGrace, originalWait })
+	var calls atomic.Int32
+	var slow atomic.Bool
+	handler := statusHandler(func(context.Context) (*metrics.CrawlerStatus, error) {
+		n := calls.Add(1)
+		if slow.Load() {
+			time.Sleep(time.Second)
+		}
+		return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual", Collected: int64(n)}, nil
+	}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
+		return mysql.ResourceCounts{Total: 1}, nil
+	})
+	router := gin.New()
+	router.GET("/api/status", handler)
+	get := func() int64 {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+		var status metrics.SystemStatus
+		if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil || status.Crawler == nil {
+			t.Fatalf("bad response: %s", recorder.Body)
+		}
+		return status.Crawler.Collected
+	}
+	get()
+	time.Sleep(50 * time.Millisecond) // Past TTL and grace: like a first visit after idling.
+	if got := get(); got != 2 {
+		t.Fatalf("long-expired cache served instead of fresh status: collected=%d", got)
+	}
+	slow.Store(true)
+	time.Sleep(50 * time.Millisecond)
+	started := time.Now()
+	if got := get(); got != 2 || time.Since(started) > 800*time.Millisecond {
+		t.Fatalf("slow refresh not bounded by stale wait: collected=%d after %v", got, time.Since(started))
+	}
+}
+
 func TestStaticHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	webDir := t.TempDir()

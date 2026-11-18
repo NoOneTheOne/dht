@@ -225,7 +225,7 @@ GET /search?name={关键词}&page={页码}
 GET /api/trending?window={1h|24h|7d}&limit={1..100}
 ```
 
-按时间窗口内的采集次数排序，默认 `window=24h`、`limit=10`。返回 `items`（字段同搜索，`count` 为窗口内次数）及 `window`、`limit`、`since`、`until`。
+按时间窗口内的采集次数排序，默认 `window=24h`、`limit=10`。返回 `items`（字段同搜索，`count` 为窗口内次数）及 `window`、`limit`、`since`、`until`。排行由 Search 在后台计算前 100 名并缓存（1h 窗口 1 分钟、24h 窗口 5 分钟、7d 窗口 15 分钟），`until` 为本次排行的计算时间；启动后首次计算完成前，请求会等待结果。热榜查询使用覆盖索引 `idx_observation_rank`，由 Search 启动后在后台在线创建。
 
 ### 最近收录
 
@@ -249,7 +249,7 @@ GET /api/torrents/{infohash}
 GET /api/status
 ```
 
-汇总采集进程状态（经 `SPIDER_STATUS_URL` 获取）与收录统计，后台每 10 秒刷新。`status` 为 `operational`、`degraded` 或 `outage`，`issues` 列出具体问题。
+汇总采集进程状态（经 `SPIDER_STATUS_URL` 获取）与收录统计，缓存 10 秒。缓存刚过期时先返回旧值并在后台刷新；过期已久（如空闲后首次访问）时最多等待 5 秒取得最新状态。`status` 为 `operational`、`degraded` 或 `outage`，`issues` 列出具体问题。
 
 ### 健康检查
 
