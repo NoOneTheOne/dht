@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,9 @@ type InitParam struct {
 	Network string
 	// format is `ip:port`
 	Address string
+	// PublicIP is the address other nodes see; it seeds the BEP-42 node ID.
+	// When empty it is looked up once at startup.
+	PublicIP string
 	// the prime nodes through which we can join in dht network
 	PrimeNodes    []string
 	NodeCachePath string
@@ -138,42 +142,53 @@ func NewCrawlConfig() *InitParam {
 // DHT represents a DHT node.
 type DHT struct {
 	*InitParam
-	node               *node
-	conn               *net.UDPConn
-	routingTable       *routingTable
-	transactionManager *transactionManager
-	peersManager       *peersManager
-	tokenManager       *tokenManager
-	blackList          *blackList
-	bootstrapMgr       *bootstrapManager
-	verifiedNodes      *verifiedNodeStore
-	lookupMu           sync.Mutex
-	lookups            map[string]*peerLookup
-	reachability       *reachabilityCheck
-	ready              atomic.Bool
-	refreshing         atomic.Bool
-	packets            chan packet
-	workerTokens       chan struct{}
-	stopOnce           sync.Once
-	runOnce            sync.Once
-	stop               chan struct{}
-	stopped            chan struct{}
-	background         sync.WaitGroup
-	packetWorkers      sync.WaitGroup
-	listenerDone       chan struct{}
-	ctx                context.Context
-	cancel             context.CancelFunc
+	node                *node
+	conn                *net.UDPConn
+	routingTable        *routingTable
+	transactionManager  *transactionManager
+	peersManager        *peersManager
+	tokenManager        *tokenManager
+	blackList           *blackList
+	bootstrapMgr        *bootstrapManager
+	verifiedNodes       *verifiedNodeStore
+	lookupMu            sync.Mutex
+	lookups             map[string]*peerLookup
+	reachability        *reachabilityCheck
+	ready               atomic.Bool
+	refreshing          atomic.Bool
+	packets             chan packet
+	activePacketWorkers atomic.Int32
+	stopOnce            sync.Once
+	runOnce             sync.Once
+	stop                chan struct{}
+	stopped             chan struct{}
+	background          sync.WaitGroup
+	packetWorkers       sync.WaitGroup
+	listenerDone        chan struct{}
+	ctx                 context.Context
+	cancel              context.CancelFunc
 }
 
 // New returns a DHT pointer. If config is nil, then config will be set to
 // the default config.
 func New(initParam *InitParam) *DHT {
-	// Generate BEP-42 compliant node ID based on local IP
-	localIP, err := getLocalIP()
-	if err != nil {
-		localIP = net.ParseIP("127.0.0.1")
+	// BEP-42 binds the node ID to the IP other nodes see, i.e. the public
+	// one; a private interface address would yield a non-compliant ID.
+	publicIP := net.ParseIP(strings.TrimSpace(initParam.PublicIP))
+	if publicIP == nil {
+		if remote, err := getRemoteIP(5 * time.Second); err == nil {
+			publicIP = net.ParseIP(remote)
+		}
 	}
-	nodeID := generateNodeID(localIP)
+	idIP := publicIP
+	if idIP == nil {
+		log.Printf("[DHT] Public IP unknown; set DHT_PUBLIC_IP for a BEP-42 compliant node ID")
+		var err error
+		if idIP, err = getLocalIP(); err != nil {
+			idIP = net.ParseIP("127.0.0.1")
+		}
+	}
+	nodeID := generateNodeID(idIP)
 
 	node, err := newNode(nodeID, initParam.Network, initParam.Address)
 	if err != nil {
@@ -181,29 +196,24 @@ func New(initParam *InitParam) *DHT {
 	}
 
 	d := &DHT{
-		InitParam:    initParam,
-		node:         node,
-		blackList:    newBlackList(initParam.BlackListMaxSize),
-		packets:      make(chan packet, initParam.PacketJobLimit),
-		workerTokens: make(chan struct{}, initParam.PacketWorkerLimit),
-		stop:         make(chan struct{}),
-		stopped:      make(chan struct{}),
+		InitParam: initParam,
+		node:      node,
+		blackList: newBlackList(initParam.BlackListMaxSize),
+		packets:   make(chan packet, initParam.PacketJobLimit),
+		stop:      make(chan struct{}),
+		stopped:   make(chan struct{}),
 	}
 
+	// Never route queries to ourselves.
 	for _, ip := range initParam.BlockedIPs {
 		d.blackList.insert(ip, -1)
 	}
-
-	go func() {
-		for _, ip := range getLocalIPs() {
-			d.blackList.insert(ip, -1)
-		}
-
-		ip, err := getRemoteIP()
-		if err == nil && ip != "" {
-			d.blackList.insert(ip, -1)
-		}
-	}()
+	for _, ip := range getLocalIPs() {
+		d.blackList.insert(ip, -1)
+	}
+	if publicIP != nil {
+		d.blackList.insert(publicIP.String(), -1)
+	}
 
 	return d
 }
@@ -238,7 +248,6 @@ func (dht *DHT) init() {
 	dht.reachability = newReachabilityCheck()
 
 	dht.background.Go(dht.transactionManager.run)
-	dht.background.Go(dht.tokenManager.clear)
 	dht.background.Go(func() { dht.blackList.clear(dht.stop) })
 }
 
@@ -367,7 +376,10 @@ func (dht *DHT) RunContext(ctx context.Context) {
 	})
 	dht.background.Go(dht.join)
 
-	var pkt packet
+	for i := 0; i < max(1, dht.PacketWorkerLimit); i++ {
+		dht.packetWorkers.Go(dht.packetWorker)
+	}
+
 	kBucketTicker := time.NewTicker(dht.CheckKBucketPeriod)
 	defer kBucketTicker.Stop()
 	evictTicker := time.NewTicker(10 * time.Minute)
@@ -392,8 +404,6 @@ func (dht *DHT) RunContext(ctx context.Context) {
 			return
 		case <-dht.stop:
 			return
-		case pkt = <-dht.packets:
-			handle(dht, pkt)
 		case <-kBucketTicker.C:
 			// Use bootstrap manager to check if re-bootstrap is needed
 			if dht.bootstrapMgr.needsRebootstrap() {
@@ -468,7 +478,7 @@ func (dht *DHT) GetDHTStats() DHTStats {
 		BlacklistedNodes:   dht.blackList.len(),
 		PacketQueueDepth:   len(dht.packets),
 		QueryQueueDepth:    len(dht.transactionManager.queryChan),
-		PacketWorkers:      len(dht.workerTokens),
+		PacketWorkers:      int(dht.activePacketWorkers.Load()),
 	}
 	if dht.bootstrapMgr != nil {
 		count, _ := dht.bootstrapMgr.getBootstrapStats()

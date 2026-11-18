@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -25,6 +26,26 @@ func NewRecoveryStore(path string) *RecoveryStore {
 		return nil
 	}
 	return &RecoveryStore{path: path}
+}
+
+// Pending reports whether the spool holds batches awaiting replay.
+func (s *RecoveryStore) Pending() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info, err := os.Stat(s.path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	return info.Size() > 0, nil
+}
+
+// Rejected returns the store, next to this spool, for items MySQL rejects
+// permanently. It is never replayed automatically; inspect it by hand.
+func (s *RecoveryStore) Rejected() *RecoveryStore {
+	return NewRecoveryStore(strings.TrimSuffix(s.path, ".jsonl") + ".rejected.jsonl")
 }
 
 func (s *RecoveryStore) Append(batch RecoveryBatch) error {
@@ -51,7 +72,12 @@ func (s *RecoveryStore) Append(batch RecoveryBatch) error {
 	return nil
 }
 
-func (s *RecoveryStore) Replay(write func(string, []Data) error) error {
+// Replay writes spooled batches in order. It stops writing at the first
+// failure, because the database is most likely still unavailable and every
+// further attempt would only add another timeout to the writer's stall. That
+// batch and all later ones are streamed, not buffered, into the replacement
+// spool. A truncated tail is preserved in a backup and reported as an error.
+func (s *RecoveryStore) Replay(write func(string, []Data) error) (result error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	file, err := os.Open(s.path)
@@ -63,7 +89,15 @@ func (s *RecoveryStore) Replay(write func(string, []Data) error) error {
 	}
 	defer file.Close()
 
-	remaining := make([]RecoveryBatch, 0)
+	var temp *os.File
+	var encoder *json.Encoder
+	defer func() {
+		if temp != nil {
+			_ = temp.Close()
+			_ = os.Remove(temp.Name())
+		}
+	}()
+	var damaged error
 	decoder := json.NewDecoder(file)
 	for {
 		var batch RecoveryBatch
@@ -72,33 +106,63 @@ func (s *RecoveryStore) Replay(write func(string, []Data) error) error {
 			break
 		}
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			backup, backupErr := os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-damaged-*")
+			name, backupErr := s.backupDamaged(file)
 			if backupErr != nil {
 				return backupErr
 			}
-			if _, backupErr = file.Seek(0, io.SeekStart); backupErr == nil {
-				_, backupErr = io.Copy(backup, file)
-			}
-			backupErr = errors.Join(backupErr, backup.Sync(), backup.Close())
-			if backupErr != nil {
-				return backupErr
-			}
-			if err := s.rewrite(remaining); err != nil {
-				return err
-			}
-			return fmt.Errorf("incomplete recovery tail preserved in %s", backup.Name())
+			damaged = fmt.Errorf("incomplete recovery tail preserved in %s", name)
+			break
 		}
 		if err != nil {
 			return fmt.Errorf("decode recovery spool: %w", err)
 		}
-		if err := write(batch.ID, batch.Items); err != nil {
-			remaining = append(remaining, batch)
+		if encoder == nil {
+			if err := write(batch.ID, batch.Items); err == nil {
+				continue
+			}
+			if temp, err = os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-*"); err != nil {
+				return fmt.Errorf("create recovery spool replacement: %w", err)
+			}
+			encoder = json.NewEncoder(temp)
+		}
+		if err := encoder.Encode(batch); err != nil {
+			return fmt.Errorf("write recovery spool replacement: %w", err)
 		}
 	}
-	if len(remaining) == 0 {
-		return os.Remove(s.path)
+	if encoder == nil {
+		if err := os.Remove(s.path); err != nil {
+			return err
+		}
+		return damaged
 	}
-	return s.rewrite(remaining)
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync recovery spool replacement: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close recovery spool replacement: %w", err)
+	}
+	name := temp.Name()
+	temp = nil
+	if err := os.Rename(name, s.path); err != nil {
+		_ = os.Remove(name)
+		return fmt.Errorf("replace recovery spool: %w", err)
+	}
+	return damaged
+}
+
+// backupDamaged copies the whole spool aside before its tail is dropped.
+func (s *RecoveryStore) backupDamaged(file *os.File) (string, error) {
+	backup, err := os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-damaged-*")
+	if err != nil {
+		return "", err
+	}
+	if _, err = file.Seek(0, io.SeekStart); err == nil {
+		_, err = io.Copy(backup, file)
+	}
+	if err = errors.Join(err, backup.Sync(), backup.Close()); err != nil {
+		return "", err
+	}
+	return backup.Name(), nil
 }
 
 func (s *RecoveryStore) Remove(id string) error {

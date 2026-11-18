@@ -1152,7 +1152,12 @@ func TestPeerWireMetadataFlowWithLargeBitfieldAndHash(t *testing.T) {
 			if err := peerWireTestHandshake(peer); err != nil {
 				t.Fatal(err)
 			}
-			bitfield := bytes.Repeat([]byte{0xff}, 32*1024+1)
+			// The largest bitfield a MaxMetadataSize torrent can have; it still
+			// exceeds the ordinary frame limit, so it takes the drain path.
+			if maxBitfieldMessageSize <= maxWireMessageSize {
+				t.Fatal("bitfield bound no longer exercises the drain path")
+			}
+			bitfield := bytes.Repeat([]byte{0xff}, maxBitfieldMessageSize)
 			bitfield[0] = 5
 			if err := sendMessage(peer, bitfield); err != nil {
 				t.Fatal(err)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -71,6 +73,10 @@ func torrentFiles(info map[string]interface{}) ([]mysql.File, int64, bool) {
 			if !ok {
 				return nil, 0, false
 			}
+			// BEP-47 padding files only align pieces; they hold no content.
+			if attr, _ := entry["attr"].(string); strings.Contains(attr, "p") {
+				continue
+			}
 			length, ok := metadataLength(entry["length"])
 			if !ok || length > math.MaxInt64-total {
 				return nil, 0, false
@@ -89,6 +95,9 @@ func torrentFiles(info map[string]interface{}) ([]mysql.File, int64, bool) {
 			}
 			files = append(files, mysql.File{Path: segments, Length: length})
 			total += length
+		}
+		if len(files) == 0 { // Only padding entries.
+			return nil, 0, false
 		}
 		return files, total, true
 	}
@@ -135,10 +144,6 @@ func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write fu
 	})
 }
 
-func writeMySQLBatchesUntil(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
-	writeMySQLBatchesWithRecovery(input, ticks, stop, write)
-}
-
 func recoveryStore() *mysql.RecoveryStore {
 	path := os.Getenv("RECOVERY_FILE_PATH")
 	if path == "" {
@@ -151,7 +156,49 @@ func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Ti
 	writeMySQLBatchesToStore(input, ticks, stop, write, recoveryStore())
 }
 
+// writeSplit retries a permanently rejected batch item by item, so one bad
+// item cannot hold the rest hostage. Each item gets its own batch ID; items
+// that still fail go to rejected (permanent) or retry (transient).
+func writeSplit(items []mysql.Data, write func(string, []mysql.Data) error, retry, rejected func(mysql.RecoveryBatch) error) {
+	for _, item := range items {
+		id, err := mysql.NewBatchID()
+		if err != nil {
+			slog.Error("MySQL item dropped: batch ID generation failed", "component", "mysql", "infohash", item.InfoHash, "error", err)
+			continue
+		}
+		err = write(id, []mysql.Data{item})
+		if err == nil {
+			continue
+		}
+		target, event := retry, "mysql_item_deferred"
+		if mysql.IsPermanent(err) {
+			target, event = rejected, "mysql_item_rejected"
+		}
+		if spoolErr := target(mysql.RecoveryBatch{ID: id, Items: []mysql.Data{item}}); spoolErr != nil {
+			slog.Error("MySQL item dropped: not written and not spooled", "component", "mysql", "event", "mysql_item_dropped", "infohash", item.InfoHash, "error", err, "spool_error", spoolErr)
+			continue
+		}
+		slog.Warn("MySQL item set aside", "component", "mysql", "event", event, "batch_id", id, "infohash", item.InfoHash, "error", err)
+	}
+}
+
 func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error, store *mysql.RecoveryStore) {
+	rejected := store.Rejected()
+	// Replay holds the spool's lock, so split items cannot be re-spooled there.
+	replayWrite := func(id string, items []mysql.Data) error {
+		err := write(id, items)
+		if err != nil && mysql.IsPermanent(err) {
+			writeSplit(items, write, rejected.Append, rejected.Append)
+			return nil
+		}
+		return err
+	}
+	replay := func() {
+		if err := store.Replay(replayWrite); err != nil {
+			slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
+		}
+	}
+	replay()
 	batch := make([]mysql.Data, 0, 100)
 	batchID := ""
 	flush := func() bool {
@@ -167,11 +214,16 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 			}
 		}
 		if err := write(batchID, batch); err != nil {
-			if spoolErr := store.Append(mysql.RecoveryBatch{ID: batchID, Items: batch}); spoolErr != nil {
+			if mysql.IsPermanent(err) {
+				// The transaction rolled back, so splitting cannot double count.
+				slog.Warn("MySQL rejected batch; retrying items individually", "component", "mysql", "event", "mysql_batch_split", "batch_id", batchID, "observations", len(batch), "error", err)
+				writeSplit(batch, write, store.Append, rejected.Append)
+			} else if spoolErr := store.Append(mysql.RecoveryBatch{ID: batchID, Items: batch}); spoolErr != nil {
 				slog.Error("MySQL and recovery write failed; retaining batch with backpressure", "component", "mysql", "event", "mysql_recovery_spool_failed", "batch_id", batchID, "error", err, "spool_error", spoolErr)
 				return false
+			} else {
+				slog.Error("MySQL batch deferred for recovery", "component", "mysql", "event", "mysql_batch_failed", "batch_id", batchID, "observations", len(batch), "error", err)
 			}
-			slog.Error("MySQL batch deferred for recovery", "component", "mysql", "event", "mysql_batch_failed", "batch_id", batchID, "observations", len(batch), "error", err)
 		}
 		batch = batch[:0]
 		batchID = ""
@@ -183,8 +235,8 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 			<-timer.C
 		}
 	}
-	replay := time.NewTicker(time.Minute)
-	defer replay.Stop()
+	replayTicker := time.NewTicker(time.Minute)
+	defer replayTicker.Stop()
 	for {
 		incoming := input
 		if len(batch) >= 100 || batchID != "" {
@@ -202,10 +254,8 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 			}
 		case <-ticks:
 			flush()
-		case <-replay.C:
-			if err := store.Replay(write); err != nil {
-				slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
-			}
+		case <-replayTicker.C:
+			replay()
 		case <-stop:
 			finish()
 			return
@@ -231,6 +281,9 @@ func main() {
 		logging.Fatal("port must be 1..65535, worker limits and query timeout must be positive")
 	}
 	var c = config.GetConfig()
+	if c.Storage.Type != "mysql" && c.Storage.Type != "elasticsearch" {
+		logging.Fatalf("unknown storage type %q: use mysql or elasticsearch", c.Storage.Type)
+	}
 
 	natStop := make(chan struct{})
 	defer close(natStop)
@@ -241,26 +294,27 @@ func main() {
 		log.Printf("[NAT] Manual forwarding: public UDP %d -> node UDP %d; preserve the source port for outbound UDP", *port, *port)
 	}
 
+	// stopping closes as soon as a shutdown signal arrives.
+	stopping := make(chan struct{})
 	w := dht.NewWire(65536, 4096, *metadataWorkers)
 	mysqlWrites := make(chan mysql.Data, 100)
 	responseDone := make(chan struct{})
 	writeDone := make(chan struct{})
+	pruneDone := make(chan struct{})
 	if c.Storage.Type == "mysql" {
+		spool := recoveryStore()
+		go func() {
+			defer close(pruneDone)
+			pruneObservations(stopping, spool)
+		}()
 		go func() {
 			defer close(writeDone)
-			store := recoveryStore()
-			if store != nil {
-				if err := store.Replay(func(id string, items []mysql.Data) error { return mysql.WriteBatchWithID(id, items) }); err != nil {
-					slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
-				}
-			}
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
-			writeMySQLBatchesUntil(mysqlWrites, ticker.C, nil, func(id string, items []mysql.Data) error {
-				return mysql.WriteBatchWithID(id, items)
-			})
+			writeMySQLBatchesToStore(mysqlWrites, ticker.C, nil, mysql.WriteBatchWithID, spool)
 		}()
 	} else {
+		close(pruneDone)
 		close(writeDone)
 	}
 	items := make(chan mysql.Data, 100)
@@ -301,6 +355,7 @@ func main() {
 	// Configure DHT
 	initConfig := dht.NewCrawlConfig()
 	initConfig.Address = net.JoinHostPort("", strconv.Itoa(*port))
+	initConfig.PublicIP = os.Getenv("DHT_PUBLIC_IP")
 	initConfig.QueryWorkerLimit = *queryWorkers
 	initConfig.QueryTimeout = *queryTimeout
 	initConfig.NodeCachePath = os.Getenv("NODE_CACHE_PATH")
@@ -417,14 +472,48 @@ func main() {
 	go func() {
 		defer close(shutdownDone)
 		<-stopSignal
+		close(stopping) // Cancels an in-progress prune right away.
 		close(scheduler.stop)
 		d.Stop()
 		w.Stop()
 		<-responseDone
 		<-writeDone
+		<-pruneDone
 	}()
 	d.Run()
 	<-shutdownDone
+}
+
+// pruneObservations bounds the observations table, which otherwise gains a row
+// per infohash per batch forever. It runs shortly after start, then hourly,
+// and skips rounds while the recovery spool has batches to replay.
+func pruneObservations(stop <-chan struct{}, spool *mysql.RecoveryStore) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-stop
+		cancel()
+	}()
+	timer := time.NewTimer(time.Minute)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		timer.Reset(time.Hour)
+		if pending, err := spool.Pending(); pending || err != nil {
+			slog.Info("MySQL observation pruning deferred until the recovery spool drains", "component", "mysql", "event", "mysql_prune_deferred", "error", err)
+			continue
+		}
+		deleted, err := mysql.PruneObservations(ctx, time.Now().Add(-mysql.ObservationRetention))
+		if err != nil && ctx.Err() == nil {
+			slog.Error("MySQL observation pruning failed", "component", "mysql", "event", "mysql_prune_failed", "deleted", deleted, "error", err)
+		} else if deleted > 0 {
+			slog.Info("MySQL observations pruned", "component", "mysql", "event", "mysql_pruned", "deleted", deleted)
+		}
+	}
 }
 
 func setupNAT(port int, stop <-chan struct{}) {
@@ -451,5 +540,19 @@ func setupNAT(port int, stop <-chan struct{}) {
 	natStatus.Store("mapped")
 	log.Printf("[NAT] Successfully mapped %s:%d -> :%d", mapping.ExternalIP, mapping.External, mapping.Internal)
 
-	<-stop
+	// Reflect lapsed leases: renewals can keep failing after the first map.
+	check := time.NewTicker(30 * time.Second)
+	defer check.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-check.C:
+			if current, ok := autoMap.GetMapping("udp", port, port); ok && current.Active(now) {
+				natStatus.Store("mapped")
+			} else {
+				natStatus.Store("mapping_failed")
+			}
+		}
+	}
 }

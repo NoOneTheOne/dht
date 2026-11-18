@@ -1,9 +1,10 @@
 package dht
 
 import (
-	"bytes"
+	"cmp"
 	"container/heap"
 	"container/list"
+	"encoding/binary"
 	"errors"
 	"net"
 	"slices"
@@ -479,19 +480,45 @@ func (rt *routingTable) Insert(nd *node) bool {
 	return false
 }
 
+// neighborSnapshots recycles the routing-table snapshot GetNeighbors needs on
+// every inbound find_node/get_peers.
+var neighborSnapshots = sync.Pool{New: func() interface{} { return new([]*node) }}
+
+// InsertMentioned adds a contact learned from another node's reply. Unlike
+// Insert it never touches a known ID or endpoint: an unverified mention must
+// neither keep a dead contact fresh nor move a known ID to a new address.
+func (rt *routingTable) InsertMentioned(nd *node) bool {
+	rt.RLock()
+	_, known := rt.cachedNodes.Get(nd.addr.String())
+	if !known {
+		existing, _ := rt.getNodeKBucketByIDLocked(nd.id)
+		known = existing != nil
+	}
+	rt.RUnlock()
+	if known {
+		return false
+	}
+	return rt.Insert(nd)
+}
+
 // GetNeighbors returns the size-length nodes closest to id.
 func (rt *routingTable) GetNeighbors(id *bitmap, size int) []*node {
 	if size <= 0 {
 		return nil
 	}
+	buf := neighborSnapshots.Get().(*[]*node)
+	nodes := (*buf)[:0]
 	rt.cachedNodes.RLock()
-	nodes := make([]*node, 0, len(rt.cachedNodes.data))
 	for _, value := range rt.cachedNodes.data {
 		nodes = append(nodes, value.(*node))
 	}
 	rt.cachedNodes.RUnlock()
 
-	return getTopKNodes(nodes, id, size)
+	result := getTopKNodes(nodes, id, size)
+	clear(nodes) // Do not pin evicted nodes through the pool.
+	*buf = nodes[:0]
+	neighborSnapshots.Put(buf)
+	return result
 }
 
 // GetNeighborCompactInfos Get Neighbor Ids return the size-length compact node info closest to id.
@@ -554,10 +581,6 @@ func (rt *routingTable) removeLocked(id *bitmap) {
 	}
 }
 
-func (rt *routingTable) failNode(expected *node) {
-	rt.removeContact(expected, true)
-}
-
 func (rt *routingTable) removeContact(expected *node, blacklist bool) {
 	rt.Lock()
 	defer rt.Unlock()
@@ -581,38 +604,6 @@ func (rt *routingTable) RemoveByAddr(address string) {
 	}
 }
 
-// Fresh sends findNode to all nodes in the expired nodes.
-func (rt *routingTable) Fresh() {
-	now := time.Now()
-
-	for e := range rt.cachedKBuckets.Iter() {
-		bucket := e.Value.(*KBucket)
-		if now.Sub(bucket.LastChanged()) < rt.dht.KBucketExpiredAfter ||
-			bucket.nodes.Len() == 0 {
-			continue
-		}
-
-		i := 0
-		for e := range bucket.nodes.Iter() {
-			if i < rt.dht.RefreshNodeNum {
-				no := e.Value.(*node)
-				rt.dht.transactionManager.findNode(no, bucket.RandomChildID())
-				if rt.dht.IsCrawlMode() {
-					rt.clearQueue.PushBack(no)
-				}
-			}
-			i++
-		}
-	}
-
-	if rt.dht.IsCrawlMode() {
-		for e := range rt.clearQueue.Iter() {
-			rt.Remove(e.Value.(*node).id)
-		}
-		rt.clearQueue.Clear()
-	}
-}
-
 // Len returns the number of nodes in table.
 func (rt *routingTable) Len() int {
 	rt.RLock()
@@ -621,18 +612,42 @@ func (rt *routingTable) Len() int {
 	return rt.cachedNodes.Len()
 }
 
+// xorDistance is a 160-bit XOR distance split into machine words, so most
+// comparisons are decided by a single uint64 instead of a 20-byte compare.
+type xorDistance struct {
+	hi, mid uint64
+	lo      uint32
+}
+
+func newXORDistance(target, id []byte) xorDistance {
+	return xorDistance{
+		hi:  binary.BigEndian.Uint64(target[0:8]) ^ binary.BigEndian.Uint64(id[0:8]),
+		mid: binary.BigEndian.Uint64(target[8:16]) ^ binary.BigEndian.Uint64(id[8:16]),
+		lo:  binary.BigEndian.Uint32(target[16:20]) ^ binary.BigEndian.Uint32(id[16:20]),
+	}
+}
+
+func (d xorDistance) compare(other xorDistance) int {
+	if c := cmp.Compare(d.hi, other.hi); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(d.mid, other.mid); c != 0 {
+		return c
+	}
+	return cmp.Compare(d.lo, other.lo)
+}
+
 type nodeHeapItem struct {
-	distance [20]byte
+	distance xorDistance
 	node     *node
 }
 
+// topKNodeHeap is a max-heap: the farthest retained node sits at the root.
 type topKNodeHeap []nodeHeapItem
 
-func (h topKNodeHeap) Len() int { return len(h) }
-func (h topKNodeHeap) Less(i, j int) bool {
-	return bytes.Compare(h[i].distance[:], h[j].distance[:]) > 0
-}
-func (h topKNodeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h topKNodeHeap) Len() int           { return len(h) }
+func (h topKNodeHeap) Less(i, j int) bool { return h[i].distance.compare(h[j].distance) > 0 }
+func (h topKNodeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 
 func (h *topKNodeHeap) Push(x interface{}) {
 	*h = append(*h, x.(nodeHeapItem))
@@ -647,28 +662,33 @@ func (h *topKNodeHeap) Pop() interface{} {
 
 func getTopKNodes(nodes []*node, id *bitmap, k int) []*node {
 	k = min(k, len(nodes))
-	if k <= 0 {
+	if k <= 0 || len(id.data) < 20 {
 		return nil
 	}
+	target := id.data[:20]
 	h := make(topKNodeHeap, 0, k)
 	for _, n := range nodes {
-		var distance [20]byte
-		for i := range distance {
-			distance[i] = id.data[i] ^ n.id.data[i]
+		if len(n.id.data) < 20 {
+			continue
 		}
+		hi := binary.BigEndian.Uint64(target[0:8]) ^ binary.BigEndian.Uint64(n.id.data[0:8])
+		if len(h) == k && hi > h[0].distance.hi {
+			continue // Cheap rejection: farther than every retained node.
+		}
+		distance := newXORDistance(target, n.id.data)
 		if len(h) < k {
 			h = append(h, nodeHeapItem{distance: distance, node: n})
 			if len(h) == k {
 				heap.Init(&h)
 			}
-		} else if bytes.Compare(distance[:], h[0].distance[:]) < 0 {
+		} else if distance.compare(h[0].distance) < 0 {
 			h[0] = nodeHeapItem{distance: distance, node: n}
 			heap.Fix(&h, 0)
 		}
 	}
 
 	slices.SortFunc(h, func(a, b nodeHeapItem) int {
-		return bytes.Compare(a.distance[:], b.distance[:])
+		return a.distance.compare(b.distance)
 	})
 	result := make([]*node, len(h))
 	for i := range h {

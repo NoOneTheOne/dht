@@ -69,12 +69,25 @@ func TestAutoMapRetainsFailedRenewal(t *testing.T) {
 	device.mu.Lock()
 	device.fail = false
 	device.mu.Unlock()
-	auto.refreshMappings()
-	renewed, ok := auto.GetMapping("udp", 6881, 6881)
+	auto.refreshMappings() // Still inside the backoff window.
 	device.mu.Lock()
 	attempts := device.attempts
 	device.mu.Unlock()
-	if !ok || renewed.Expires.Before(time.Now().Add(50*time.Minute)) || attempts != 3 {
+	if attempts != 2 {
+		t.Fatalf("renewal retried during backoff: %d attempts", attempts)
+	}
+	auto.mu.Lock()
+	if m := auto.mappings[key]; m.failures != 1 || !m.retryAt.After(time.Now()) {
+		t.Fatalf("missing backoff after failure: %+v", m)
+	}
+	auto.mappings[key].retryAt = time.Now().Add(-time.Second)
+	auto.mu.Unlock()
+	auto.refreshMappings()
+	renewed, ok := auto.GetMapping("udp", 6881, 6881)
+	device.mu.Lock()
+	attempts = device.attempts
+	device.mu.Unlock()
+	if !ok || renewed.Expires.Before(time.Now().Add(50*time.Minute)) || attempts != 3 || renewed.failures != 0 {
 		t.Fatal("mapping did not recover after gateway became available")
 	}
 	if !mapping.Expires.Before(renewed.Expires) {

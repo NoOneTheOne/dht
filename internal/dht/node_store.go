@@ -33,7 +33,7 @@ type verifiedNodeRecord struct {
 	Failures    int           `json:"consecutive_failures"`
 }
 
-// verifiedNodeStore is independent of the routing table and global NodeQuality.
+// verifiedNodeStore is independent of the routing table.
 // Loading historical successes does not establish current routing-table trust.
 // Callers must not mutate an input node concurrently with recordSuccess/Failure.
 type verifiedNodeStore struct {

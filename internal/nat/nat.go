@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/huin/goupnp/dcps/internetgateway2"
+	"github.com/huin/goupnp/soap"
 	"github.com/jackpal/gateway"
 	natpmp "github.com/jackpal/go-nat-pmp"
 )
@@ -26,6 +27,14 @@ type Mapping struct {
 	Desc       string
 	Expires    time.Time
 	lease      time.Duration
+	// Renewal backoff after failures; zero means renew on schedule.
+	retryAt  time.Time
+	failures int
+}
+
+// Active reports whether the gateway lease is still in force at now.
+func (m *Mapping) Active(now time.Time) bool {
+	return m.Expires.IsZero() || now.Before(m.Expires)
 }
 
 // NAT interface for NAT traversal operations
@@ -150,7 +159,8 @@ func discoverNATPMP() (*NATPMP, error) {
 		return nil, errors.New("no gateway found")
 	}
 
-	client := natpmp.NewClient(gwIP)
+	// Bound every request; the default client retries for about 128s.
+	client := natpmp.NewClientWithTimeout(gwIP, 3*time.Second)
 	_, err = client.GetExternalAddress()
 	if err != nil {
 		return nil, err
@@ -197,12 +207,21 @@ func (u *UPnPNAT) AddPortMapping(protocol string, externalPort, internalPort int
 	leaseDuration := uint32(seconds)
 	protocol = strings.ToUpper(protocol)
 
-	if u.ipService != nil {
-		err = u.ipService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), u.localIP.String(), true, desc, leaseDuration)
-	} else if u.pppService != nil {
-		err = u.pppService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), u.localIP.String(), true, desc, leaseDuration)
-	} else {
-		return 0, 0, errors.New("no UPnP service available")
+	add := func(lease uint32) error {
+		if u.ipService != nil {
+			return u.ipService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), u.localIP.String(), true, desc, lease)
+		}
+		if u.pppService != nil {
+			return u.pppService.AddPortMapping("", uint16(externalPort), protocol, uint16(internalPort), u.localIP.String(), true, desc, lease)
+		}
+		return errors.New("no UPnP service available")
+	}
+	err = add(leaseDuration)
+	var fault *soap.SOAPFaultError
+	if err != nil && leaseDuration != 0 && errors.As(err, &fault) && fault.Detail.UPnPError.Errorcode == 725 {
+		// OnlyPermanentLeasesSupported: request a permanent mapping instead.
+		leaseDuration = 0
+		err = add(0)
 	}
 	if err != nil {
 		return 0, 0, err
@@ -423,36 +442,73 @@ func (am *AutoMap) refreshLoop() {
 	}
 }
 
-func (am *AutoMap) refreshMappings() {
-	am.mu.Lock()
-	defer am.mu.Unlock()
+const (
+	renewRetryMin = 5 * time.Second
+	renewRetryMax = 5 * time.Minute
+)
 
+// refreshMappings renews finite leases halfway through. Gateway I/O happens
+// outside am.mu so Stop and readers never wait on a slow router, and failed
+// renewals back off exponentially instead of retrying on every tick.
+func (am *AutoMap) refreshMappings() {
+	type renewal struct {
+		key                string
+		protocol, desc     string
+		external, internal int
+		lease              time.Duration
+	}
+	am.mu.Lock()
 	select {
 	case <-am.stopCh:
+		am.mu.Unlock()
 		return
 	default:
 	}
 	now := time.Now()
+	var due []renewal
 	for key, m := range am.mappings {
-		// A zero lease is permanent (UPnP). Renew finite leases halfway through.
-		if m.Expires.IsZero() || now.Before(m.Expires.Add(-m.lease/2)) {
+		// A zero lease is permanent (UPnP).
+		if m.Expires.IsZero() || now.Before(m.Expires.Add(-m.lease/2)) || now.Before(m.retryAt) {
 			continue
 		}
-		external, lease, err := am.nat.AddPortMapping(m.Protocol, m.External, m.Internal, m.Desc, m.lease)
+		due = append(due, renewal{key, m.Protocol, m.Desc, m.External, m.Internal, m.lease})
+	}
+	am.mu.Unlock()
+
+	for _, r := range due {
+		external, lease, err := am.nat.AddPortMapping(r.protocol, r.external, r.internal, r.desc, r.lease)
 		if err == nil && (external <= 0 || external > 65535 || lease < 0) {
 			err = errors.New("invalid port mapping response")
 		}
+		am.mu.Lock()
+		m, ok := am.mappings[r.key]
+		stopped := false
+		select {
+		case <-am.stopCh:
+			stopped = true
+		default:
+		}
+		if !ok || stopped {
+			am.mu.Unlock()
+			continue
+		}
 		if err != nil {
-			log.Printf("[NAT] Failed to refresh mapping %s: %v", key, err)
+			m.failures++
+			delay := min(renewRetryMin<<min(m.failures-1, 16), renewRetryMax)
+			m.retryAt = time.Now().Add(delay)
+			am.mu.Unlock()
+			log.Printf("[NAT] Failed to refresh mapping %s (attempt %d, retry in %s): %v", r.key, m.failures, delay, err)
 			continue
 		}
 		m.External = external
 		m.lease = lease
+		m.failures, m.retryAt = 0, time.Time{}
 		m.Expires = time.Time{}
 		if lease > 0 {
 			m.Expires = time.Now().Add(lease)
 		}
-		log.Printf("[NAT] Refreshed mapping %s at external port %d", key, external)
+		am.mu.Unlock()
+		log.Printf("[NAT] Refreshed mapping %s at external port %d", r.key, external)
 	}
 }
 

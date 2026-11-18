@@ -43,7 +43,7 @@ func TestDHTRunContextStopsAllWorkers(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		d := &DHT{
 			InitParam: &InitParam{Network: "udp4", Address: "127.0.0.1:0", K: 8, KBucketSize: 8, MaxNodes: 64, MaxTransactionCursor: 65536, QueryWorkerLimit: 2, QueryTimeout: time.Hour, CheckKBucketPeriod: time.Hour, Try: 1},
-			node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), workerTokens: make(chan struct{}, 2), stop: make(chan struct{}), stopped: make(chan struct{}),
+			node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), stop: make(chan struct{}), stopped: make(chan struct{}),
 		}
 		cancel()
 		done := make(chan struct{})
@@ -54,7 +54,7 @@ func TestDHTRunContextStopsAllWorkers(t *testing.T) {
 			t.Fatal("RunContext did not release workers")
 		}
 		d.Stop()
-		if d.ready.Load() || d.transactionManager.len() != 0 || len(d.workerTokens) != 0 {
+		if d.ready.Load() || d.transactionManager.len() != 0 || d.activePacketWorkers.Load() != 0 {
 			t.Fatal("DHT remains active after stop")
 		}
 	}
@@ -97,7 +97,7 @@ func TestDHTStopAfterServingPacket(t *testing.T) {
 	t.Cleanup(func() { defaultBootstrapNodes = original })
 	d := &DHT{
 		InitParam: &InitParam{Network: "udp4", Address: "127.0.0.1:0", Mode: "StandardMode", K: 8, KBucketSize: 8, MaxNodes: 64, MaxTransactionCursor: 65536, QueryWorkerLimit: 2, QueryTimeout: time.Hour, CheckKBucketPeriod: time.Hour, Try: 1},
-		node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), workerTokens: make(chan struct{}, 2), stop: make(chan struct{}), stopped: make(chan struct{}),
+		node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), stop: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	done := make(chan struct{})
 	go func() { defer close(done); d.RunContext(context.Background()) }()
@@ -132,7 +132,7 @@ func TestDHTStopAfterServingPacket(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("live DHT failed to stop")
 	}
-	if d.ready.Load() || d.transactionManager.len() != 0 || len(d.workerTokens) != 0 {
+	if d.ready.Load() || d.transactionManager.len() != 0 || d.activePacketWorkers.Load() != 0 {
 		t.Fatal("live DHT leaked work")
 	}
 }

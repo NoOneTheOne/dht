@@ -84,7 +84,9 @@ func mysqlDSN(c *config.Config) string {
 	dsn.DBName = c.MySQL.Database
 	dsn.Params = map[string]string{"charset": "utf8mb4"}
 	dsn.ParseTime = true
-	dsn.Loc = time.Local
+	// UTC in every process: trending windows and per-run counts compare
+	// DATETIMEs written by the spider with times computed by the search API.
+	dsn.Loc = time.UTC
 	dsn.Timeout = connectionTimeout
 	dsn.ReadTimeout = ioTimeout
 	dsn.WriteTimeout = ioTimeout
@@ -191,15 +193,40 @@ func Write(d *Data) error {
 	return WriteBatch([]Data{*d})
 }
 
+// ErrInvalidItem marks items rejected before reaching MySQL.
+var ErrInvalidItem = errors.New("invalid metadata item")
+
+// permanentErrorCodes are server rejections caused by the data itself, which
+// replaying the same batch can never fix.
+var permanentErrorCodes = map[uint16]bool{
+	1048: true, // column cannot be null
+	1153: true, // packet larger than max_allowed_packet
+	1264: true, // out of range value
+	1292: true, // incorrect datetime value
+	1366: true, // incorrect string value
+	1406: true, // data too long
+	3140: true, // invalid JSON text
+}
+
+// IsPermanent reports whether err rejects the batch's data rather than
+// signalling an unavailable or overloaded database.
+func IsPermanent(err error) bool {
+	if errors.Is(err, ErrInvalidItem) || errors.Is(err, mysqlDriver.ErrPktTooLarge) {
+		return true
+	}
+	var mysqlErr *mysqlDriver.MySQLError
+	return errors.As(err, &mysqlErr) && permanentErrorCodes[mysqlErr.Number]
+}
+
 func aggregateWrites(items []Data) ([]Data, error) {
 	grouped := make(map[string]Data, len(items))
 	for _, item := range items {
 		var hash [20]byte
 		if len(item.InfoHash) != 40 {
-			return nil, fmt.Errorf("infohash must be 40 hexadecimal characters")
+			return nil, fmt.Errorf("%w: infohash must be 40 hexadecimal characters", ErrInvalidItem)
 		}
 		if _, err := hex.Decode(hash[:], []byte(item.InfoHash)); err != nil {
-			return nil, fmt.Errorf("infohash must be 40 hexadecimal characters")
+			return nil, fmt.Errorf("%w: infohash must be 40 hexadecimal characters", ErrInvalidItem)
 		}
 		item.InfoHash = strings.ToLower(item.InfoHash)
 		if existing, ok := grouped[item.InfoHash]; ok {
@@ -321,6 +348,47 @@ func WriteBatchWithID(batchID string, items []Data) error {
 		var mysqlErr *mysqlDriver.MySQLError
 		return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1213 || mysqlErr.Number == 1205), err
 	})
+}
+
+// ObservationRetention keeps every row the longest trending window (7d) can
+// read, plus a day of margin for recovery batches replayed late.
+const ObservationRetention = 8 * 24 * time.Hour
+
+const pruneChunkSize = 5000
+
+// PruneObservations deletes applied observations older than before in small
+// chunks, so the cleanup never holds long locks against concurrent writers.
+// Unapplied rows are kept because WriteBatchWithID still needs them.
+//
+// Callers must not prune while the recovery spool holds batches: a spooled
+// batch may already be applied (ambiguous commit), and its observation rows
+// are what make the replay a no-op. Fresh batches are never old enough to be
+// pruned, so an empty spool makes pruning by discovery time safe.
+func PruneObservations(parent context.Context, before time.Time) (int64, error) {
+	var total int64
+	for {
+		ctx, cancel := context.WithTimeout(parent, operationTimeout)
+		db, err := GetDBContext(ctx)
+		if err != nil {
+			cancel()
+			return total, err
+		}
+		// A single DELETE is atomic; skip GORM's BEGIN/COMMIT round trips.
+		result := db.WithContext(ctx).Session(&gorm.Session{SkipDefaultTransaction: true}).
+			Where("applied = ? AND time < ?", true, before).
+			Limit(pruneChunkSize).Delete(&Observation{})
+		cancel()
+		if result.Error != nil {
+			return total, result.Error
+		}
+		total += result.RowsAffected
+		if result.RowsAffected < pruneChunkSize {
+			return total, nil
+		}
+		if err := parent.Err(); err != nil {
+			return total, err
+		}
+	}
 }
 
 const SearchPageSize = 50

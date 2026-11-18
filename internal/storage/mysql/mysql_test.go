@@ -112,6 +112,42 @@ func TestRecoveryReplayRetainsFailuresAndDamagedTail(t *testing.T) {
 	}
 }
 
+func TestRecoveryReplayStopsAtFirstFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.jsonl")
+	store := NewRecoveryStore(path)
+	for _, id := range []string{"a", "b", "c"} {
+		if err := store.Append(RecoveryBatch{ID: id, Items: []Data{{Name: id}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var attempted []string
+	if err := store.Replay(func(id string, _ []Data) error {
+		attempted = append(attempted, id)
+		if id == "b" {
+			return errors.New("offline")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(attempted, ",") != "a,b" {
+		t.Fatalf("attempted %v; replay must stop after the first failure", attempted)
+	}
+	var retained []string
+	if err := store.Replay(func(id string, items []Data) error {
+		if len(items) != 1 || items[0].Name != id {
+			t.Fatalf("batch %s lost its items", id)
+		}
+		retained = append(retained, id)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(retained, ",") != "b,c" {
+		t.Fatalf("retained %v", retained)
+	}
+}
+
 func TestGetDBRetriesFailureAndCachesSuccess(t *testing.T) {
 	failure := errors.New("temporary initialization failure")
 	candidate := &gorm.DB{}
@@ -980,7 +1016,44 @@ func TestMySQLDSN(t *testing.T) {
 	if parsed.Timeout != 2*time.Second || parsed.ReadTimeout != 5*time.Second || parsed.WriteTimeout != 5*time.Second {
 		t.Fatal("DSN does not have bounded connect/read/write timeouts")
 	}
-	if !parsed.ParseTime || parsed.Loc != time.Local || parsed.Params["charset"] != "utf8mb4" {
+	if !parsed.ParseTime || parsed.Loc != time.UTC || parsed.Params["charset"] != "utf8mb4" {
 		t.Fatal("DSN did not preserve charset and time settings")
+	}
+}
+
+func TestPruneObservationsQuery(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := time.Date(2026, 11, 7, 0, 0, 0, 0, time.UTC)
+	calls := 0
+	if err := candidate.Callback().Delete().After("gorm:delete").Register("capture_prune", func(tx *gorm.DB) {
+		calls++
+		sql := tx.Statement.SQL.String()
+		for _, fragment := range []string{"DELETE FROM `torrent_test_observations`", "applied = ? AND time < ?", "LIMIT ?"} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("missing %q in %s", fragment, sql)
+			}
+		}
+		vars := tx.Statement.Vars
+		if len(vars) != 3 || vars[0] != true || vars[1] != before || vars[2] != pruneChunkSize {
+			t.Fatalf("unexpected vars: %v", vars)
+		}
+		if _, ok := tx.Statement.Context.Deadline(); !ok {
+			t.Fatal("missing timeout")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
+	// Dry runs affect no rows, so a single chunk ends the loop.
+	if deleted, err := PruneObservations(context.Background(), before); err != nil || deleted != 0 || calls != 1 {
+		t.Fatalf("deleted=%d calls=%d err=%v", deleted, calls, err)
 	}
 }

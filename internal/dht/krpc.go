@@ -1,6 +1,8 @@
 package dht
 
 import (
+	"crypto/hmac"
+	"crypto/sha1"
 	"errors"
 	"net"
 	"strings"
@@ -28,84 +30,60 @@ type packet struct {
 	RealAddress *net.UDPAddr
 }
 
-// token represents the token when response getPeers request.
-type token struct {
-	data       string
-	createTime time.Time
-}
-
-// tokenManager managers the tokens.
+// tokenManager issues stateless announce tokens: a truncated HMAC of the
+// requester's IP. The secret rotates every expiredAfter and the previous
+// secret is still accepted, so a token stays valid for at least expiredAfter
+// (BEP-5 asks for ten minutes) and memory does not grow with requesters.
 type tokenManager struct {
-	*syncedMap
+	mu           sync.Mutex
+	current      []byte
+	previous     []byte
+	rotatedAt    time.Time
 	expiredAfter time.Duration
-	dht          *DHT
+	now          func() time.Time
 }
 
 // newTokenManager returns a new tokenManager.
-func newTokenManager(expiredAfter time.Duration, dht *DHT) *tokenManager {
-	return &tokenManager{
-		syncedMap:    newSyncedMap(),
-		expiredAfter: expiredAfter,
-		dht:          dht,
-	}
+func newTokenManager(expiredAfter time.Duration, _ *DHT) *tokenManager {
+	tm := &tokenManager{expiredAfter: expiredAfter, now: time.Now}
+	tm.current = []byte(randomString(20))
+	tm.previous = []byte(randomString(20))
+	tm.rotatedAt = tm.now()
+	return tm
 }
 
-// token returns a token. If it doesn't exist or is expired, it will add a
-// new token.
+// secrets returns the current and previous secrets, rotating as needed.
+func (tm *tokenManager) secrets() (current, previous []byte) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	elapsed := tm.now().Sub(tm.rotatedAt)
+	if elapsed >= tm.expiredAfter {
+		if elapsed >= 2*tm.expiredAfter {
+			tm.current = []byte(randomString(20)) // Both secrets are stale.
+		}
+		tm.previous, tm.current = tm.current, []byte(randomString(20))
+		tm.rotatedAt = tm.now()
+	}
+	return tm.current, tm.previous
+}
+
+func tokenFor(secret []byte, addr *net.UDPAddr) string {
+	mac := hmac.New(sha1.New, secret)
+	mac.Write(addr.IP.To16())
+	return string(mac.Sum(nil)[:8])
+}
+
+// token returns the token for addr's IP.
 func (tm *tokenManager) token(addr *net.UDPAddr) string {
-	tm.Lock()
-	defer tm.Unlock()
-	key := addr.IP.String()
-	v, ok := tm.data[key]
-	tk, _ := v.(token)
-
-	if !ok || time.Since(tk.createTime) > tm.expiredAfter {
-		tk = token{
-			data:       randomString(5),
-			createTime: time.Now(),
-		}
-
-		tm.data[key] = tk
-	}
-
-	return tk.data
+	current, _ := tm.secrets()
+	return tokenFor(current, addr)
 }
 
-// clear removes expired tokens.
-func (tm *tokenManager) clear() {
-	ticker := time.NewTicker(time.Minute * 3)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-tm.dht.stop:
-			return
-		case <-ticker.C:
-		}
-		tm.Lock()
-		for key, value := range tm.data {
-			if time.Since(value.(token).createTime) > tm.expiredAfter {
-				delete(tm.data, key)
-			}
-		}
-		tm.Unlock()
-	}
-}
-
-// check returns whether the token is valid.
+// check returns whether the token is valid for addr's IP.
 func (tm *tokenManager) check(addr *net.UDPAddr, tokenString string) bool {
-	tm.Lock()
-	defer tm.Unlock()
-	key := addr.IP.String()
-	v, ok := tm.data[key]
-	if !ok {
-		return false
-	}
-	tk := v.(token)
-	if time.Since(tk.createTime) > tm.expiredAfter {
-		delete(tm.data, key)
-		return false
-	}
-	return tokenString == tk.data
+	current, previous := tm.secrets()
+	return hmac.Equal([]byte(tokenString), []byte(tokenFor(current, addr))) ||
+		hmac.Equal([]byte(tokenString), []byte(tokenFor(previous, addr)))
 }
 
 // makeQuery returns a query-formed data.
@@ -593,14 +571,12 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
+	// The endpoint now presents another ID: it restarted, or our entry came
+	// from an unverified third-party mention. Drop the stale contact rather
+	// than blacklisting the real sender, whose requests carry infohashes.
 	if no, ok := dht.routingTable.GetNodeByAddress(addr.String()); ok &&
 		no.id.RawString() != id {
-
-		dht.blackList.insert(addr.IP.String(), addr.Port)
-		dht.routingTable.RemoveByAddr(addr.String())
-
-		send(dht, addr, makeError(t, protocolError, "invalid id"))
-		return
+		dht.routingTable.removeContact(no, false)
 	}
 
 	switch q {
@@ -618,26 +594,25 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			send(dht, addr, makeError(t, protocolError, "invalid target"))
 			return
 		}
-		if dht.IsStandardMode() {
+		// Crawl mode answers too: nodes that reply stay in remote routing
+		// tables, which is what attracts get_peers/announce_peer traffic.
+		var nodes string
+		targetID := newBitmapFromString(target)
 
-			var nodes string
-			targetID := newBitmapFromString(target)
-
-			no, _ := dht.routingTable.GetNodeKBucketByID(targetID)
-			if no != nil {
-				nodes = no.CompactNodeInfo()
-			} else {
-				nodes = strings.Join(
-					dht.routingTable.GetNeighborCompactInfos(targetID, dht.K),
-					"",
-				)
-			}
-
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id":    dht.id(target),
-				"nodes": nodes,
-			}))
+		no, _ := dht.routingTable.GetNodeKBucketByID(targetID)
+		if no != nil {
+			nodes = no.CompactNodeInfo()
+		} else {
+			nodes = strings.Join(
+				dht.routingTable.GetNeighborCompactInfos(targetID, dht.K),
+				"",
+			)
 		}
+
+		send(dht, addr, makeResponse(t, map[string]interface{}{
+			"id":    dht.id(target),
+			"nodes": nodes,
+		}))
 	case getPeersType:
 		if err := ParseKey(a, "info_hash", "string"); err != nil {
 			send(dht, addr, makeError(t, protocolError, err.Error()))
@@ -651,13 +626,8 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 
-		if dht.IsCrawlMode() {
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id":    dht.id(infoHash),
-				"token": dht.tokenManager.token(addr),
-				"nodes": "",
-			}))
-		} else if peers := dht.peersManager.GetPeers(
+		// Crawl mode never caches peers, so it always takes the nodes branch.
+		if peers := dht.peersManager.GetPeers(
 			infoHash, dht.K); len(peers) > 0 {
 
 			values := make([]interface{}, len(peers))
@@ -721,13 +691,13 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 
-		if dht.IsStandardMode() {
-			dht.peersManager.Insert(infoHash, newPeer(addr.IP, port, token))
-
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id": dht.id(id),
-			}))
-		}
+		// Peers are cached only in standard mode, but both modes must reply:
+		// an unanswered announce counts as a timeout and gets us evicted.
+		dht.peersManager.Insert(infoHash, newPeer(addr.IP, port, token))
+		// Reply under the same ID our get_peers answer used for this hash.
+		send(dht, addr, makeResponse(t, map[string]interface{}{
+			"id": dht.id(infoHash),
+		}))
 
 		if dht.OnAnnouncePeer != nil {
 			dht.OnAnnouncePeer(infoHash, addr.IP.String(), port)
@@ -775,7 +745,7 @@ func findOn(dht *DHT, r map[string]interface{}, target *bitmap,
 			found = true
 		}
 
-		if dht.routingTable.Insert(no) {
+		if dht.routingTable.InsertMentioned(no) {
 			hasNew = true
 		}
 	}
@@ -837,10 +807,12 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		return
 	}
 
-	// A stale transaction must not evict a contact refreshed by another query.
+	// The queried endpoint answered our transaction under a new ID (e.g. a
+	// restart). Forget the old identity; the reply itself is still valid.
+	// removeContact checks pointer identity, so a contact refreshed by
+	// another query is left alone.
 	if trans.node.id != nil && trans.node.id.RawString() != id {
-		dht.routingTable.failNode(trans.node)
-		return
+		dht.routingTable.removeContact(trans.node, false)
 	}
 
 	node, err := newNode(id, addr.Network(), addr.String())
@@ -869,6 +841,12 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 		}
 		token := r["token"].(string)
 		infoHash := a["info_hash"].(string)
+		// Validate every field before mutating any state.
+		if value, exists := r["values"]; exists {
+			if _, ok := value.([]interface{}); !ok {
+				return
+			}
+		}
 
 		if trans.lookup != nil {
 			if value, exists := r["nodes"]; exists {
@@ -883,15 +861,12 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 							continue
 						}
 						trans.resultNodes = append(trans.resultNodes, n)
-						dht.routingTable.Insert(n)
+						dht.routingTable.InsertMentioned(n)
 					}
 				}
 			}
 		}
 		if _, exists := r["values"]; exists {
-			if err := ParseKey(r, "values", "list"); err != nil {
-				return
-			}
 			values := r["values"].([]interface{})
 			for _, v := range values {
 				compactInfo, ok := v.(string)
@@ -975,46 +950,45 @@ var handlers = map[string]func(*DHT, *net.UDPAddr, map[string]interface{}) bool{
 	"e": handleError,
 }
 
-// handle handles packets received from udp.
+// packetWorker consumes the packet queue until the DHT stops. A fixed pool
+// lets the queue absorb bursts instead of dropping packets whenever every
+// worker is momentarily busy, and avoids a goroutine per packet.
+func (dht *DHT) packetWorker() {
+	for {
+		select {
+		case <-dht.stop:
+			return
+		case pkt := <-dht.packets:
+			dht.activePacketWorkers.Add(1)
+			handle(dht, pkt)
+			dht.activePacketWorkers.Add(-1)
+		}
+	}
+}
+
+// handle handles a packet received from udp on the calling goroutine.
 func handle(dht *DHT, pkt packet) {
-	// Non-blocking acquire of worker token; drop packet if at capacity
-	select {
-	case dht.workerTokens <- struct{}{}:
-	default:
-		RecordPacketDropped()
-		RecordProtocolEvent("packet_worker", "full")
+	if dht.blackList.in(pkt.RealAddress.IP.String(), pkt.RealAddress.Port) {
 		return
 	}
 
-	dht.packetWorkers.Add(1)
-	go func() {
-		defer dht.packetWorkers.Done()
-		defer func() {
-			<-dht.workerTokens
-		}()
+	data, err := Decode(pkt.data)
+	if err != nil {
+		RecordProtocolEvent("packet", "decode_error")
+		return
+	}
 
-		if dht.blackList.in(pkt.RealAddress.IP.String(), pkt.RealAddress.Port) {
-			return
-		}
+	response, err := parseMessage(data)
+	if err != nil {
+		RecordProtocolEvent("packet", "invalid_envelope")
+		return
+	}
 
-		data, err := Decode(pkt.data)
-		if err != nil {
-			RecordProtocolEvent("packet", "decode_error")
-			return
+	if f, ok := handlers[response["y"].(string)]; ok {
+		if !f(dht, pkt.RealAddress, response) {
+			RecordProtocolEvent("packet", "rejected")
 		}
-
-		response, err := parseMessage(data)
-		if err != nil {
-			RecordProtocolEvent("packet", "invalid_envelope")
-			return
-		}
-
-		if f, ok := handlers[response["y"].(string)]; ok {
-			if !f(dht, pkt.RealAddress, response) {
-				RecordProtocolEvent("packet", "rejected")
-			}
-		} else {
-			RecordProtocolEvent("packet", "unknown_type")
-		}
-	}()
+	} else {
+		RecordProtocolEvent("packet", "unknown_type")
+	}
 }

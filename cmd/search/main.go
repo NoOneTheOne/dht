@@ -34,10 +34,14 @@ func main() {
 	gin.DisableConsoleColor()
 	gin.DefaultWriter = logging.Writer(slog.LevelInfo)
 	gin.DefaultErrorWriter = logging.Writer(slog.LevelError)
+	// Fail at startup, not on the first request: GetConfig exits on error.
+	cfg := config.GetConfig()
 	router := gin.New()
+	// Recovery is innermost so access logs and metrics still see the 500
+	// produced for a panicking handler.
 	router.Use(accessLog())
-	router.Use(recoveryLog())
 	router.Use(metrics.Middleware())
+	router.Use(recoveryLog())
 
 	// Set up MySQL stats getter for metrics
 	metrics.SetMySQLStatsGetter(func() (open, inUse, idle int) {
@@ -53,20 +57,12 @@ func main() {
 
 	router.GET("/health", func(c *gin.Context) {
 		health := gin.H{
-			"status":     "ok",
-			"uptime":     time.Since(startTime).String(),
-			"goroutines": runtime.NumGoroutine(),
-			"memory":     getMemoryUsage(),
-		}
-
-		// Check config
-		cfg := config.GetConfig()
-		if cfg == nil {
-			health["status"] = "degraded"
-			health["config"] = "not loaded"
-		} else {
-			health["config"] = "loaded"
-			health["storage_type"] = cfg.Storage.Type
+			"status":       "ok",
+			"uptime":       time.Since(startTime).String(),
+			"goroutines":   runtime.NumGoroutine(),
+			"memory":       getMemoryUsage(),
+			"config":       "loaded",
+			"storage_type": cfg.Storage.Type,
 		}
 
 		// Check MySQL connection
@@ -75,8 +71,6 @@ func main() {
 		statusCode := http.StatusOK
 		if health["status"] == "unhealthy" {
 			statusCode = http.StatusServiceUnavailable
-		} else if health["status"] == "degraded" {
-			statusCode = http.StatusPartialContent
 		}
 
 		c.JSON(statusCode, health)
@@ -92,32 +86,7 @@ func main() {
 	}
 	webDir := filepath.Join(filepath.Dir(executable), "web")
 	if _, err := os.Stat(webDir); err == nil {
-		router.NoRoute(func(c *gin.Context) {
-			path := c.Request.URL.Path
-			if path == "/" {
-				path = "/index.html"
-			}
-			filePath := filepath.Join(webDir, filepath.Clean(path))
-			// Prevent path traversal: ensure resolved path is under webDir
-			rel, err := filepath.Rel(webDir, filePath)
-			if err != nil || len(rel) >= 2 && rel[:2] == ".." {
-				c.Status(http.StatusForbidden)
-				return
-			}
-			if abs, err := filepath.Abs(filePath); err == nil {
-				if absAbs, err := filepath.Abs(webDir); err == nil {
-					if len(abs) < len(absAbs) || abs[:len(absAbs)] != absAbs {
-						c.Status(http.StatusForbidden)
-						return
-					}
-				}
-			}
-			if _, err := os.Stat(filePath); err == nil {
-				c.File(filePath)
-			} else {
-				c.File(filepath.Join(webDir, "index.html"))
-			}
-		})
+		router.NoRoute(staticHandler(webDir))
 	} else {
 		slog.Warn("web directory unavailable; serving API only", "path", webDir)
 	}
@@ -135,6 +104,30 @@ func main() {
 	err = server.ListenAndServe()
 	if err != nil {
 		logging.Fatalln(err)
+	}
+}
+
+// staticHandler serves the built frontend. Unknown paths fall back to
+// index.html for client-side routing; directories never produce listings.
+func staticHandler(webDir string) gin.HandlerFunc {
+	index := filepath.Join(webDir, "index.html")
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		path := c.Request.URL.Path
+		if path == "/api" || strings.HasPrefix(path, "/api/") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		// Cleaning a rooted path removes every "..", so the join stays in webDir.
+		filePath := filepath.Join(webDir, filepath.Clean("/"+path))
+		if info, err := os.Stat(filePath); err == nil && info.Mode().IsRegular() {
+			c.File(filePath)
+			return
+		}
+		c.File(index)
 	}
 }
 

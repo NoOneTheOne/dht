@@ -160,10 +160,10 @@ func getLocalIP() (net.IP, error) {
 	return nil, errors.New("no local IP found")
 }
 
-// getRemoteIP returns the wlan ip.
-func getRemoteIP() (ip string, err error) {
+// getRemoteIP returns the public IP as seen by an external echo service.
+func getRemoteIP(timeout time.Duration) (ip string, err error) {
 	client := &http.Client{
-		Timeout: time.Second * 30,
+		Timeout: timeout,
 	}
 
 	req, err := http.NewRequest("GET", "https://ifconfig.me", nil)
@@ -184,11 +184,14 @@ func getRemoteIP() (ip string, err error) {
 		}
 	}(res.Body)
 
-	data, err := io.ReadAll(res.Body)
+	data, err := io.ReadAll(io.LimitReader(res.Body, 64))
 	if err != nil {
 		return
 	}
 	ip = strings.TrimSpace(string(data))
+	if res.StatusCode != http.StatusOK || net.ParseIP(ip) == nil {
+		return "", errors.New("public IP lookup returned no address")
+	}
 
 	return
 }

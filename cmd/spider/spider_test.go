@@ -14,7 +14,27 @@ import (
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
 )
 
+func TestTorrentFilesSkipsPadding(t *testing.T) {
+	info := map[string]interface{}{
+		"name": "album",
+		"files": []interface{}{
+			map[string]interface{}{"path": []interface{}{"a.flac"}, "length": 100},
+			map[string]interface{}{"path": []interface{}{".pad", "1"}, "length": 50, "attr": "p"},
+			map[string]interface{}{"path": []interface{}{"b.flac"}, "length": 7, "attr": "x"},
+		},
+	}
+	files, total, ok := torrentFiles(info)
+	if !ok || total != 107 || len(files) != 2 || files[0].Path[0] != "a.flac" || files[1].Path[0] != "b.flac" {
+		t.Fatalf("files=%v total=%d ok=%v", files, total, ok)
+	}
+	info["files"] = []interface{}{map[string]interface{}{"path": []interface{}{".pad", "0"}, "length": 9, "attr": "p"}}
+	if _, _, ok := torrentFiles(info); ok {
+		t.Fatal("padding-only file list accepted")
+	}
+}
+
 func TestWriteMySQLBatches(t *testing.T) {
+	t.Setenv("RECOVERY_FILE_PATH", filepath.Join(t.TempDir(), "recovery.jsonl"))
 	for _, n := range []int{0, 1, 100, 205} {
 		input := make(chan mysql.Data, n)
 		for i := 0; i < n; i++ {

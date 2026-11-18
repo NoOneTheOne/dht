@@ -87,7 +87,7 @@ jobs:
       - name: Build frontend
         working-directory: web
         run: |
-          npm install
+          npm ci
           npm run build
       - uses: actions/upload-artifact@v4
         with:
@@ -207,7 +207,8 @@ jobs:
   deploy:
     name: Deploy
     runs-on: self-hosted
-    needs: [build]
+    # Never deploy a tag whose GitHub Release failed to publish.
+    needs: [build, release]
     if: github.ref_type == 'tag' && github.event_name == 'push'
     concurrency:
       group: dht-production

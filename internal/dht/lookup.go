@@ -96,7 +96,10 @@ func (l *peerLookup) advance() bool {
 			delete(l.dht.lookups, l.hash)
 		}
 		l.dht.lookupMu.Unlock()
-		RecordProtocolEvent("peer_lookup", "finished")
+		// Lookups that never queued a query were not counted as started.
+		if l.attempted > 0 {
+			RecordProtocolEvent("peer_lookup", "finished")
+		}
 	}
 	return queued
 }

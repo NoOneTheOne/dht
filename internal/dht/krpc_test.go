@@ -63,17 +63,31 @@ func TestTokenReuseExpiryAndInvalidAttempt(t *testing.T) {
 	d, remote := newKRPCTestDHT(t)
 	addr := remote.LocalAddr().(*net.UDPAddr)
 	tm := d.tokenManager
+	now := time.Now()
+	tm.now = func() time.Time { return now }
+	tm.rotatedAt = now
 	tokenString := tm.token(addr)
 	if tm.check(addr, "wrong") {
 		t.Fatal("invalid token accepted")
+	}
+	other := &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: addr.Port}
+	if tm.check(other, tokenString) {
+		t.Fatal("token accepted for another IP")
 	}
 	for i := 0; i < 3; i++ {
 		if !tm.check(addr, tokenString) {
 			t.Fatal("valid token consumed by another announce")
 		}
 	}
-	tm.Set(addr.IP.String(), token{data: tokenString, createTime: time.Now().Add(-2 * time.Minute)})
-	if tm.check(addr, tokenString) {
+	// Issued just before a rotation, the token must survive the full window.
+	now = now.Add(tm.expiredAfter - time.Second)
+	issued := tm.token(addr)
+	now = now.Add(tm.expiredAfter - time.Second)
+	if !tm.check(addr, issued) {
+		t.Fatal("token rejected before expiredAfter elapsed")
+	}
+	now = now.Add(2 * tm.expiredAfter)
+	if tm.check(addr, issued) || tm.check(addr, tokenString) {
 		t.Fatal("expired token accepted")
 	}
 }
@@ -103,7 +117,7 @@ func TestKRPCAnnounceRejectsInvalidArguments(t *testing.T) {
 				d.Mode = mode
 				addr := remote.LocalAddr().(*net.UDPAddr)
 				token := d.tokenManager.token(addr)
-				if token == "" || !d.tokenManager.Has(addr.IP.String()) {
+				if token == "" || !d.tokenManager.check(addr, token) {
 					t.Fatal("missing local token")
 				}
 				called := false
@@ -490,5 +504,45 @@ func TestKRPCResponseExistingValidation(t *testing.T) {
 		if d.routingTable.Len() != 0 || len(trans.response) != 0 {
 			t.Fatal("invalid response modified routing table or notified transaction")
 		}
+	}
+}
+
+func TestCrawlModeAnswersWithNodes(t *testing.T) {
+	for _, queryType := range []string{findNodeType, getPeersType} {
+		t.Run(queryType, func(t *testing.T) {
+			d, remote := newKRPCTestDHT(t)
+			d.Mode = "CrawlMode"
+			known, err := newNode(strings.Repeat("k", 20), "udp4", "8.8.8.8:6881")
+			if err != nil || !d.routingTable.Insert(known) {
+				t.Fatal("could not seed routing table")
+			}
+			a := map[string]interface{}{"id": strings.Repeat("r", 20)}
+			if queryType == findNodeType {
+				a["target"] = strings.Repeat("t", 20)
+			} else {
+				a["info_hash"] = strings.Repeat("h", 20)
+			}
+			addr := remote.LocalAddr().(*net.UDPAddr)
+			if !handleRequest(d, addr, makeQuery("cq", queryType, a)) {
+				t.Fatal("crawl-mode request rejected")
+			}
+			message := readKRPCTestMessage(t, remote)
+			r, ok := message["r"].(map[string]interface{})
+			if message["t"] != "cq" || !ok {
+				t.Fatalf("expected response, got %v", message)
+			}
+			if nodes, _ := r["nodes"].(string); nodes != known.CompactNodeInfo() {
+				t.Fatalf("nodes = %q, want the known contact", nodes)
+			}
+			target, _ := a["target"].(string)
+			if queryType == getPeersType {
+				target = a["info_hash"].(string)
+			}
+			// Crawl mode impersonates a neighbor of the requested target.
+			if id, _ := r["id"].(string); len(id) != 20 || id[:15] != target[:15] {
+				t.Fatalf("responder id %q is not a neighbor of %q", id, target)
+			}
+
+		})
 	}
 }

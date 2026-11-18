@@ -14,6 +14,8 @@ services:
       CONFIG_FILE_PATH: "/app/config.yml"
       APP_ENV: prod
       SPIDER_STATUS_ADDR: ":30081"
+      # Public IP other DHT nodes see (BEP-42 node ID). Empty: looked up at startup.
+      DHT_PUBLIC_IP: "${DHT_PUBLIC_IP:-}"
     command:
       - ./dht-spider
       - -port=${DHT_PORT:-6881}

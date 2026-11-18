@@ -27,8 +27,9 @@ const (
 const (
 	// BLOCK is 2 ^ 14
 	BLOCK = 16384
-	// MaxMetadataSize represents the max medata it can accept
-	MaxMetadataSize = BLOCK * 1000
+	// MaxMetadataSize bounds what one peer can make us buffer before the
+	// SHA1 check. Real info dictionaries are rarely above 1 MiB.
+	MaxMetadataSize = BLOCK * 256
 	// EXTENDED represents it is extended message
 	EXTENDED = 20
 	// HANDSHAKE represents handshake bit
@@ -604,7 +605,10 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 	if err := sendExtHandshake(conn); err != nil {
 		return err
 	}
-	var pieces [][]byte
+	// Pieces land directly in one buffer: no per-piece slices and no final
+	// join copy, so a peer can pin at most metadataSize bytes here.
+	var metadata []byte
+	var have []bool
 	var metadataSize, utMetadata, nextPiece, received int
 	for {
 		if !time.Now().Before(deadline) {
@@ -633,7 +637,7 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 			if err != nil {
 				return errMetadataProtocol
 			}
-			if pieces != nil {
+			if have != nil {
 				if id != utMetadata || size != metadataSize {
 					return errMetadataProtocol
 				}
@@ -642,7 +646,7 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 			finishStage(nil)
 			stage, started = "pieces", time.Now()
 			utMetadata, metadataSize = id, size
-			pieces = make([][]byte, (size+BLOCK-1)/BLOCK)
+			have = make([]bool, (size+BLOCK-1)/BLOCK)
 			writerDone = make(chan struct{})
 			go func() {
 				defer close(writerDone)
@@ -651,7 +655,7 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 					_ = raw.Close()
 				}
 			}()
-			for nextPiece < min(8, len(pieces)) {
+			for nextPiece < min(8, len(have)) {
 				requests <- nextPiece
 				nextPiece++
 			}
@@ -660,7 +664,7 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 		if extendedID != localMetadataID {
 			continue
 		}
-		if pieces == nil {
+		if have == nil {
 			return errMetadataProtocol
 		}
 		d, index, err := DecodeDict(payload, 0)
@@ -690,15 +694,21 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 		if len(payload)-index != expected {
 			return errMetadataProtocol
 		}
-		if pieces[piece] != nil {
-			if !bytes.Equal(pieces[piece], payload[index:]) {
+		offset := piece * BLOCK
+		if have[piece] {
+			if !bytes.Equal(metadata[offset:offset+expected], payload[index:]) {
 				return errMetadataProtocol
 			}
 			continue
 		}
-		pieces[piece] = payload[index:]
+		if metadata == nil {
+			// Allocate only once a correctly sized piece has arrived.
+			metadata = make([]byte, metadataSize)
+		}
+		copy(metadata[offset:], payload[index:])
+		have[piece] = true
 		received++
-		if nextPiece < len(pieces) {
+		if nextPiece < len(have) {
 			select {
 			case requests <- nextPiece:
 				nextPiece++
@@ -710,10 +720,10 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 				return context.DeadlineExceeded
 			}
 		}
-		if received != len(pieces) {
+		if received != len(have) {
 			continue
 		}
-		metadataInfo := bytes.Join(pieces, nil)
+		metadataInfo := metadata
 		hash := sha1.Sum(metadataInfo)
 		if !bytes.Equal(r.InfoHash, hash[:]) {
 			return errMetadataHashMismatch

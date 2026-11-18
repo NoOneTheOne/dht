@@ -84,18 +84,22 @@ func (bl *blackList) clear(stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 		}
-		keys := make([]interface{}, 0, 100)
-
-		for item := range bl.list.Iter() {
-			if time.Since(
-				item.val.(*blockedItem).createTime) > bl.expiredAfter {
-
-				keys = append(keys, item.key)
-			}
-		}
-
-		bl.list.DeleteMulti(keys)
+		bl.sweep()
 	}
+}
+
+// sweep removes expired ip:port entries.
+func (bl *blackList) sweep() {
+	keys := make([]interface{}, 0, 100)
+	for item := range bl.list.Iter() {
+		blocked := item.val.(*blockedItem)
+		// IP-only entries (configured BlockedIPs, our own addresses) are
+		// permanent; in() never expires them either.
+		if blocked.port >= 0 && time.Since(blocked.createTime) > bl.expiredAfter {
+			keys = append(keys, item.key)
+		}
+	}
+	bl.list.DeleteMulti(keys)
 }
 
 // len returns the number of items in the blacklist.

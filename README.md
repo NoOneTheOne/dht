@@ -96,11 +96,14 @@ docker compose down
 |--------|--------|------|
 | `DHT_PORT` | `6881` | Spider UDP 监听端口 |
 | `DHT_IMAGE_TAG` | 必填 | Docker 镜像标签，复制 `.env.example` 获取当前值 |
-| `DHT_QUERY_WORKERS` | `64` | DHT 并发查询数 |
+| `DHT_QUERY_WORKERS` | `512` | DHT 并发查询数（直接运行二进制时 `-query-workers` 默认 64） |
 | `DHT_QUERY_TIMEOUT` | `5s` | 单次 DHT 查询超时 |
 | `DHT_METADATA_WORKERS` | `64` | 元数据并发抓取数 |
+| `DHT_PUBLIC_IP` | 空 | 其他 DHT 节点看到的公网 IP，用于生成 BEP-42 节点 ID；留空时启动时自动查询 |
 | `SEARCH_PORT` | `30080` | Search API HTTP 端口 |
 | `CONFIG_FILE_PATH` | `./config.yml` | 配置文件路径（容器内） |
+
+MySQL 写入失败的批次会暂存在 `RECOVERY_FILE_PATH`（容器内默认 `/app/data/recovery.jsonl`）并每分钟重放；被 MySQL 因数据本身拒绝的单条记录会转存到同目录的 `recovery.rejected.jsonl`，不会自动重放，需人工检查。
 
 ### 配置文件
 
@@ -122,23 +125,27 @@ docker compose down
 
 **请求**：
 ```
-GET /search?name={keyword}
+GET /search?name={keyword}&page={page}
 ```
 
 **参数**：
 - `name`（必填）：搜索关键词，最大 200 字节
+- `page`（可选）：页码，从 1 开始，默认 1；每页固定 50 条
 
 **响应**：
 ```json
 {
   "total": 100,
+  "page": 1,
+  "page_size": 50,
   "items": [
     {
       "name": "示例文件名",
       "infohash": "0123456789abcdef0123456789abcdef01234567",
       "time": "2026-11-06T10:00:00Z",
       "length": 1073741824,
-      "count": 5
+      "count": 5,
+      "has_files": true
     }
   ]
 }
@@ -151,6 +158,31 @@ GET /search?name={keyword}
 - `time`：发现时间
 - `length`：文件大小（字节）
 - `count`：热度（被发现的次数）
+- `has_files`：是否已保存文件列表（可通过详情接口获取）
+
+### 热榜接口
+
+```
+GET /api/trending?window={1h|24h|7d}&limit={1..100}
+```
+
+按时间窗口内的采集次数排序，默认 `window=24h`、`limit=10`。返回 `items`（字段同搜索结果，`count` 为窗口内次数）及 `window`、`limit`、`since`、`until`。
+
+### 资源详情接口
+
+```
+GET /api/torrents/{infohash}
+```
+
+返回单个资源及其完整文件列表 `files`（`[{"path": [...], "length": n}]`）；未保存文件列表时返回 `404`。
+
+### 系统状态接口
+
+```
+GET /api/status
+```
+
+汇总 Spider 状态（通过 `SPIDER_STATUS_URL` 拉取）与数据库收录统计，结果缓存 10 秒并在后台刷新，`status` 为 `operational`、`degraded` 或 `outage`，`issues` 列出具体问题。
 
 ### 健康检查
 
@@ -184,8 +216,9 @@ GET /health
 
 **状态码**：
 - `200`：服务正常
-- `206`：配置未加载（降级）
 - `503`：MySQL 不可用（不健康）
+
+配置文件缺失或无法解析时，服务在启动阶段直接退出。
 
 ### Prometheus 指标
 
@@ -225,7 +258,7 @@ GET /metrics
 - 静态深色背景与响应式布局，移动端使用资源卡片
 - 搜索支持回车提交、超时提示、取消旧请求及失败重试
 - 结果支持键盘操作的列排序，排序仅作用于当前最多 50 条结果
-- InfoHash 与磁力链接复制，资源名称可唤起支持磁力链接的客户端
+- InfoHash 与磁力链接复制；点击资源名称进入详情页查看文件列表，详情页提供可唤起客户端的磁力链接
 - 文件大小自动转换二进制单位（B/KiB/MiB/GiB/TiB/PiB/EiB）
 - 展示成功写入元数据的采集次数，不代表在线 Peer 数
 
@@ -252,12 +285,19 @@ cp config/config.yml.example config/config.yml
 
 3. 运行 Spider（嗅探器）：
 ```bash
-go run cmd/spider/spider.go
+CONFIG_FILE_PATH=config/config.yml go run ./cmd/spider
 ```
 
 4. 运行 Search API（新终端）：
 ```bash
-go run ./cmd/search
+CONFIG_FILE_PATH=config/config.yml go run ./cmd/search
+```
+
+`go run` 只提供 API。Search 从可执行文件同级的 `web/` 目录加载前端，如需 Web UI：
+```bash
+make build-search
+(cd web && npm ci && npm run build) && cp -r web/dist build/web
+CONFIG_FILE_PATH=config/config.yml ./build/dht-search
 ```
 
 ### 构建 Docker 镜像
@@ -304,6 +344,10 @@ A: 程序会自动创建表，如果仍然报错，请检查 MySQL 用户是否�
 ### Q: 搜索结果为空
 
 A: Spider 需要时间嗅探网络，刚启动时数据库可能没有数据。等待几分钟后再搜索。
+
+### Q: `_observations` 表是做什么的？会一直增长吗？
+
+A: 每批写入都会在 `<table>_observations` 中记录观测明细，用于批次幂等（故障恢复重放不会重复计数）和热榜统计。Spider 每小时删除 8 天前已应用的记录（热榜最长窗口为 7 天），表大小保持稳定。
 
 ### Q: 如何修改端口
 

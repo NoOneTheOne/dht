@@ -2,77 +2,55 @@ package dht
 
 import (
 	"crypto/rand"
-	"crypto/sha1"
-	"encoding/binary"
+	"hash/crc32"
 	"net"
 )
 
-// BEP-42: Generate node ID based on IP address
-// The first 8 bits of node ID must be derived from the IP address
-// This helps prevent Sybil attacks
+// BEP-42 (DHT security extension): the top 21 bits of a node ID are derived
+// from the node's external IP so that peers can reject forged IDs.
+// See https://www.bittorrent.org/beps/bep_0042.html.
 
-// generateNodeID generates a BEP-42 compliant node ID from an IP address
+var (
+	castagnoli = crc32.MakeTable(crc32.Castagnoli)
+	bep42Mask4 = []byte{0x03, 0x0f, 0x3f, 0xff}
+	bep42Mask6 = []byte{0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff}
+)
+
+// bep42Prefix returns the CRC32-C over the masked IP with r folded into the
+// top three bits, or false for addresses BEP-42 does not cover.
+func bep42Prefix(ip net.IP, r byte) (uint32, bool) {
+	var masked []byte
+	if ip4 := ip.To4(); ip4 != nil {
+		masked = make([]byte, len(bep42Mask4))
+		for i, m := range bep42Mask4 {
+			masked[i] = ip4[i] & m
+		}
+	} else if ip6 := ip.To16(); ip6 != nil {
+		masked = make([]byte, len(bep42Mask6))
+		for i, m := range bep42Mask6 {
+			masked[i] = ip6[i] & m
+		}
+	} else {
+		return 0, false
+	}
+	masked[0] |= (r & 0x07) << 5
+	return crc32.Checksum(masked, castagnoli), true
+}
+
+// generateNodeID generates a BEP-42 compliant node ID for ip. Addresses that
+// BEP-42 cannot cover produce a fully random ID.
 func generateNodeID(ip net.IP) string {
 	id := make([]byte, 20)
-
-	// Fill with random bytes first
 	rand.Read(id)
 
-	// Apply BEP-42: mask the first byte based on IP hash
-	if ip4 := ip.To4(); ip4 != nil {
-		// IPv4: use first 3 octets for hash
-		mask := generateIPv4Mask(ip4)
-		id[0] = (id[0] & mask) | (mask ^ 0xFF)
-	} else if ip6 := ip.To16(); ip6 != nil {
-		// IPv6: use first 6 octets for hash
-		mask := generateIPv6Mask(ip6)
-		id[0] = (id[0] & mask) | (mask ^ 0xFF)
+	r := id[19] & 0x07
+	crc, ok := bep42Prefix(ip, r)
+	if !ok {
+		return string(id)
 	}
-
-	// BEP-42: Set the last byte's top 3 bits to 0b000
-	id[19] = id[19] & 0x7F
-
+	id[0] = byte(crc >> 24)
+	id[1] = byte(crc >> 16)
+	id[2] = byte(crc>>8)&0xf8 | id[2]&0x07
+	// id[19] stays random; its low three bits are r.
 	return string(id)
-}
-
-// generateIPv4Mask generates the mask for IPv4 address
-// BEP-42: r = IP[0..3] & 0x03000000 (for IPv4)
-func generateIPv4Mask(ip net.IP) byte {
-	// Create a 4-byte representation
-	ipBytes := ip.To4()
-	if ipBytes == nil {
-		return 0xFF
-	}
-
-	// r = (ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]
-	// r = r & 0x03000000
-	// This extracts bits 25-24 of the IP (from the second octet)
-	r := binary.BigEndian.Uint32(ipBytes)
-	r = r & 0x03000000
-
-	// Hash r to get the mask
-	hash := sha1.New()
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, r)
-	hash.Write(buf)
-	result := hash.Sum(nil)
-
-	// Return first byte as mask
-	return result[0]
-}
-
-// generateIPv6Mask generates the mask for IPv6 address
-// BEP-42: r = IP[0..5] for IPv6
-func generateIPv6Mask(ip net.IP) byte {
-	ipBytes := ip.To16()
-	if ipBytes == nil {
-		return 0xFF
-	}
-
-	// Use first 6 bytes for IPv6
-	hash := sha1.New()
-	hash.Write(ipBytes[0:6])
-	result := hash.Sum(nil)
-
-	return result[0]
 }

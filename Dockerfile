@@ -1,7 +1,8 @@
 FROM node:20-alpine AS web-builder
 WORKDIR /web
-COPY web/package.json web/package-lock.json* ./
-RUN npm install
+COPY web/package.json web/package-lock.json ./
+# Install exactly the locked versions; fails if the lockfile is out of date.
+RUN npm ci
 COPY web/ .
 RUN npm run build
 
