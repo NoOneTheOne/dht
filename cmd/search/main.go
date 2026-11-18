@@ -35,7 +35,7 @@ func main() {
 	gin.DefaultWriter = logging.Writer(slog.LevelInfo)
 	gin.DefaultErrorWriter = logging.Writer(slog.LevelError)
 	// Fail at startup, not on the first request: GetConfig exits on error.
-	cfg := config.GetConfig()
+	config.RequireMySQL(config.GetConfig())
 	router := gin.New()
 	// Recovery is innermost so access logs and metrics still see the 500
 	// produced for a panicking handler.
@@ -63,7 +63,7 @@ func main() {
 			"goroutines":   runtime.NumGoroutine(),
 			"memory":       getMemoryUsage(),
 			"config":       "loaded",
-			"storage_type": cfg.Storage.Type,
+			"storage_type": "mysql",
 		}
 
 		// Check MySQL connection

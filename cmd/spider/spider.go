@@ -24,6 +24,7 @@ import (
 	"github.com/NoOneTheOne/dht/internal/metrics"
 	"github.com/NoOneTheOne/dht/internal/nat"
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func metadataLength(value interface{}) (int64, bool) {
@@ -270,10 +271,7 @@ func main() {
 	if *port < 1 || *port > 65535 || *queryWorkers < 1 || *metadataWorkers < 1 || *queryTimeout <= 0 {
 		logging.Fatal("port must be 1..65535, worker limits and query timeout must be positive")
 	}
-	var c = config.GetConfig()
-	if c.Storage.Type != "mysql" {
-		logging.Fatalf("unsupported storage type %q: only mysql is supported", c.Storage.Type)
-	}
+	config.RequireMySQL(config.GetConfig())
 
 	natStop := make(chan struct{})
 	defer close(natStop)
@@ -375,6 +373,9 @@ func main() {
 	})
 
 	statusMux := http.NewServeMux()
+	// Prometheus metrics for the crawler: DHT, protocol outcomes, queues and
+	// metadata stage timings only exist in this process.
+	statusMux.Handle("GET /metrics", promhttp.Handler())
 	statusMux.HandleFunc("GET /status", func(wr http.ResponseWriter, r *http.Request) {
 		stats := d.GetDHTStats()
 		_, _, active := w.QueueStats()

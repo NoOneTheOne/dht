@@ -1,3 +1,12 @@
+# MySQL settings shared by both services. Required values fail
+# `docker compose config` early when missing; define them in .env.
+x-mysql-env: &mysql-env
+  DHT_MYSQL_ADDRESS: "${DHT_MYSQL_ADDRESS:?DHT_MYSQL_ADDRESS must be set (host:port)}"
+  DHT_MYSQL_USER: "${DHT_MYSQL_USER:?DHT_MYSQL_USER must be set}"
+  DHT_MYSQL_PASSWORD: "${DHT_MYSQL_PASSWORD:-}"
+  DHT_MYSQL_DATABASE: "${DHT_MYSQL_DATABASE:?DHT_MYSQL_DATABASE must be set}"
+  DHT_MYSQL_TABLE: "${DHT_MYSQL_TABLE:?DHT_MYSQL_TABLE must be set}"
+
 services:
   dht-spider:
     image: dht-spider:${DHT_IMAGE_TAG:?DHT_IMAGE_TAG must be set}
@@ -11,9 +20,11 @@ services:
       target: spider
     container_name: dht-spider
     environment:
-      CONFIG_FILE_PATH: "/app/config.yml"
+      <<: *mysql-env
       APP_ENV: prod
       SPIDER_STATUS_ADDR: ":30081"
+      # Extra DHT bootstrap nodes (host:port, comma-separated); built-ins are always used.
+      DHT_BOOTSTRAP_NODES: "${DHT_BOOTSTRAP_NODES:-}"
       # Public IP other DHT nodes see (BEP-42 node ID). Empty: looked up at startup.
       DHT_PUBLIC_IP: "${DHT_PUBLIC_IP:-}"
     command:
@@ -24,8 +35,9 @@ services:
       - -metadata-workers=${DHT_METADATA_WORKERS:-64}
     ports:
       - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
+      # Crawler /status and /metrics, reachable from this host only.
+      - "127.0.0.1:${SPIDER_STATUS_PORT:-30081}:30081"
     volumes:
-      - ./config/config.yml:/app/config.yml:ro
       - spider-data:/app/data
     stop_grace_period: 60s
     restart: unless-stopped
@@ -43,8 +55,8 @@ services:
     container_name: dht-search
     environment:
       SEARCH_API_PORT: "30080"
+      <<: *mysql-env
       SPIDER_STATUS_URL: "http://dht-spider:30081/status"
-      CONFIG_FILE_PATH: "/app/config.yml"
       APP_ENV: prod
     healthcheck:
       test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:30080/health"]
@@ -54,8 +66,6 @@ services:
       start_period: 15s
     ports:
       - "${SEARCH_PORT:-30080}:30080"
-    volumes:
-      - ./config/config.yml:/app/config.yml:ro
     restart: unless-stopped
 
 volumes:

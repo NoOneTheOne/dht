@@ -200,8 +200,9 @@ var (
 		},
 	)
 
-	// DHT network metrics
-	dhtRoutingTableNodes = promauto.NewGaugeFunc(
+	// DHT network metrics. Only the spider has DHT data, so these are
+	// registered by SetDHTStatsGetter rather than for every process.
+	dhtRoutingTableNodes = prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "dht_routing_table_nodes",
 			Help: "Number of nodes in the DHT routing table",
@@ -214,7 +215,7 @@ var (
 		},
 	)
 
-	dhtBootstrapCount = promauto.NewCounterFunc(
+	dhtBootstrapCount = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{
 			Name: "dht_bootstrap_total",
 			Help: "Total number of bootstrap attempts",
@@ -227,7 +228,7 @@ var (
 		},
 	)
 
-	dhtPacketsReceived = promauto.NewCounterFunc(
+	dhtPacketsReceived = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{
 			Name: "dht_packets_received_total",
 			Help: "Total number of UDP packets received",
@@ -240,7 +241,7 @@ var (
 		},
 	)
 
-	dhtPacketsSent = promauto.NewCounterFunc(
+	dhtPacketsSent = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{
 			Name: "dht_packets_sent_total",
 			Help: "Total number of UDP packets sent",
@@ -253,7 +254,7 @@ var (
 		},
 	)
 
-	dhtActiveTransactions = promauto.NewGaugeFunc(
+	dhtActiveTransactions = prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "dht_active_transactions",
 			Help: "Number of active DHT transactions",
@@ -266,7 +267,7 @@ var (
 		},
 	)
 
-	dhtBlacklistedNodes = promauto.NewGaugeFunc(
+	dhtBlacklistedNodes = prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "dht_blacklisted_nodes",
 			Help: "Number of blacklisted nodes",
@@ -279,7 +280,7 @@ var (
 		},
 	)
 
-	dhtPacketsDropped = promauto.NewCounterFunc(
+	dhtPacketsDropped = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{Name: "dht_packets_dropped_total", Help: "Total number of dropped DHT packets"},
 		func() float64 {
 			if dhtStatsGetter != nil {
@@ -288,7 +289,7 @@ var (
 			return 0
 		},
 	)
-	dhtMetadataRequestsDropped = promauto.NewCounterFunc(
+	dhtMetadataRequestsDropped = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{Name: "dht_metadata_requests_dropped_total", Help: "Total number of dropped metadata requests"},
 		func() float64 {
 			if dhtStatsGetter != nil {
@@ -297,7 +298,7 @@ var (
 			return 0
 		},
 	)
-	dhtMetadataResponsesDropped = promauto.NewCounterFunc(
+	dhtMetadataResponsesDropped = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{Name: "dht_metadata_responses_dropped_total", Help: "Total number of dropped metadata responses"},
 		func() float64 {
 			if dhtStatsGetter != nil {
@@ -307,7 +308,7 @@ var (
 		},
 	)
 
-	dhtTorrentsDiscovered = promauto.NewCounterFunc(
+	dhtTorrentsDiscovered = prometheus.NewCounterFunc(
 		prometheus.CounterOpts{
 			Name: "dht_torrents_discovered_total",
 			Help: "Total number of torrents discovered",
@@ -389,13 +390,21 @@ func (c *protocolCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func init() {
-	prometheus.MustRegister(&protocolCollector{
-		events:  prometheus.NewDesc("dht_protocol_events_total", "Protocol outcomes by bounded stage and reason", []string{"stage", "reason"}, nil),
-		queues:  prometheus.NewDesc("dht_queue_depth", "Current buffered jobs by queue", []string{"queue"}, nil),
-		workers: prometheus.NewDesc("dht_active_workers", "Current active workers by pool", []string{"pool"}, nil),
-	})
+// dhtCollectors are the metrics backed by DHTStats.
+func dhtCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		dhtRoutingTableNodes, dhtBootstrapCount, dhtPacketsReceived, dhtPacketsSent,
+		dhtActiveTransactions, dhtBlacklistedNodes, dhtTorrentsDiscovered, dhtPacketsDropped,
+		dhtMetadataRequestsDropped, dhtMetadataResponsesDropped,
+		&protocolCollector{
+			events:  prometheus.NewDesc("dht_protocol_events_total", "Protocol outcomes by bounded stage and reason", []string{"stage", "reason"}, nil),
+			queues:  prometheus.NewDesc("dht_queue_depth", "Current buffered jobs by queue", []string{"queue"}, nil),
+			workers: prometheus.NewDesc("dht_active_workers", "Current active workers by pool", []string{"pool"}, nil),
+		},
+	}
 }
+
+var registerDHTOnce sync.Once
 
 // DHTStats holds DHT network statistics
 type DHTStats struct {
@@ -419,9 +428,14 @@ func SetMySQLStatsGetter(getter func() (open, inUse, idle int)) {
 	mysqlStatsGetter = getter
 }
 
-// SetDHTStatsGetter sets the function to get DHT statistics
+// SetDHTStatsGetter sets the function to get DHT statistics and, the first
+// time it is given one, registers the DHT metrics. Processes without a DHT
+// (the search service) therefore expose no always-zero DHT series.
 func SetDHTStatsGetter(getter func() DHTStats) {
 	dhtStatsGetter = getter
+	if getter != nil {
+		registerDHTOnce.Do(func() { prometheus.MustRegister(dhtCollectors()...) })
+	}
 }
 
 func getMySQLOpenConnections() float64 {

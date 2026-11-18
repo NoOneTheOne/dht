@@ -303,11 +303,14 @@ func WriteBatch(items []Data) error {
 	return WriteBatchWithID(batchID, items)
 }
 
+// upsertRows writes one INSERT ... ON DUPLICATE KEY UPDATE statement per row.
+// Do not batch them: in a multi-row statement, InnoDB drops the full-text
+// document of every newly inserted row that precedes a row taking the
+// update path, so mixing new and re-observed torrents in one statement
+// silently hides the new ones from search. One row per statement inside the
+// caller's transaction keeps both the counts and the index correct.
 func upsertRows(tx *gorm.DB, values []Data) error {
-	for i := range values {
-		values[i].FileNames = fileNamesText(values[i].Files)
-	}
-	return tx.Clauses(clause.OnConflict{
+	upsert := clause.OnConflict{
 		Columns: []clause.Column{{Name: "infohash"}},
 		// MySQL evaluates assignments left to right; inspect the old files before replacing them.
 		DoUpdates: clause.Set{
@@ -316,7 +319,14 @@ func upsertRows(tx *gorm.DB, values []Data) error {
 			{Column: clause.Column{Name: "file_names"}, Value: gorm.Expr("IF((`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL') AND JSON_LENGTH(VALUES(`files`)) > 0, VALUES(`file_names`), `file_names`)")},
 			{Column: clause.Column{Name: "files"}, Value: gorm.Expr("IF(`files` IS NULL OR JSON_LENGTH(`files`) = 0 OR JSON_TYPE(`files`) = 'NULL', VALUES(`files`), `files`)")},
 		},
-	}).Create(&values).Error
+	}
+	for i := range values {
+		values[i].FileNames = fileNamesText(values[i].Files)
+		if err := tx.Clauses(upsert).Create(&values[i]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func WriteBatchWithID(batchID string, items []Data) error {
@@ -420,6 +430,10 @@ const (
 	fileNamesMaxRunes = 2000
 	backfillBatch     = 200
 	searchIndexLock   = "dht_search_indexes"
+	// searchIndexGeneration tags the full-text indexes (as their comment).
+	// Bump it to make EnsureSearchIndexes rebuild them. v2: rebuilt after the
+	// multi-row upsert bug left new rows out of the v1 indexes.
+	searchIndexGeneration = "dht-search-v2"
 )
 
 // EnsureSearchIndexes builds the full-text search schema: an ngram index on
@@ -463,29 +477,41 @@ func EnsureSearchIndexes(ctx context.Context) error {
 		started := time.Now()
 		if err := db.Exec(sql, args...).Error; err != nil {
 			var mysqlErr *mysqlDriver.MySQLError
-			if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1060 || mysqlErr.Number == 1061) {
-				return nil // Column or index created concurrently.
+			// 1060/1061: column or index created concurrently; 1091: already dropped.
+			if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1060 || mysqlErr.Number == 1061 || mysqlErr.Number == 1091) {
+				return nil
 			}
 			return fmt.Errorf("%s: %w", event, err)
 		}
 		slog.Info("search index step finished", "component", "mysql", "event", event, "duration_ms", time.Since(started).Milliseconds())
 		return nil
 	}
-	migrator := db.Migrator()
-	if !migrator.HasIndex(&Data{}, nameFulltextIndex) {
-		if err := step("name_fulltext_created", "CREATE FULLTEXT INDEX `"+nameFulltextIndex+"` ON ? (`name`) WITH PARSER ngram", table); err != nil {
+	// ensureIndex creates a full-text index tagged with searchIndexGeneration,
+	// rebuilding an existing index with an older tag: a rebuild re-tokenizes
+	// every row, restoring documents an earlier writer failed to index.
+	ensureIndex := func(index, columns, event string) error {
+		var comments []string
+		if err := db.Raw("SELECT INDEX_COMMENT FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+			table.Name, index).Scan(&comments).Error; err != nil {
 			return err
 		}
+		if len(comments) > 0 && comments[0] == searchIndexGeneration {
+			return nil
+		}
+		if len(comments) > 0 {
+			if err := step(event+"_outdated_dropped", "DROP INDEX `"+index+"` ON ?", table); err != nil {
+				return err
+			}
+		}
+		return step(event, "CREATE FULLTEXT INDEX `"+index+"` ON ? ("+columns+") WITH PARSER ngram COMMENT '"+searchIndexGeneration+"'", table)
+	}
+	if err := ensureIndex(nameFulltextIndex, "`name`", "name_fulltext_created"); err != nil {
+		return err
 	}
 	if err := backfillFileNames(ctx, db); err != nil {
 		return err
 	}
-	if !migrator.HasIndex(&Data{}, searchFulltextIndex) {
-		if err := step("search_fulltext_created", "CREATE FULLTEXT INDEX `"+searchFulltextIndex+"` ON ? (`name`, `"+fileNamesColumn+"`) WITH PARSER ngram", table); err != nil {
-			return err
-		}
-	}
-	return nil
+	return ensureIndex(searchFulltextIndex, "`name`, `"+fileNamesColumn+"`", "search_fulltext_created")
 }
 
 // fileNamesText renders a file list as searchable text: every distinct

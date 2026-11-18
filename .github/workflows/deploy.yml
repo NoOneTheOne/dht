@@ -140,7 +140,7 @@ jobs:
             directory="packages/$name"
             mkdir -p "$directory"
             go build -trimpath -ldflags "-s -w -X github.com/NoOneTheOne/dht/internal/logging.Version=$version -X github.com/NoOneTheOne/dht/internal/logging.Revision=$GITHUB_SHA -X github.com/NoOneTheOne/dht/internal/logging.Environment=$BUILD_ENV" -o "$directory/dht-${binary}${extension}" "./cmd/$binary"
-            cp config/config.yml.example "$directory/config.yml.example"
+            cp .env.example "$directory/.env.example"
             cp LICENSE "$directory/LICENSE"
             if [[ "$binary" == search ]]; then
               mkdir -p "$directory/web"
@@ -240,17 +240,14 @@ jobs:
 
       - name: Prepare configuration
         run: |
-          test -r /volume/dht/config.yml || {
-            echo "ERROR: /volume/dht/config.yml is not readable on runner"
+          # Runner-only settings: MySQL credentials, ports, worker limits.
+          # The job's DHT_IMAGE_TAG still wins, so the tag always selects the image.
+          test -r /volume/dht/.env || {
+            echo "ERROR: /volume/dht/.env is not readable on runner; see .env.example"
             exit 1
           }
-          install -d -m 700 config
-          install -m 644 /volume/dht/config.yml config/config.yml
-          # Optional runner-only overrides (ports, worker limits, DHT_PUBLIC_IP).
-          # The job's DHT_IMAGE_TAG still wins, so the tag always selects the image.
-          if [[ -f /volume/dht/.env ]]; then
-            install -m 600 /volume/dht/.env .env
-          fi
+          install -m 600 /volume/dht/.env .env
+          # Fails, naming the variable, when a required setting is missing.
           docker compose config --quiet
 
       - name: Build missing images without overwriting released tags

@@ -98,3 +98,31 @@ func TestProtocolCollector(t *testing.T) {
 		t.Fatalf("collector without getter: %v %v", families, err)
 	}
 }
+
+func TestDHTCollectorsReportStatsGetter(t *testing.T) {
+	previous := dhtStatsGetter
+	t.Cleanup(func() { dhtStatsGetter = previous })
+	dhtStatsGetter = func() DHTStats {
+		return DHTStats{RoutingTableNodes: 42, PacketsReceived: 7, TorrentsDiscovered: 3}
+	}
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(dhtCollectors()...)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]float64{}
+	for _, family := range families {
+		for _, metric := range family.Metric {
+			switch {
+			case metric.Gauge != nil:
+				values[family.GetName()] = metric.Gauge.GetValue()
+			case metric.Counter != nil:
+				values[family.GetName()] = metric.Counter.GetValue()
+			}
+		}
+	}
+	if values["dht_routing_table_nodes"] != 42 || values["dht_packets_received_total"] != 7 || values["dht_torrents_discovered_total"] != 3 {
+		t.Fatalf("DHT metrics do not reflect the stats getter: %v", values)
+	}
+}

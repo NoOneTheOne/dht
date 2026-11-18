@@ -180,6 +180,61 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 		t.Fatalf("file name of a new row not searchable: %q", got)
 	}
 
+	// Regression: a new torrent whose infohash sorts before a re-observed one
+	// in the same batch. A multi-row upsert loses the new row's document.
+	reobserved := items[5] // infohash "fff..."; the new one below sorts first.
+	reobserved.Files = nil // As the scheduler emits re-observations.
+	if err := WriteBatch([]Data{
+		{Name: "brand new qwvx release", InfoHash: strings.Repeat("1", 40), Time: time.Now(), Files: []File{{Path: []string{"n.bin"}, Length: 1}}},
+		reobserved,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := search("qwvx"); len(got) != 1 {
+		t.Fatalf("new row written before a re-observed row is not searchable: %q", got)
+	}
+
+	// Indexes carry the current generation tag.
+	var comments []string
+	db.Raw("SELECT DISTINCT INDEX_COMMENT FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_TYPE = 'FULLTEXT'", cfg.MySQL.Table).Scan(&comments)
+	if len(comments) != 1 || comments[0] != searchIndexGeneration {
+		t.Fatalf("index generation tags = %q, want %q", comments, searchIndexGeneration)
+	}
+
+	// An outdated generation is rebuilt, recovering documents its writers lost.
+	// Lose one on purpose with the multi-row statement order that triggers it.
+	if err := db.Exec("INSERT INTO `"+cfg.MySQL.Table+"` (name, infohash, time, count) VALUES (?, ?, ?, 1), (?, ?, ?, 1) "+
+		"ON DUPLICATE KEY UPDATE count = count + 1", "lost by old writer zkqp", strings.Repeat("2", 40), time.Now(),
+		items[5].Name, items[5].InfoHash, time.Now()).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := search("zkqp"); len(got) != 0 {
+		t.Logf("note: this MySQL indexed the multi-row upsert correctly; recovery is still exercised")
+	}
+	for _, index := range []string{nameFulltextIndex, searchFulltextIndex} {
+		columns := "`name`"
+		if index == searchFulltextIndex {
+			columns = "`name`, `file_names`"
+		}
+		if err := db.Exec("DROP INDEX `" + index + "` ON `" + cfg.MySQL.Table + "`").Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec("CREATE FULLTEXT INDEX `" + index + "` ON `" + cfg.MySQL.Table + "` (" + columns + ") WITH PARSER ngram COMMENT 'dht-search-v1'").Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := EnsureSearchIndexes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	comments = nil
+	db.Raw("SELECT DISTINCT INDEX_COMMENT FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_TYPE = 'FULLTEXT'", cfg.MySQL.Table).Scan(&comments)
+	if len(comments) != 1 || comments[0] != searchIndexGeneration {
+		t.Fatalf("outdated indexes not rebuilt: tags %q", comments)
+	}
+	if got, _ := search("zkqp"); len(got) != 1 {
+		t.Fatalf("rebuild did not recover the lost document: %q", got)
+	}
+
 	// Without the indexes, searches step down instead of failing.
 	for _, index := range []string{searchFulltextIndex, nameFulltextIndex} {
 		if err := db.Exec("DROP INDEX `" + index + "` ON `" + cfg.MySQL.Table + "`").Error; err != nil {

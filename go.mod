@@ -2,8 +2,6 @@ module github.com/NoOneTheOne/dht
 
 go 1.26.2
 
-require gopkg.in/yaml.v3 v3.0.1
-
 require (
 	github.com/gin-gonic/gin v1.7.4
 	github.com/go-sql-driver/mysql v1.8.1
