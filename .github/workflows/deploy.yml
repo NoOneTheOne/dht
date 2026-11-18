@@ -246,6 +246,11 @@ jobs:
           }
           install -d -m 700 config
           install -m 644 /volume/dht/config.yml config/config.yml
+          # Optional runner-only overrides (ports, worker limits, DHT_PUBLIC_IP).
+          # The job's DHT_IMAGE_TAG still wins, so the tag always selects the image.
+          if [[ -f /volume/dht/.env ]]; then
+            install -m 600 /volume/dht/.env .env
+          fi
           docker compose config --quiet
 
       - name: Build missing images without overwriting released tags
