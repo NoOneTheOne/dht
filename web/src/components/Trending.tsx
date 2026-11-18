@@ -1,5 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { TorrentItem } from '../types';
+import { formatSize } from '../format';
+import RecentCollected from './RecentCollected';
 
 const periods = [{ value: '1h', label: '过去 1 小时' }, { value: '24h', label: '过去 24 小时' }, { value: '7d', label: '过去 7 天' }];
 interface TrendingResponse { items: TorrentItem[]; window: string; limit: number; since: string; until: string }
@@ -11,13 +13,6 @@ function isTrending(value: unknown, period: string, limit: number): value is Tre
     Array.isArray(data.items) && data.items.length <= limit && data.items.every(item => item && typeof item.name === 'string' &&
       typeof item.infohash === 'string' && /^[a-f\d]{40}$/i.test(item.infohash) && typeof item.time === 'string' &&
       Number.isFinite(item.length) && item.length >= 0 && Number.isSafeInteger(item.count) && item.count > 0 && typeof item.has_files === 'boolean');
-}
-
-function formatSize(bytes: number) {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${Number((bytes / 1024 ** index).toFixed(2))} ${units[index]}`;
 }
 
 export default function Trending() {
@@ -73,6 +68,7 @@ export default function Trending() {
   return <section className="trending-section" aria-labelledby="trending-title">
     <a className="detail-back" href="#">← 返回搜索</a>
     <div className="trending-heading"><div><span className="eyebrow">TRENDING / DHT NETWORK</span><h1 id="trending-title">资源热榜<span className="trending-top">TOP {limit}</span></h1><p>发现最近被频繁采集的资源，按所选时间范围内的命中次数排序。</p></div><span className="trending-indicator">滚动时间窗口</span></div>
+    <div className="trending-layout"><div className="trending-main">
     <div className="trending-toolbar">
       <div className="trending-periods" role="group" aria-label="热榜时间范围">{periods.map(option => <button key={option.value} aria-pressed={period === option.value} onClick={() => setPeriod(option.value)}>{option.label}</button>)}</div>
       <form className="trending-limit" onSubmit={applyLimit} noValidate><label htmlFor="trending-limit">显示条数</label><input id="trending-limit" type="number" inputMode="numeric" min="1" max="100" step="1" value={draftLimit} aria-invalid={!!validation} aria-describedby="trending-limit-hint" onChange={event => { setDraftLimit(event.target.value); setValidation(''); }} /><button className="page-button" type="submit">应用</button></form>
@@ -88,6 +84,7 @@ export default function Trending() {
       </li>)}</ol>
     </>}
     <p className="results-footnote">命中次数指成功采集并落库的记录，不是网页浏览量或下载次数；仅统计已有观察记录，旧版未记录的时间段无法补算。</p>
+    </div><RecentCollected /></div>
     <div className="copy-notice" role="status" aria-live="polite">{notice}</div>
   </section>;
 }

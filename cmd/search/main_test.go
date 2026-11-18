@@ -390,3 +390,45 @@ func (c *healthConn) Ping(ctx context.Context) error {
 func (*healthConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
 func (*healthConn) Begin() (driver.Tx, error)           { return nil, errors.New("unused") }
 func (*healthConn) Close() error                        { return nil }
+
+func TestRecentHandler(t *testing.T) {
+	for _, tc := range []struct {
+		query         string
+		limit, status int
+	}{
+		{"", 10, 200}, {"limit=1", 1, 200}, {"limit=100", 100, 200},
+		{"limit=0", 0, 400}, {"limit=101", 0, 400}, {"limit=1.5", 0, 400}, {"limit=", 0, 400}, {"limit=-1", 0, 400}, {"limit=x", 0, 400},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			calls := 0
+			router := gin.New()
+			router.GET("/api/recent", recentHandler(func(_ context.Context, limit int) ([]mysql.Data, error) {
+				calls++
+				if limit != tc.limit {
+					t.Fatalf("limit=%d, want %d", limit, tc.limit)
+				}
+				return nil, nil
+			}))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest("GET", "/api/recent?"+tc.query, nil))
+			if response.Code != tc.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if tc.status == 400 && calls != 0 {
+				t.Fatal("invalid parameters queried storage")
+			}
+			if tc.status == 200 && !strings.Contains(response.Body.String(), `"items":[]`) {
+				t.Fatal("empty list must be a JSON array")
+			}
+		})
+	}
+	router := gin.New()
+	router.GET("/api/recent", recentHandler(func(context.Context, int) ([]mysql.Data, error) {
+		return nil, errors.New("secret backend error")
+	}))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest("GET", "/api/recent", nil))
+	if response.Code != 500 || strings.Contains(response.Body.String(), "secret") {
+		t.Fatal("backend failure exposed")
+	}
+}

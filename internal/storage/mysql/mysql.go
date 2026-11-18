@@ -443,6 +443,28 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 	return items, err
 }
 
+// RecentLimitMax bounds the recent-resources list.
+const RecentLimitMax = 100
+
+// Recent returns the most recently collected resources, newest first. `time`
+// is the first-seen time and is indexed, so this is an ordered index scan.
+func Recent(parent context.Context, limit int) ([]Data, error) {
+	if limit < 1 || limit > RecentLimitMax {
+		return nil, fmt.Errorf("invalid recent limit")
+	}
+	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	defer cancel()
+	db, err := GetDBContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]Data, 0, limit)
+	err = db.WithContext(ctx).Model(&Data{}).
+		Select("`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files").
+		Order("`time` DESC, `infohash` DESC").Limit(limit).Find(&items).Error
+	return items, err
+}
+
 type ResourceCounts struct {
 	Total            int64
 	WithFiles        int64

@@ -53,6 +53,7 @@ func main() {
 	router.GET("/search", searchHandler)
 	router.GET("/api/status", statusHandler(crawlerStatusGetter(), mysql.CountResources))
 	router.GET("/api/trending", trendingHandler(mysql.Trending))
+	router.GET("/api/recent", recentHandler(mysql.Recent))
 	router.GET("/api/torrents/:infohash", detailHandler(mysql.Detail))
 
 	router.GET("/health", func(c *gin.Context) {
@@ -192,6 +193,30 @@ func trendingHandler(lookup func(context.Context, time.Duration, int, time.Time)
 			items = []mysql.Data{}
 		}
 		c.JSON(http.StatusOK, gin.H{"items": items, "window": period, "limit": limit, "since": until.Add(-window), "until": until})
+	}
+}
+
+// recentHandler lists the newest collected resources; limit is 1..100, default 10.
+func recentHandler(lookup func(context.Context, int) ([]mysql.Data, error)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		limit, err := strconv.Atoi(c.DefaultQuery("limit", "10"))
+		if err != nil || limit < 1 || limit > mysql.RecentLimitMax {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be 1..100"})
+			return
+		}
+		start := time.Now()
+		items, err := lookup(c.Request.Context(), limit)
+		metrics.RecordMySQLQuery("recent", time.Since(start), err)
+		if err != nil {
+			slog.ErrorContext(c.Request.Context(), "recent lookup failed", "component", "mysql", "event", "recent_failed", "limit", limit, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		if items == nil {
+			items = []mysql.Data{}
+		}
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{"items": items, "limit": limit})
 	}
 }
 

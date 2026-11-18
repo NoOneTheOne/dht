@@ -1057,3 +1057,46 @@ func TestPruneObservationsQuery(t *testing.T) {
 		t.Fatalf("deleted=%d calls=%d err=%v", deleted, calls, err)
 	}
 }
+
+func TestRecentQuery(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	if err := candidate.Callback().Query().After("gorm:query").Register("capture_recent", func(tx *gorm.DB) {
+		calls++
+		sql := tx.Statement.SQL.String()
+		for _, fragment := range []string{"FROM `torrent_test`", "ORDER BY `time` DESC, `infohash` DESC", "LIMIT ?", "AS has_files"} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("missing %q in %s", fragment, sql)
+			}
+		}
+		if strings.Contains(sql, "`files`,") || strings.Contains(sql, "WHERE") {
+			t.Fatalf("recent list must not load file lists or filter rows: %s", sql)
+		}
+		if vars := tx.Statement.Vars; len(vars) != 1 || vars[0] != 25 {
+			t.Fatalf("unexpected vars: %v", vars)
+		}
+		if _, ok := tx.Statement.Context.Deadline(); !ok {
+			t.Fatal("missing timeout")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
+	items, err := Recent(context.Background(), 25)
+	if err != nil || items == nil || calls != 1 {
+		t.Fatalf("items=%v calls=%d err=%v", items, calls, err)
+	}
+	for _, limit := range []int{0, -1, RecentLimitMax + 1} {
+		if _, err := Recent(context.Background(), limit); err == nil {
+			t.Fatalf("limit %d accepted", limit)
+		}
+	}
+}
