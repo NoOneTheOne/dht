@@ -361,12 +361,17 @@ A:
 
 ## 协议支持
 
-本项目实现了以下 BitTorrent DHT 协议规范：
+本项目实现了以下 BitTorrent 协议规范：
 
-- [BEP-3](http://www.bittorrent.org/beps/bep_0003.html) - BitTorrent Protocol（部分）
-- [BEP-5](http://www.bittorrent.org/beps/bep_0005.html) - DHT Protocol
-- [BEP-9](http://www.bittorrent.org/beps/bep_0009.html) - Extension for Peers to Send Metadata Files
-- [BEP-10](http://www.bittorrent.org/beps/bep_0010.html) - Extension Protocol
+- [BEP-3](https://www.bittorrent.org/beps/bep_0003.html) - BitTorrent Protocol（握手与消息帧，仅用于抓取元数据）
+- [BEP-5](https://www.bittorrent.org/beps/bep_0005.html) - DHT Protocol（含未知方法的 204 错误响应）
+- [BEP-9](https://www.bittorrent.org/beps/bep_0009.html) - Extension for Peers to Send Metadata Files
+- [BEP-10](https://www.bittorrent.org/beps/bep_0010.html) - Extension Protocol
+- [BEP-20](https://www.bittorrent.org/beps/bep_0020.html) - Peer ID Conventions
+- [BEP-42](https://www.bittorrent.org/beps/bep_0042.html) - DHT Security Extension（按公网 IP 生成节点 ID，响应中携带 `ip` 字段）
+- [BEP-47](https://www.bittorrent.org/beps/bep_0047.html) - Padding files（文件列表中忽略填充文件）
+- [BEP-51](https://www.bittorrent.org/beps/bep_0051.html) - DHT Infohash Indexing（`sample_infohashes` 采样，遵守对方的 `interval`）
+- [Message Stream Encryption](https://wiki.vuze.com/w/Message_Stream_Encryption)（MSE/PE）- 元数据连接优先加密握手，对方拒绝时回退明文
 
 ## 致谢
 

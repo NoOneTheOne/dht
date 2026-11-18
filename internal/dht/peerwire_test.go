@@ -113,6 +113,7 @@ func TestWireWorkerCompletion(t *testing.T) {
 				}()
 			}()
 			wire := NewWire(8, 2, 1)
+			wire.preferEncryption = false // This fake peer speaks plaintext only.
 			go wire.Run()
 			defer wire.Stop()
 			before := protocolCount("metadata", reason)
@@ -489,7 +490,7 @@ func (shortWireConn) Write(data []byte) (int, error) {
 }
 
 func TestPeerWireHandshakeShortWrite(t *testing.T) {
-	if err := sendHandshake(shortWireConn{}, make([]byte, 20), make([]byte, 20)); !errors.Is(err, io.ErrShortWrite) {
+	if err := sendHandshake(shortWireConn{}, handshakeMessage(make([]byte, 20), make([]byte, 20))); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("handshake short write = %v", err)
 	}
 }

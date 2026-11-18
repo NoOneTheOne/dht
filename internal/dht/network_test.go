@@ -632,6 +632,7 @@ func TestWireFailedWorkerReleasesRequests(t *testing.T) {
 	}
 	defer listener.Close()
 	wire := NewWire(10, 10, 1)
+	wire.preferEncryption = false // This fake peer speaks plaintext only.
 	hash := make([]byte, 20)
 	port := listener.Addr().(*net.TCPAddr).Port
 	done := make(chan struct{})

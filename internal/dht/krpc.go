@@ -119,6 +119,13 @@ func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
 	if dht.reachability != nil {
 		dht.reachability.recordSend(addr)
 	}
+	// BEP-42: tell responders which address we see them from, so nodes
+	// behind NAT can learn their external IP and pick a compliant node ID.
+	if y, _ := data["y"].(string); y == "r" || y == "e" {
+		if compact, err := encodeCompactIPPortInfo(addr.IP, addr.Port); err == nil {
+			data["ip"] = compact
+		}
+	}
 	dht.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err := dht.conn.WriteToUDP([]byte(Encode(data)), addr)
 	if err == nil {
@@ -702,8 +709,15 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		if dht.OnAnnouncePeer != nil {
 			dht.OnAnnouncePeer(infoHash, addr.IP.String(), port)
 		}
+	case sampleInfohashesType:
+		if err := ParseKey(a, "target", "string"); err != nil || len(a["target"].(string)) != 20 {
+			send(dht, addr, makeError(t, protocolError, "invalid target"))
+			return
+		}
+		send(dht, addr, makeResponse(t, dht.sampleReply(a["target"].(string))))
 	default:
-		//		send(dht, addr, makeError(t, protocolError, "invalid q"))
+		// BEP-5: answer unknown methods instead of letting the sender time out.
+		send(dht, addr, makeError(t, methodUnknown, "Method Unknown"))
 		return
 	}
 
@@ -878,6 +892,9 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 					continue
 				}
 				dht.peersManager.Insert(infoHash, p)
+				if trans.lookup != nil {
+					trans.lookup.foundPeer()
+				}
 				if dht.OnGetPeersResponse != nil {
 					dht.OnGetPeersResponse(infoHash, p)
 				}
@@ -887,6 +904,10 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 	case announcePeerType:
+	case sampleInfohashesType:
+		if !dht.onSampleResponse(addr, node, r) {
+			return
+		}
 	default:
 		return
 	}

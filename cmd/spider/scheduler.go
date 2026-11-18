@@ -73,7 +73,8 @@ func (s *hashScheduler) discover(hash, ip string, port int, source string) {
 		return
 	}
 	var peer *dht.Request
-	if source != "get_peers" {
+	// get_peers requests and BEP-51 samples name a hash but no peer.
+	if source != "get_peers" && source != "sample" {
 		if !dht.IsPublicPeerIP(ip) || port < 1 || port > 65535 {
 			return
 		}

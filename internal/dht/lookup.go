@@ -11,6 +11,10 @@ const (
 	peerLookupBudget     = 24
 	peerLookupCandidates = 64
 	peerLookupTimeout    = 45 * time.Second
+	// peerLookupEnough stops a lookup once it has handed this many peers to
+	// the caller (the scheduler keeps at most 8 per hash); the remaining query
+	// budget is better spent on other hashes.
+	peerLookupEnough = 8
 )
 
 type peerLookup struct {
@@ -22,6 +26,14 @@ type peerLookup struct {
 	visited    map[string]bool
 	active     int
 	attempted  int
+	peers      int
+}
+
+// foundPeer counts a peer delivered for this lookup.
+func (l *peerLookup) foundPeer() {
+	l.mu.Lock()
+	l.peers++
+	l.mu.Unlock()
 }
 
 func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
@@ -31,10 +43,12 @@ func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
 	}
 	if existing := d.lookups[hash]; existing != nil {
 		d.lookupMu.Unlock()
+		RecordProtocolEvent("peer_lookup", "not_queued_active")
 		return ErrQueryNotQueued
 	}
 	if len(d.lookups) >= maxPeerLookups {
 		d.lookupMu.Unlock()
+		RecordProtocolEvent("peer_lookup", "not_queued_capacity")
 		return ErrQueryNotQueued
 	}
 	lookup := &peerLookup{dht: d, hash: hash, deadline: time.Now().Add(peerLookupTimeout), visited: make(map[string]bool)}
@@ -45,6 +59,7 @@ func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
 	queued := lookup.advance()
 	lookup.mu.Unlock()
 	if !queued {
+		RecordProtocolEvent("peer_lookup", "not_queued_no_candidates")
 		return ErrQueryNotQueued
 	}
 	RecordProtocolEvent("peer_lookup", "started")
@@ -78,7 +93,8 @@ func (l *peerLookup) addCandidates(nodes []*node) {
 
 func (l *peerLookup) advance() bool {
 	queued := false
-	for len(l.candidates) > 0 && l.active < peerLookupAlpha && l.attempted < peerLookupBudget && time.Now().Before(l.deadline) {
+	for len(l.candidates) > 0 && l.active < peerLookupAlpha && l.attempted < peerLookupBudget &&
+		l.peers < peerLookupEnough && time.Now().Before(l.deadline) {
 		n := l.candidates[0]
 		l.candidates = l.candidates[1:]
 		l.visited[n.addr.String()] = true

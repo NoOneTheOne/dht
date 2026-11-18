@@ -35,6 +35,8 @@ func newKRPCTestDHT(t *testing.T) (*DHT, *net.UDPConn) {
 	d.peersManager = newPeersManager(d)
 	d.tokenManager = newTokenManager(time.Minute, d)
 	d.transactionManager = newTransactionManager(65536, d)
+	d.sampleSchedule = newBoundedSchedule(64)
+	d.lookupHints = newBoundedSchedule(64)
 	return d, remote
 }
 

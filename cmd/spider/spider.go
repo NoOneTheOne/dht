@@ -375,6 +375,11 @@ func main() {
 	initConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
 		scheduler.discover(infoHash, ip, port, "announce_peer")
 	}
+	initConfig.OnSampleInfohashes = func(hashes []string) {
+		for _, hash := range hashes {
+			scheduler.discover(hash, "", 0, "sample")
+		}
+	}
 	initConfig.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
 		scheduler.discover(infoHash, peer.IP.String(), peer.Port, "lookup")
 	}

@@ -69,6 +69,9 @@ type InitParam struct {
 	OnGetPeersResponse func(string, *Peer)
 	// callback when got announce_peer request
 	OnAnnouncePeer func(string, string, int)
+	// OnSampleInfohashes receives BEP-51 samples. Crawl mode only sends
+	// sample_infohashes queries while it is set.
+	OnSampleInfohashes func([]string)
 	// blocked ips
 	BlockedIPs []string
 	// blacklist size
@@ -156,6 +159,9 @@ type DHT struct {
 	reachability        *reachabilityCheck
 	ready               atomic.Bool
 	refreshing          atomic.Bool
+	sampling            atomic.Bool
+	sampleSchedule      *boundedSchedule
+	lookupHints         *boundedSchedule
 	packets             chan packet
 	activePacketWorkers atomic.Int32
 	stopOnce            sync.Once
@@ -246,6 +252,8 @@ func (dht *DHT) init() {
 		log.Printf("[DHT] Node cache load failed: %v", err)
 	}
 	dht.reachability = newReachabilityCheck()
+	dht.sampleSchedule = newBoundedSchedule(maxSampleSchedule)
+	dht.lookupHints = newBoundedSchedule(maxLookupHints)
 
 	dht.background.Go(dht.transactionManager.run)
 	dht.background.Go(func() { dht.blackList.clear(dht.stop) })
@@ -342,6 +350,11 @@ func (dht *DHT) GetPeers(infoHash string) error {
 
 	neighbors := dht.routingTable.GetNeighbors(
 		newBitmapFromString(infoHash), dht.K)
+	// A BEP-51 sampler stores this hash's peers; ask it first.
+	if hint := dht.lookupHint(infoHash); hint != nil {
+		neighbors = append([]*node{hint}, neighbors...)
+		RecordProtocolEvent("peer_lookup", "hinted")
+	}
 
 	return dht.startPeerLookup(infoHash, neighbors)
 }
@@ -405,6 +418,12 @@ func (dht *DHT) RunContext(ctx context.Context) {
 		case <-dht.stop:
 			return
 		case <-kBucketTicker.C:
+			if dht.IsCrawlMode() && dht.OnSampleInfohashes != nil && dht.sampling.CompareAndSwap(false, true) {
+				dht.background.Go(func() {
+					defer dht.sampling.Store(false)
+					dht.sampleRound()
+				})
+			}
 			// Use bootstrap manager to check if re-bootstrap is needed
 			if dht.bootstrapMgr.needsRebootstrap() {
 				dht.background.Go(dht.join)

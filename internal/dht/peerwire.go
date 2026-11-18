@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"bufio"
 	"bytes"
 	"container/list"
 	"context"
@@ -104,6 +105,8 @@ func metadataFailureReason(err error) string {
 		switch stage {
 		case "dial":
 			return "dial_timeout"
+		case "encryption":
+			return "encryption_timeout"
 		case "handshake":
 			return "handshake_timeout"
 		case "extension":
@@ -205,13 +208,32 @@ func sendMessage(conn net.Conn, data []byte) error {
 	return err
 }
 
-// sendHandshake sends handshake message to conn.
-func sendHandshake(conn net.Conn, infoHash, peerID []byte) error {
+// peerIDPrefix is a BEP-20 Azureus-style client tag: "-" + two-letter client
+// code + four version characters + "-". Fully random IDs read as an unknown,
+// possibly hostile client to peers that filter by client.
+const peerIDPrefix = "-DH1A00-"
+
+// newPeerID returns a BEP-20 peer ID with a random printable suffix.
+func newPeerID() []byte {
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	id := []byte(peerIDPrefix + randomString(20-len(peerIDPrefix)))
+	for i := len(peerIDPrefix); i < len(id); i++ {
+		id[i] = alphabet[int(id[i])%len(alphabet)]
+	}
+	return id
+}
+
+// handshakeMessage builds the 68-byte BitTorrent handshake.
+func handshakeMessage(infoHash, peerID []byte) []byte {
 	data := make([]byte, 68)
 	copy(data[:28], handshakePrefix)
 	copy(data[28:48], infoHash)
 	copy(data[48:], peerID)
+	return data
+}
 
+// sendHandshake sends a prepared handshake message to conn.
+func sendHandshake(conn net.Conn, data []byte) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(time.Second * 10)); err != nil {
 		return err
 	}
@@ -323,8 +345,11 @@ type Wire struct {
 	workers      sync.WaitGroup
 	connMu       sync.Mutex
 	connections  map[net.Conn]struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
+	// preferEncryption starts downloads with an MSE handshake and falls back
+	// to plaintext when the peer rejects it. NewWire enables it.
+	preferEncryption bool
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 // NewWire returns a Wire pointer.
@@ -348,6 +373,8 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 		stop:         make(chan struct{}),
 		stopped:      make(chan struct{}),
 		connections:  make(map[net.Conn]struct{}),
+
+		preferEncryption: true,
 	}
 }
 
@@ -523,6 +550,9 @@ func (wire *Wire) requestPieces(conn net.Conn, utMetadata int, requests <-chan i
 }
 
 // fetchMetadata records exactly one aggregate outcome for an actual download.
+// It tries an encrypted (MSE) handshake first, which both encryption-optional
+// and encryption-required clients accept, and redials in plaintext only when
+// the peer rejects encryption outright.
 func (wire *Wire) fetchMetadata(r Request) (result error) {
 	defer func() {
 		if result != nil && wire.ctx.Err() != nil {
@@ -530,8 +560,18 @@ func (wire *Wire) fetchMetadata(r Request) (result error) {
 		}
 		recordMetadataError(result)
 	}()
+	deadline := time.Now().Add(metadataDownloadTimeout)
+	err := wire.fetchMetadataOnce(r, deadline, wire.preferEncryption)
+	if errors.Is(err, errMSEUnsupported) && wire.ctx.Err() == nil && time.Now().Before(deadline) {
+		RecordProtocolEvent("metadata_encryption", "fallback_plaintext")
+		err = wire.fetchMetadataOnce(r, deadline, false)
+	}
+	return err
+}
+
+// fetchMetadataOnce dials the peer and runs one download attempt.
+func (wire *Wire) fetchMetadataOnce(r Request, deadline time.Time, encrypt bool) error {
 	started := time.Now()
-	deadline := started.Add(metadataDownloadTimeout)
 	dialer := net.Dialer{Timeout: 15 * time.Second, Deadline: deadline}
 	conn, err := dialer.DialContext(wire.ctx, "tcp", genAddress(r.IP, r.Port))
 	recordMetadataStage("dial", started, err)
@@ -553,12 +593,20 @@ func (wire *Wire) fetchMetadata(r Request) (result error) {
 		_ = conn.Close()
 	}()
 	conn.(*net.TCPConn).SetLinger(0)
-	return wire.fetchMetadataConn(conn, r, deadline)
+	return wire.fetchMetadataConnMode(conn, r, deadline, encrypt)
 }
 
-// fetchMetadataConn runs a download with a fixed deadline, including writes.
-func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) (result error) {
+// fetchMetadataConn runs a plaintext download with a fixed deadline.
+func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) error {
+	return wire.fetchMetadataConnMode(raw, r, deadline, false)
+}
+
+// fetchMetadataConnMode runs a download with a fixed deadline, including writes.
+func (wire *Wire) fetchMetadataConnMode(raw net.Conn, r Request, deadline time.Time, encrypt bool) (result error) {
 	stage, started := "handshake", time.Now()
+	if encrypt {
+		stage = "encryption"
+	}
 	finishStage := func(err error) {
 		recordMetadataStage(stage, started, err)
 	}
@@ -586,12 +634,37 @@ func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time)
 	if err := raw.SetDeadline(deadline); err != nil {
 		return err
 	}
-	conn := &metadataConn{Conn: raw, deadline: deadline}
+	var conn net.Conn = &metadataConn{Conn: raw, deadline: deadline}
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	data := new(bytes.Buffer)
 	data.Grow(BLOCK)
-	if err := sendHandshake(conn, r.InfoHash, []byte(randomString(20))); err != nil {
+	handshake := handshakeMessage(r.InfoHash, newPeerID())
+	if encrypt {
+		stageDeadline := time.Now().Add(15 * time.Second)
+		if err := conn.SetReadDeadline(stageDeadline); err != nil {
+			return err
+		}
+		if err := conn.SetWriteDeadline(stageDeadline); err != nil {
+			return err
+		}
+		// Our BitTorrent handshake travels as the MSE initial payload.
+		encrypted, err := mseInitiate(conn, r.InfoHash, handshake)
+		if err != nil {
+			if errors.Is(err, errMSEProtocol) {
+				return errors.Join(errMetadataProtocol, err)
+			}
+			return err
+		}
+		if _, plaintext := encrypted.(*mseConn).reader.(*bufio.Reader); plaintext {
+			RecordProtocolEvent("metadata_encryption", "plaintext_selected")
+		} else {
+			RecordProtocolEvent("metadata_encryption", "rc4")
+		}
+		conn = encrypted
+		finishStage(nil)
+		stage, started = "handshake", time.Now()
+	} else if err := sendHandshake(conn, handshake); err != nil {
 		return err
 	}
 	if err := read(conn, 68, data); err != nil {
