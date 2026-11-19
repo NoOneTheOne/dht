@@ -14,7 +14,7 @@ import (
 
 func testTrendingCache(compute func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error), ttl time.Duration) *trendingCache {
 	cache := newTrendingCache(compute)
-	cache.ttls = map[time.Duration]time.Duration{time.Hour: ttl, 24 * time.Hour: ttl}
+	cache.ttls = map[time.Duration]time.Duration{time.Hour: ttl, 12 * time.Hour: ttl}
 	cache.retry = ttl
 	return cache
 }

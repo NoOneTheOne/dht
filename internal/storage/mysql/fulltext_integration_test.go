@@ -152,7 +152,7 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 		len(plan) != 1 || plan[0].Extra == nil || !strings.Contains(*plan[0].Extra, "Using index") {
 		t.Fatalf("trending plan is not index-only: %+v %v", plan, err)
 	}
-	if again, err := Trending(ctx, 7*24*time.Hour, 10, time.Now().Add(time.Minute)); err != nil || len(again) < len(trending) {
+	if again, err := Trending(ctx, 24*time.Hour, 10, time.Now().Add(time.Minute)); err != nil || len(again) < len(trending) {
 		t.Fatalf("trending after covering index: %v %v", again, err)
 	}
 

@@ -644,7 +644,7 @@ func TestTrendingQuery(t *testing.T) {
 	for _, tc := range []struct {
 		window time.Duration
 		limit  int
-	}{{2 * time.Hour, 10}, {time.Hour, 0}, {time.Hour, 101}} {
+	}{{2 * time.Hour, 10}, {48 * time.Hour, 10}, {7 * 24 * time.Hour, 10}, {time.Hour, 0}, {time.Hour, 101}} {
 		if _, err := Trending(context.Background(), tc.window, tc.limit, until); err == nil {
 			t.Fatal("invalid parameters accepted")
 		}

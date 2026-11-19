@@ -204,12 +204,12 @@ func searchHandler(c *gin.Context) {
 // trendingHandler serves rankings; lookup returns them with their computation time.
 func trendingHandler(lookup func(context.Context, time.Duration, int) ([]mysql.Data, time.Time, error)) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		period := c.DefaultQuery("window", "24h")
-		windows := map[string]time.Duration{"1h": time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour}
+		period := c.DefaultQuery("window", "1h")
+		windows := map[string]time.Duration{"1h": time.Hour, "3h": 3 * time.Hour, "6h": 6 * time.Hour, "12h": 12 * time.Hour, "24h": 24 * time.Hour}
 		window, ok := windows[period]
 		limit, err := strconv.Atoi(c.DefaultQuery("limit", "10"))
 		if !ok || err != nil || limit < 1 || limit > trendingLimitMax {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "window must be 1h, 24h or 7d; limit must be 1..100"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "window must be 1h, 3h, 6h, 12h or 24h; limit must be 1..100"})
 			return
 		}
 		start := time.Now()

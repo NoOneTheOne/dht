@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from 'react';
 import { TorrentItem } from '../types';
 import { formatSize } from '../format';
 
-const periods = [{ value: '1h', label: '过去 1 小时' }, { value: '24h', label: '过去 24 小时' }, { value: '7d', label: '过去 7 天' }];
+const periods = ['1', '3', '6', '12', '24'].map(hours => ({ value: `${hours}h`, short: `${hours} 小时`, label: `过去 ${hours} 小时` }));
 interface TrendingResponse { items: TorrentItem[]; window: string; limit: number; since: string; until: string }
 
 function isTrending(value: unknown, period: string, limit: number): value is TrendingResponse {
@@ -15,7 +15,7 @@ function isTrending(value: unknown, period: string, limit: number): value is Tre
 }
 
 export default function Trending() {
-  const [period, setPeriod] = useState('24h');
+  const [period, setPeriod] = useState('1h');
   const [limit, setLimit] = useState(10);
   const [draftLimit, setDraftLimit] = useState('10');
   const [validation, setValidation] = useState('');
@@ -69,7 +69,7 @@ export default function Trending() {
     <a className="detail-back" href="#">← 返回搜索</a>
     <div className="trending-heading"><div><span className="eyebrow">TRENDING / DHT NETWORK</span><h1 id="trending-title">资源热榜<span className="trending-top">TOP {limit}</span></h1><p>发现最近被频繁采集的资源，按所选时间范围内的命中次数排序。</p></div><span className="trending-indicator">滚动时间窗口</span></div>
     <div className="trending-toolbar">
-      <div className="trending-periods" role="group" aria-label="热榜时间范围">{periods.map(option => <button key={option.value} aria-pressed={period === option.value} onClick={() => setPeriod(option.value)}>{option.label}</button>)}</div>
+      <div className="trending-periods" role="group" aria-label="热榜时间范围（过去）">{periods.map(option => <button key={option.value} aria-pressed={period === option.value} aria-label={option.label} onClick={() => setPeriod(option.value)}>{option.short}</button>)}</div>
       <form className="trending-limit" onSubmit={applyLimit} noValidate><label htmlFor="trending-limit">显示条数</label><input id="trending-limit" type="number" inputMode="numeric" min="1" max="100" step="1" value={draftLimit} aria-invalid={!!validation} aria-describedby="trending-limit-hint" onChange={event => { setDraftLimit(event.target.value); setValidation(''); }} /><button className="page-button" type="submit">应用</button></form>
     </div>
     <p id="trending-limit-hint" className={validation ? 'validation-error' : 'trending-hint'}>{validation || '默认 10 条，可自定义 1–100 条；相同次数按 InfoHash 排序。'}</p>

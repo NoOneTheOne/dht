@@ -56,7 +56,8 @@ func TestTrendingHandler(t *testing.T) {
 		window        time.Duration
 		limit, status int
 	}{
-		{"", 24 * time.Hour, 10, 200}, {"window=1h&limit=1", time.Hour, 1, 200}, {"window=7d&limit=100", 7 * 24 * time.Hour, 100, 200},
+		{"", time.Hour, 10, 200}, {"window=6h&limit=1", 6 * time.Hour, 1, 200}, {"window=12h&limit=100", 12 * time.Hour, 100, 200},
+		{"window=3h", 3 * time.Hour, 10, 200}, {"window=24h", 24 * time.Hour, 10, 200}, {"window=7d", 0, 0, 400}, {"window=2h", 0, 0, 400},
 		{"window=2h", 0, 0, 400}, {"window=", 0, 0, 400}, {"limit=0", 0, 0, 400}, {"limit=101", 0, 0, 400}, {"limit=1.5", 0, 0, 400}, {"limit=", 0, 0, 400}, {"limit=-1", 0, 0, 400},
 	} {
 		t.Run(tc.query, func(t *testing.T) {

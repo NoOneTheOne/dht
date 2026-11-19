@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -396,9 +397,13 @@ func WriteBatchWithID(batchID string, items []Data) error {
 	})
 }
 
-// ObservationRetention keeps every row the longest trending window (7d) can
-// read, plus a day of margin for recovery batches replayed late.
-const ObservationRetention = 8 * 24 * time.Hour
+// TrendingWindows are the supported ranking windows, shortest first.
+var TrendingWindows = []time.Duration{time.Hour, 3 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
+
+// ObservationRetention keeps every row the longest trending window (24h) can
+// read, plus 12 hours of margin for recovery batches replayed late (pruning
+// also waits while the recovery spool is not empty).
+const ObservationRetention = 36 * time.Hour
 
 const pruneChunkSize = 5000
 
@@ -814,7 +819,7 @@ func searchWith(db *gorm.DB, name string, page int, mode searchMode) ([]Data, in
 }
 
 func Trending(parent context.Context, window time.Duration, limit int, until time.Time) ([]Data, error) {
-	if (window != time.Hour && window != 24*time.Hour && window != 7*24*time.Hour) || limit < 1 || limit > 100 {
+	if !slices.Contains(TrendingWindows, window) || limit < 1 || limit > 100 {
 		return nil, fmt.Errorf("invalid trending parameters")
 	}
 	ctx, cancel := context.WithTimeout(parent, TrendingTimeout)
@@ -836,7 +841,7 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 	return items, err
 }
 
-// TrendingTimeout bounds one ranking query. Aggregating a 7-day window reads
+// TrendingTimeout bounds one ranking query. Aggregating a 24-hour window reads
 // every observation in it, which can exceed the 5s socket read timeout of the
 // main pool, so rankings run on a small pool of their own (analyticsDBContext)
 // and callers should cache the result rather than query per request.

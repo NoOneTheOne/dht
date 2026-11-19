@@ -19,9 +19,11 @@ const trendingLimitMax = 100
 // accepted per window; variables so tests can shorten them.
 var (
 	trendingTTLs = map[time.Duration]time.Duration{
-		time.Hour:          time.Minute,
-		24 * time.Hour:     5 * time.Minute,
-		7 * 24 * time.Hour: 15 * time.Minute,
+		time.Hour:      time.Minute,
+		3 * time.Hour:  time.Minute,
+		6 * time.Hour:  2 * time.Minute,
+		12 * time.Hour: 5 * time.Minute,
+		24 * time.Hour: 5 * time.Minute,
 	}
 	trendingRetry = 10 * time.Second // After a failed computation.
 )
