@@ -188,6 +188,7 @@ func TestUnknownRevisionUsesBuildInfo(t *testing.T) {
 
 func TestRequestIDContext(t *testing.T) {
 	base := context.Background()
+	//lint:ignore SA1012 a nil context is the case under test
 	if RequestID(base) != "" || RequestID(nil) != "" {
 		t.Fatal("absent request ID should be empty")
 	}

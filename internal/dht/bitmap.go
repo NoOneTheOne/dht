@@ -104,11 +104,6 @@ func (bitmap *bitmap) Set(index int) {
 	bitmap.set(index, 1)
 }
 
-// Unset sets the bit at index to 0.
-func (bitmap *bitmap) Unset(index int) {
-	bitmap.set(index, 0)
-}
-
 // Compare compares the prefixLen-prefix of two bitmap.
 //   - If bitmap.data[:prefixLen] < other.data[:prefixLen], return -1.
 //   - If bitmap.data[:prefixLen] > other.data[:prefixLen], return 1.
@@ -134,18 +129,6 @@ func (bitmap *bitmap) Compare(other *bitmap, prefixLen int) int {
 	}
 
 	return 0
-}
-
-// Xor returns the xor value of two bitmap.
-func (bitmap *bitmap) Xor(other *bitmap) *bitmap {
-	if bitmap.Size != other.Size {
-		panic("size not the same")
-	}
-
-	distance := newBitmap(bitmap.Size)
-	xor(distance.data, bitmap.data, other.data)
-
-	return distance
 }
 
 // String returns the bit sequence string of the bitmap.

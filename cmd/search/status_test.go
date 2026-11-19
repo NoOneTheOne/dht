@@ -279,7 +279,8 @@ func TestStaticHandler(t *testing.T) {
 		{http.MethodGet, "/assets/app.js", 200, "APP"},
 		{http.MethodGet, "/assets/", 200, "INDEX"},
 		{http.MethodGet, "/trending", 200, "INDEX"},
-		{http.MethodGet, "/../secret.txt", 400, ""}, // http.ServeFile rejects "..".
+		{http.MethodGet, "/../secret.txt", 404, ""}, // Cleaned into webDir; missing files are 404.
+		{http.MethodGet, "/assets/missing.js", 404, ""},
 		{http.MethodGet, "/api/unknown", 404, ""},
 		{http.MethodPost, "/", 404, ""},
 	} {

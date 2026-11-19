@@ -43,7 +43,7 @@ func (l *peerLookup) foundPeer() {
 	l.mu.Unlock()
 }
 
-func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
+func (d *DHT) startPeerLookup(hash string, seeds []*node, hint *node) error {
 	d.lookupMu.Lock()
 	if d.lookups == nil {
 		d.lookups = make(map[string]*peerLookup)
@@ -63,6 +63,7 @@ func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
 	d.lookupMu.Unlock()
 	lookup.mu.Lock()
 	lookup.addCandidates(seeds)
+	lookup.prioritize(hint)
 	queued := lookup.advance()
 	lookup.mu.Unlock()
 	if !queued {
@@ -71,6 +72,27 @@ func (d *DHT) startPeerLookup(hash string, seeds []*node) error {
 	}
 	RecordProtocolEvent("peer_lookup", "started")
 	return nil
+}
+
+// prioritize makes hint, a BEP-51 sampler that stores the hash's peers, the
+// first node asked. addCandidates orders by distance to the hash, where a
+// sampler usually ranks low or is cut off entirely.
+func (l *peerLookup) prioritize(hint *node) {
+	if hint == nil {
+		return
+	}
+	others := l.candidates
+	l.candidates = nil
+	l.addCandidates([]*node{hint}) // Applies the same endpoint filters.
+	if len(l.candidates) == 0 {
+		l.candidates = others
+		return
+	}
+	for _, candidate := range others {
+		if candidate.addr.String() != hint.addr.String() {
+			l.candidates = append(l.candidates, candidate)
+		}
+	}
 }
 
 func (l *peerLookup) addCandidates(nodes []*node) {

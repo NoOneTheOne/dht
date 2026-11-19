@@ -37,7 +37,7 @@ func TestWireWorkerDialFailureFeedback(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	wire := NewWire(8, 2, 1)
+	wire := NewWire(2, 1)
 	go wire.Run()
 	defer wire.Stop()
 	hash := bytes.Repeat([]byte{'d'}, 20)
@@ -59,9 +59,6 @@ func TestWireWorkerDialFailureFeedback(t *testing.T) {
 	}
 	if len(wire.Response()) != 0 || wire.queue.Len() != 0 {
 		t.Fatal("failure produced response or leaked reservation")
-	}
-	if wire.blackList.in("127.0.0.1", port) {
-		t.Fatal("dial failure inserted one-hour blacklist entry")
 	}
 	if wire.Request(bytes.Repeat([]byte{'e'}, 20), "127.0.0.1", port) {
 		t.Fatal("dial failure did not cool endpoint")
@@ -112,7 +109,7 @@ func TestWireWorkerCompletion(t *testing.T) {
 					return sendMessage(peer, append(payload, metadata...))
 				}()
 			}()
-			wire := NewWire(8, 2, 1)
+			wire := NewWire(2, 1)
 			wire.preferEncryption = false // This fake peer speaks plaintext only.
 			go wire.Run()
 			defer wire.Stop()
@@ -171,14 +168,14 @@ func metadataEventTotal() int64 {
 }
 
 func TestWireFailureBackpressureAndStop(t *testing.T) {
-	wire := NewWire(8, 3, 1)
+	wire := NewWire(3, 1)
 	wire.failures = make(chan MetadataFailure, 1)
 	for i := 0; i < 3; i++ {
 		if !wire.Request(bytes.Repeat([]byte{byte(i)}, 20), "127.0.0.1", 1) {
 			t.Fatal("request not accepted")
 		}
 	}
-	wire.blackList.insert("127.0.0.1", 1) // A second blacklist check must report completion.
+	coolEndpoint(wire, "127.0.0.1", 1) // A second skip check must report completion.
 	before := protocolCount("metadata_queue", "blacklisted")
 	metadataBefore := metadataEventTotal()
 	go wire.Run()
@@ -227,14 +224,14 @@ func TestWireFailureBackpressureAndStop(t *testing.T) {
 }
 
 func TestWireFailureBackpressureDeliversAll(t *testing.T) {
-	wire := NewWire(8, 3, 1)
+	wire := NewWire(3, 1)
 	wire.failures = make(chan MetadataFailure, 1)
 	for i := 0; i < 3; i++ {
 		if !wire.Request(bytes.Repeat([]byte{byte(i)}, 20), "127.0.0.1", 1) {
 			t.Fatal("request not accepted")
 		}
 	}
-	wire.blackList.insert("127.0.0.1", 1)
+	coolEndpoint(wire, "127.0.0.1", 1)
 	before := protocolCount("metadata_queue", "blacklisted")
 	go wire.Run()
 	defer wire.Stop()
@@ -264,7 +261,7 @@ func TestWireFailureBackpressureDeliversAll(t *testing.T) {
 }
 
 func TestWireFailureMinimumBufferAndClosure(t *testing.T) {
-	wire := NewWire(8, 0, 1)
+	wire := NewWire(0, 1)
 	if cap(wire.Failures()) < 1 {
 		t.Fatal("failure channel has no buffer")
 	}
@@ -309,7 +306,7 @@ func TestPeerWireStageTimeouts(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			client, peer := net.Pipe()
 			defer peer.Close()
-			wire := NewWire(8, 1, 1)
+			wire := NewWire(1, 1)
 			done := make(chan error, 1)
 			before := protocolCount("metadata_"+stage, "failure")
 			go func() {
@@ -388,7 +385,7 @@ func TestWireFailureCooldownScopesAndExpiry(t *testing.T) {
 		{"hash_mismatch", true, 5 * time.Minute},
 	} {
 		t.Run(tc.reason, func(t *testing.T) {
-			wire := NewWire(8, 4, 1)
+			wire := NewWire(4, 1)
 			r := Request{InfoHash: bytes.Repeat([]byte{'a'}, 20), IP: "127.0.0.1", Port: 1}
 			other := r
 			other.InfoHash = bytes.Repeat([]byte{'b'}, 20)
@@ -410,7 +407,7 @@ func TestWireFailureCooldownScopesAndExpiry(t *testing.T) {
 			}
 		})
 	}
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	r := Request{InfoHash: make([]byte, 20), IP: "127.0.0.1", Port: 1}
 	wire.coolFailure(r, "hash_mismatch")
 	wire.coolFailure(r, "dial_error")
@@ -430,7 +427,7 @@ func TestWireFailureCooldownScopesAndExpiry(t *testing.T) {
 }
 
 func TestWireFailureCooldownBounded(t *testing.T) {
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	for i := 0; i <= maxMetadataCooldowns; i++ {
 		r := Request{InfoHash: make([]byte, 20), IP: "127.0.0.1", Port: 1}
 		binary.BigEndian.PutUint64(r.InfoHash, uint64(i))
@@ -445,7 +442,7 @@ func TestWireFailureCooldownBounded(t *testing.T) {
 }
 
 func TestConnectedPeers(t *testing.T) {
-	wire := NewWire(10, 10, 2)
+	wire := NewWire(10, 2)
 	if wire.ConnectedPeers() != 0 {
 		t.Fatal("new wire has connections")
 	}
@@ -500,7 +497,7 @@ func TestPeerWirePipelineWindow(t *testing.T) {
 	hash := sha1.Sum(metadata)
 	client, peer := net.Pipe()
 	defer peer.Close()
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	done := make(chan error, 1)
 	go func() {
 		done <- wire.fetchMetadataConn(client, Request{InfoHash: hash[:]}, time.Now().Add(3*time.Second))
@@ -560,7 +557,7 @@ func TestPeerWirePipelineWindow(t *testing.T) {
 func TestPeerWireBlockedWriterStopsWithReader(t *testing.T) {
 	client, peer := net.Pipe()
 	defer peer.Close()
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	done := make(chan error, 1)
 	go func() {
 		done <- wire.fetchMetadataConn(client, Request{InfoHash: make([]byte, 20)}, time.Now().Add(time.Second))
@@ -587,7 +584,7 @@ func TestPeerWireBlockedWriterStopsWithReader(t *testing.T) {
 }
 
 func TestWireStopReleasesReservations(t *testing.T) {
-	wire := NewWire(8, 16, 1)
+	wire := NewWire(16, 1)
 	for i := 0; i < 10; i++ {
 		hash := bytes.Repeat([]byte{byte(i)}, 20)
 		wire.Request(hash, "127.0.0.1", 1)
@@ -636,7 +633,7 @@ func TestMetadataOutcomeReasons(t *testing.T) {
 }
 
 func TestWireQueueDropCountedOnce(t *testing.T) {
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	before := GetStats().MetadataRequestsDropped
 	full := protocolCount("metadata_queue", "full")
 	wire.Request(bytes.Repeat([]byte{'a'}, 20), "127.0.0.1", 1)
@@ -651,7 +648,7 @@ func TestWireQueueDropCountedOnce(t *testing.T) {
 func TestPeerWireConflictingDuplicate(t *testing.T) {
 	client, peer := net.Pipe()
 	defer peer.Close()
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	done := make(chan error, 1)
 	go func() {
 		done <- wire.fetchMetadataConn(client, Request{InfoHash: make([]byte, 20)}, time.Now().Add(time.Second))
@@ -684,17 +681,9 @@ func TestPeerWireConflictingDuplicate(t *testing.T) {
 	}
 }
 
-func TestPeerWireResponseBackpressure(t *testing.T) {
-	client, peer := net.Pipe()
-	defer peer.Close()
-	wire := NewWire(8, 1, 1)
-	wire.responses = make(chan Response)
-	metadata := []byte("metadata")
-	hash := sha1.Sum(metadata)
-	done := make(chan error, 1)
-	go func() {
-		done <- wire.fetchMetadataConn(client, Request{InfoHash: hash[:]}, time.Now().Add(150*time.Millisecond))
-	}()
+// servePeerWireMetadata plays a peer that completes a one-piece download.
+func servePeerWireMetadata(t *testing.T, peer net.Conn, metadata []byte) {
+	t.Helper()
 	if err := peerWireTestHandshake(peer); err != nil {
 		t.Fatal(err)
 	}
@@ -708,18 +697,58 @@ func TestPeerWireResponseBackpressure(t *testing.T) {
 	if err := sendMessage(peer, append(payload, metadata...)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPeerWireResponseBackpressure(t *testing.T) {
+	original := metadataDeliveryWait
+	metadataDeliveryWait = 200 * time.Millisecond
+	t.Cleanup(func() { metadataDeliveryWait = original })
+	metadata := []byte("metadata")
+	hash := sha1.Sum(metadata)
+
+	// No consumer at all: the verified response is dropped after the wait.
+	client, peer := net.Pipe()
+	defer peer.Close()
+	wire := NewWire(1, 1)
+	wire.responses = make(chan Response)
+	done := make(chan error, 1)
+	go func() {
+		done <- wire.fetchMetadataConn(client, Request{InfoHash: hash[:]}, time.Now().Add(150*time.Millisecond))
+	}()
+	servePeerWireMetadata(t, peer, metadata)
 	select {
 	case err := <-done:
 		if !errors.Is(err, errMetadataResponseDropped) {
 			t.Fatalf("backpressure error = %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("backpressure ignored deadline")
+		t.Fatal("backpressure ignored the delivery wait")
+	}
+
+	// A consumer that frees up after the download deadline, but within the
+	// delivery wait, still receives the verified metadata.
+	client, peer = net.Pipe()
+	defer peer.Close()
+	go func() {
+		done <- wire.fetchMetadataConn(client, Request{InfoHash: hash[:]}, time.Now().Add(150*time.Millisecond))
+	}()
+	servePeerWireMetadata(t, peer, metadata)
+	time.Sleep(100 * time.Millisecond) // Past what was left of the download deadline.
+	select {
+	case response := <-wire.responses:
+		if !bytes.Equal(response.MetadataInfo, metadata) {
+			t.Fatal("delivered metadata differs")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("verified metadata was not delivered to a late consumer")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("late delivery error = %v", err)
 	}
 }
 
 func TestWireConcurrentRequestAndStop(t *testing.T) {
-	wire := NewWire(8, 64, 2)
+	wire := NewWire(64, 2)
 	go wire.Run()
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -820,7 +849,7 @@ func TestPeerWireRejectsInvalidPieces(t *testing.T) {
 			client, peer := net.Pipe()
 			defer client.Close()
 			defer peer.Close()
-			wire := NewWire(8, 1, 1)
+			wire := NewWire(1, 1)
 			done := make(chan struct{})
 			go func() {
 				wire.fetchMetadataConn(client, Request{InfoHash: make([]byte, 20)}, time.Now().Add(time.Second))
@@ -862,7 +891,7 @@ func TestPeerWireRejectsInvalidPieces(t *testing.T) {
 }
 
 func TestPeerWireRequestCopiesHash(t *testing.T) {
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	hash := bytes.Repeat([]byte{'h'}, 20)
 	for _, port := range []int{-1, 0, 65536} {
 		wire.Request(hash, "127.0.0.1", port)
@@ -885,7 +914,7 @@ func TestPeerWireRequestValidatesIP(t *testing.T) {
 		"224.0.0.1", "239.255.255.250", "ff02::1", "169.254.1.1", "fe80::1",
 	} {
 		t.Run(ip, func(t *testing.T) {
-			wire := NewWire(8, 1, 1)
+			wire := NewWire(1, 1)
 			wire.Request(make([]byte, 20), ip, 6881)
 			if len(wire.requests) != 0 || wire.queue.Len() != 0 || len(wire.infoHashes) != 0 {
 				t.Fatal("invalid IP reserved request capacity")
@@ -894,7 +923,7 @@ func TestPeerWireRequestValidatesIP(t *testing.T) {
 	}
 	for _, ip := range []string{"127.0.0.1", "::1", "192.168.1.1", "10.0.0.1", "172.16.0.1", "fd00::1", "2001:4860:4860::8888"} {
 		t.Run(ip, func(t *testing.T) {
-			wire := NewWire(8, 1, 1)
+			wire := NewWire(1, 1)
 			wire.Request(make([]byte, 20), ip, 6881)
 			if len(wire.requests) != 1 {
 				t.Fatal("valid local or global IP rejected")
@@ -914,7 +943,7 @@ func TestPeerWireRequestCanonicalizesIP(t *testing.T) {
 		{"2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::1", "2001:db8::1"},
 	} {
 		t.Run(tc.want, func(t *testing.T) {
-			wire := NewWire(8, 8, 1)
+			wire := NewWire(8, 1)
 			hash := make([]byte, 20)
 			wire.Request(hash, tc.first, 6881)
 			wire.Request(hash, tc.second, 6881)
@@ -926,10 +955,8 @@ func TestPeerWireRequestCanonicalizesIP(t *testing.T) {
 				t.Fatalf("queued IP = %q, want %q", r.IP, tc.want)
 			}
 			wire.releaseRequest(r)
-			wire.blackList.insert(tc.want, 6881)
-			wire.Request(hash, tc.first, 6881)
-			if len(wire.requests) != 0 || wire.queue.Len() != 0 || len(wire.infoHashes) != 0 {
-				t.Fatal("noncanonical IP spelling bypassed blacklist")
+			if wire.queue.Len() != 0 || len(wire.infoHashes) != 0 {
+				t.Fatal("released request left its reservation")
 			}
 		})
 	}
@@ -1094,7 +1121,7 @@ func TestPeerWireKeepalivesDoNotExtendDownloadDeadline(t *testing.T) {
 	client, peer := net.Pipe()
 	defer client.Close()
 	defer peer.Close()
-	wire := NewWire(8, 1, 1)
+	wire := NewWire(1, 1)
 	deadline := time.Now().Add(100 * time.Millisecond)
 	done := make(chan struct{})
 	go func() {
@@ -1140,7 +1167,7 @@ func TestPeerWireMetadataFlowWithLargeBitfieldAndHash(t *testing.T) {
 			client, peer := net.Pipe()
 			defer client.Close()
 			defer peer.Close()
-			wire := NewWire(8, 1, 1)
+			wire := NewWire(1, 1)
 			hash := sha1.Sum(metadata)
 			if !validHash {
 				hash[0] ^= 1
@@ -1245,4 +1272,9 @@ func TestPeerWireMetadataFlowWithLargeBitfieldAndHash(t *testing.T) {
 // fetchMetadataConn runs a plaintext download with a fixed deadline.
 func (wire *Wire) fetchMetadataConn(raw net.Conn, r Request, deadline time.Time) error {
 	return wire.fetchMetadataConnMode(raw, r, deadline, false)
+}
+
+// coolEndpoint puts an endpoint into dial-failure cooldown, so workers skip it.
+func coolEndpoint(wire *Wire, ip string, port int) {
+	wire.coolFailure(Request{IP: ip, Port: port}, "dial_error")
 }

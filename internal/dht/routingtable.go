@@ -96,74 +96,6 @@ func (p *Peer) CompactIPPortInfo() string {
 	return info
 }
 
-// maxPeerHashes bounds the standard-mode peer cache independently of K.
-const maxPeerHashes = 4096
-
-// peersManager represents a proxy that manipulates peers.
-type peersManager struct {
-	sync.RWMutex
-	table *keyedDeque
-	dht   *DHT
-}
-
-// newPeersManager returns a new peersManager.
-func newPeersManager(dht *DHT) *peersManager {
-	return &peersManager{
-		table: newKeyedDeque(),
-		dht:   dht,
-	}
-}
-
-// Insert adds a peer into peersManager. Crawl mode leaves peer storage to the scheduler.
-func (pm *peersManager) Insert(infoHash string, peer *Peer) {
-	if pm.dht.IsCrawlMode() {
-		return
-	}
-
-	pm.Lock()
-	defer pm.Unlock()
-
-	var queue *keyedDeque
-	if e, ok := pm.table.Get(infoHash); ok {
-		queue = e.Value.(*keyedDeque)
-	} else {
-		if pm.table.Len() >= maxPeerHashes {
-			pm.table.Remove(pm.table.Front())
-		}
-		queue = newKeyedDeque()
-	}
-	pm.table.Push(infoHash, queue)
-
-	queue.Push(peer.CompactIPPortInfo(), peer)
-	if queue.Len() > pm.dht.K {
-		queue.Remove(queue.Front())
-	}
-}
-
-// GetPeers returns size-length peers who announce having infoHash.
-func (pm *peersManager) GetPeers(infoHash string, size int) []*Peer {
-	pm.Lock()
-	defer pm.Unlock()
-
-	peers := make([]*Peer, 0, size)
-
-	e, ok := pm.table.Get(infoHash)
-	if !ok {
-		return peers
-	}
-	queue := e.Value.(*keyedDeque)
-	pm.table.Push(infoHash, queue)
-
-	for e := range queue.Iter() {
-		peers = append(peers, e.Value.(*Peer))
-	}
-
-	if len(peers) > size {
-		peers = peers[len(peers)-size:]
-	}
-	return peers
-}
-
 // KBucket represents a k-size bucket.
 type KBucket struct {
 	sync.RWMutex
@@ -351,7 +283,6 @@ type routingTable struct {
 	cachedNodes    *syncedMap
 	cachedKBuckets *keyedDeque
 	dht            *DHT
-	clearQueue     *syncedList
 	refreshOffset  int
 }
 
@@ -366,7 +297,6 @@ func newRoutingTable(k int, dht *DHT) *routingTable {
 		cachedNodes:    newSyncedMap(),
 		cachedKBuckets: newKeyedDeque(),
 		dht:            dht,
-		clearQueue:     newSyncedList(),
 	}
 
 	rt.cachedKBuckets.Push(root.bucket.prefix.String(), root.bucket)
@@ -581,15 +511,12 @@ func (rt *routingTable) removeLocked(id *bitmap) {
 	}
 }
 
-func (rt *routingTable) removeContact(expected *node, blacklist bool) {
+func (rt *routingTable) removeContact(expected *node) {
 	rt.Lock()
 	defer rt.Unlock()
 	current, ok := rt.cachedNodes.Get(expected.addr.String())
 	if !ok || current != expected {
 		return
-	}
-	if blacklist {
-		rt.dht.blackList.insert(expected.addr.IP.String(), expected.addr.Port)
 	}
 	rt.removeLocked(expected.id)
 }

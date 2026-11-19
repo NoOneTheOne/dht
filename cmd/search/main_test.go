@@ -315,8 +315,8 @@ func TestMySQLHealthPing(t *testing.T) {
 				t.Fatal("health did not call PingContext")
 			}
 			deadline, ok := conn.pingContext.Deadline()
-			if !ok || deadline.Before(before.Add(time.Second)) || deadline.After(time.Now().Add(2*time.Second)) {
-				t.Fatal("health ping must have a two-second deadline")
+			if !ok || deadline.Before(before.Add(healthCheckTimeout-time.Second)) || deadline.After(time.Now().Add(healthCheckTimeout)) {
+				t.Fatal("health ping must have the health check deadline")
 			}
 			if !errors.Is(conn.pingContext.Err(), context.Canceled) {
 				t.Fatal("health ping context was not canceled after use")
@@ -340,7 +340,7 @@ func TestMySQLChecksBoundInitialization(t *testing.T) {
 	getDB := func(ctx context.Context) (*gorm.DB, error) {
 		calls++
 		deadline, ok := ctx.Deadline()
-		if !ok || time.Until(deadline) > 2*time.Second {
+		if !ok || time.Until(deadline) > healthCheckTimeout {
 			t.Fatal("database initialization must share the check deadline")
 		}
 		return nil, errors.New("unavailable")

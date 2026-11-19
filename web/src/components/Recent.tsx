@@ -40,7 +40,7 @@ export default function Recent() {
       const controller = new AbortController();
       active = controller;
       setRefreshing(true);
-      const timeout = window.setTimeout(() => controller.abort(), 15000);
+      const timeout = window.setTimeout(() => controller.abort(), 60000);
       try {
         const response = await fetch(`/api/recent?limit=${limit}`, { signal: controller.signal });
         if (!response.ok) throw new Error('最近收录暂时不可用，请稍后重试。');

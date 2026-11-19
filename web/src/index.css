@@ -1,5 +1,4 @@
 @tailwind base;
-@tailwind components;
 @tailwind utilities;
 
 :root { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; color-scheme: light; font-synthesis: none; --text: #203e35; --muted: #617e73; --subtle: #718f82; --accent: #28785e; --mint: #b8edcf; --mint-hover: #a3e5c1; --border: #cce2d7; --surface: #ffffffb8; --solid: #f4fbf7; --hover: #e7f5ed; --soft: #d9eee3; --shadow: #244e3710; --green: #277951; --green-bg: #d6f1df; --yellow: #916814; --yellow-bg: #faf0ce; --red: #b24747; --red-bg: #fbe5e3; color: var(--text); background: #f7fbf8; }

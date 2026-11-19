@@ -25,7 +25,6 @@ type bootstrapManager struct {
 	dht            *DHT
 	addresses      []string
 	bootstrapMu    sync.Mutex
-	lastBootstrap  time.Time
 	bootstrapCount int
 	joining        bool
 	nextRetry      time.Time
@@ -109,7 +108,6 @@ func (bm *bootstrapManager) join() {
 		return
 	}
 	bm.joining = true
-	bm.lastBootstrap = time.Now()
 	bm.bootstrapCount++
 	attempt := bm.bootstrapCount
 	bm.bootstrapMu.Unlock()
@@ -174,8 +172,8 @@ func (bm *bootstrapManager) needsRebootstrap() bool {
 	return !bm.joining && !time.Now().Before(bm.nextRetry)
 }
 
-func (bm *bootstrapManager) getBootstrapStats() (count int, lastTime time.Time) {
+func (bm *bootstrapManager) getBootstrapCount() int {
 	bm.bootstrapMu.Lock()
 	defer bm.bootstrapMu.Unlock()
-	return bm.bootstrapCount, bm.lastBootstrap
+	return bm.bootstrapCount
 }

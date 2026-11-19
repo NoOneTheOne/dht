@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"log"
@@ -137,17 +139,21 @@ func recoveryStore() *mysql.RecoveryStore {
 	return mysql.NewRecoveryStore(path)
 }
 
+// splitBatchID derives the batch ID of item index of batch parent. It is
+// deterministic, so splitting the same spooled batch again (after a crash
+// before the spool was rewritten) is deduplicated instead of counted twice.
+func splitBatchID(parent string, index int, infoHash string) string {
+	sum := sha256.Sum256([]byte(parent + "/" + strconv.Itoa(index) + "/" + infoHash))
+	return hex.EncodeToString(sum[:16])
+}
+
 // writeSplit retries a permanently rejected batch item by item, so one bad
 // item cannot hold the rest hostage. Each item gets its own batch ID; items
 // that still fail go to rejected (permanent) or retry (transient).
-func writeSplit(items []mysql.Data, write func(string, []mysql.Data) error, retry, rejected func(mysql.RecoveryBatch) error) {
-	for _, item := range items {
-		id, err := mysql.NewBatchID()
-		if err != nil {
-			slog.Error("MySQL item dropped: batch ID generation failed", "component", "mysql", "infohash", item.InfoHash, "error", err)
-			continue
-		}
-		err = write(id, []mysql.Data{item})
+func writeSplit(parent string, items []mysql.Data, write func(string, []mysql.Data) error, retry, rejected func(mysql.RecoveryBatch) error) {
+	for index, item := range items {
+		id := splitBatchID(parent, index, item.InfoHash)
+		err := write(id, []mysql.Data{item})
 		if err == nil {
 			continue
 		}
@@ -163,13 +169,19 @@ func writeSplit(items []mysql.Data, write func(string, []mysql.Data) error, retr
 	}
 }
 
-func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error, store *mysql.RecoveryStore) {
+func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, write func(string, []mysql.Data) error, store *mysql.RecoveryStore) {
 	rejected := store.Rejected()
-	// Replay holds the spool's lock, so split items cannot be re-spooled there.
+	// Replay holds the spool's lock, so items of a split batch that failed only
+	// transiently are collected and re-spooled once it returns; they must not
+	// end up in the never-replayed rejected file.
+	var deferred []mysql.RecoveryBatch
 	replayWrite := func(id string, items []mysql.Data) error {
 		err := write(id, items)
 		if err != nil && mysql.IsPermanent(err) {
-			writeSplit(items, write, rejected.Append, rejected.Append)
+			writeSplit(id, items, write, func(batch mysql.RecoveryBatch) error {
+				deferred = append(deferred, batch)
+				return nil
+			}, rejected.Append)
 			return nil
 		}
 		return err
@@ -178,6 +190,12 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 		if err := store.Replay(replayWrite); err != nil {
 			slog.Error("MySQL recovery replay failed", "component", "mysql", "event", "mysql_recovery_failed", "error", err)
 		}
+		for _, batch := range deferred {
+			if err := store.Append(batch); err != nil {
+				slog.Error("MySQL item dropped: not written and not spooled", "component", "mysql", "event", "mysql_item_dropped", "batch_id", batch.ID, "error", err)
+			}
+		}
+		deferred = deferred[:0]
 	}
 	replay()
 	batch := make([]mysql.Data, 0, 100)
@@ -198,7 +216,7 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 			if mysql.IsPermanent(err) {
 				// The transaction rolled back, so splitting cannot double count.
 				slog.Warn("MySQL rejected batch; retrying items individually", "component", "mysql", "event", "mysql_batch_split", "batch_id", batchID, "observations", len(batch), "error", err)
-				writeSplit(batch, write, store.Append, rejected.Append)
+				writeSplit(batchID, batch, write, store.Append, rejected.Append)
 			} else if spoolErr := store.Append(mysql.RecoveryBatch{ID: batchID, Items: batch}); spoolErr != nil {
 				slog.Error("MySQL and recovery write failed; retaining batch with backpressure", "component", "mysql", "event", "mysql_recovery_spool_failed", "batch_id", batchID, "error", err, "spool_error", spoolErr)
 				return false
@@ -237,9 +255,6 @@ func writeMySQLBatchesToStore(input <-chan mysql.Data, ticks <-chan time.Time, s
 			flush()
 		case <-replayTicker.C:
 			replay()
-		case <-stop:
-			finish()
-			return
 		}
 	}
 }
@@ -274,7 +289,7 @@ func main() {
 
 	// stopping closes as soon as a shutdown signal arrives.
 	stopping := make(chan struct{})
-	w := dht.NewWire(65536, 4096, *metadataWorkers)
+	w := dht.NewWire(4096, *metadataWorkers)
 	mysqlWrites := make(chan mysql.Data, 100)
 	responseDone := make(chan struct{})
 	writeDone := make(chan struct{})
@@ -288,7 +303,7 @@ func main() {
 		defer close(writeDone)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		writeMySQLBatchesToStore(mysqlWrites, ticker.C, nil, mysql.WriteBatchWithID, spool)
+		writeMySQLBatchesToStore(mysqlWrites, ticker.C, mysql.WriteBatchWithID, spool)
 	}()
 	items := make(chan mysql.Data, 100)
 	go func() {
@@ -396,7 +411,7 @@ func main() {
 	if statusAddr == "" {
 		statusAddr = "127.0.0.1:30081"
 	}
-	statusServer := &http.Server{Addr: statusAddr, Handler: statusMux, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	statusServer := &http.Server{Addr: statusAddr, Handler: statusMux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	defer statusServer.Close()
 	go func() {
 		if err := statusServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

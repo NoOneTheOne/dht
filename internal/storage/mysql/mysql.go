@@ -26,12 +26,17 @@ type Observation struct {
 	BatchID  string    `gorm:"column:batch_id;type:char(32);primaryKey"`
 	InfoHash string    `gorm:"column:infohash;type:varchar(64);primaryKey"`
 	Name     string    `gorm:"column:name;type:varchar(512);not null"`
-	Time     time.Time `gorm:"column:time;not null;index:idx_observation_window,priority:2"`
+	Time     time.Time `gorm:"column:time;not null"`
 	Length   int64     `gorm:"column:length;default:0"`
 	Count    int64     `gorm:"column:count;default:1"`
 	Files    []File    `gorm:"column:files;type:json;serializer:json"`
-	Applied  bool      `gorm:"column:applied;default:false;index;index:idx_observation_window,priority:1"`
+	Applied  bool      `gorm:"column:applied;default:false"`
 }
+
+// Observations are read by applied/time range (trending, pruning) through
+// observationRankIndex, built online by EnsureSearchIndexes. Its prefixes
+// were once separate indexes; they only cost writes and are dropped there.
+var redundantObservationIndexes = []string{"idx_info_observations_applied", "idx_observation_window"}
 
 func (Observation) TableName() string {
 	return getCfg().MySQL.Table + "_observations"
@@ -61,18 +66,18 @@ func (Data) TableName() string {
 }
 
 const (
-	operationTimeout  = 10 * time.Second
-	connectionTimeout = 2 * time.Second
+	operationTimeout  = 30 * time.Second
+	connectionTimeout = 10 * time.Second
 	// ioTimeout is only a backstop for a stalled socket: each operation's
 	// context (operationTimeout) and MAX_EXECUTION_TIME hints bound queries.
 	// It must exceed them, or a slow query kills its connection mid-flight
 	// and surfaces as "invalid connection".
-	ioTimeout = 30 * time.Second
+	ioTimeout = 150 * time.Second
 	// migrationTimeout bounds AutoMigrate at startup. Migrations run on a
 	// connection without a socket read timeout: schema changes on large
 	// tables outlive any query budget. Long index builds belong in the
 	// background (EnsureSearchIndexes), not in a struct tag.
-	migrationTimeout = 2 * time.Minute
+	migrationTimeout = 10 * time.Minute
 )
 
 var (
@@ -220,11 +225,10 @@ func openDB(parent context.Context) (*gorm.DB, error) {
 	dialector.(*mysql.Dialector).Conn = pool
 	candidate.ConnPool = pool
 	candidate.Statement.ConnPool = pool
+	// A migration may outlive ctx (see migrate); once it has succeeded the
+	// pool is ready, so ctx's expiry must not discard it.
 	if err := migrate(ctx, candidate); err != nil {
 		return nil, fmt.Errorf("migrate MySQL: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
 	}
 	initialized = true
 	return candidate, nil
@@ -397,6 +401,16 @@ func WriteBatchWithID(batchID string, items []Data) error {
 	})
 }
 
+// hasFilesSQL tests whether a row has a non-empty file list. file_names is
+// written with the row (and backfilled for older rows) exactly when the list
+// is non-empty, so this avoids reading and parsing the large files JSON.
+func hasFilesSQL(table string) string {
+	return "(" + table + "`" + fileNamesColumn + "` IS NOT NULL)"
+}
+
+// TrendingLimitMax is the largest ranking Trending returns.
+const TrendingLimitMax = 100
+
 // TrendingWindows are the supported ranking windows, shortest first.
 var TrendingWindows = []time.Duration{time.Hour, 3 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
 
@@ -409,7 +423,8 @@ const pruneChunkSize = 5000
 
 // PruneObservations deletes applied observations older than before in small
 // chunks, so the cleanup never holds long locks against concurrent writers.
-// Unapplied rows are kept because WriteBatchWithID still needs them.
+// WriteBatchWithID applies every observation in the transaction that inserts
+// it, so committed rows are always applied; the filter is defensive.
 //
 // Callers must not prune while the recovery spool holds batches: a spooled
 // batch may already be applied (ambiguous commit), and its observation rows
@@ -456,6 +471,10 @@ const (
 	searchIndexLock   = "dht_search_indexes"
 	// observationRankIndex covers the trending aggregation.
 	observationRankIndex = "idx_observation_rank"
+	// nameTimeIndex covers substring searches of names: a full scan of this
+	// narrow index (InnoDB appends the infohash key) replaces a scan of the
+	// wide rows, whose file lists make every row read expensive.
+	nameTimeIndex = "idx_name_time"
 	// searchIndexGeneration tags the full-text indexes (as their comment).
 	// Bump it to make EnsureSearchIndexes rebuild them. v2: rebuilt after the
 	// multi-row upsert bug left new rows out of the v1 indexes.
@@ -545,6 +564,28 @@ func EnsureSearchIndexes(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, index := range redundantObservationIndexes {
+		var present int64
+		if err := db.Raw("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+			observations.Name, index).Scan(&present).Error; err != nil {
+			return err
+		}
+		if present > 0 {
+			if err := step("observation_redundant_index_dropped", "DROP INDEX `"+index+"` ON ? ALGORITHM=INPLACE LOCK=NONE", observations); err != nil {
+				return err
+			}
+		}
+	}
+	var nameIndexes int64
+	if err := db.Raw("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+		table.Name, nameTimeIndex).Scan(&nameIndexes).Error; err != nil {
+		return err
+	}
+	if nameIndexes == 0 {
+		if err := step("name_time_index_created", "CREATE INDEX `"+nameTimeIndex+"` ON ? (`name`, `time`) ALGORITHM=INPLACE LOCK=NONE", table); err != nil {
+			return err
+		}
+	}
 	if err := ensureIndex(nameFulltextIndex, "`name`", "name_fulltext_created"); err != nil {
 		return err
 	}
@@ -566,7 +607,9 @@ func fileNamesText(files []File) *string {
 	runes := 0
 	for _, file := range files {
 		for _, segment := range file.Path {
-			segment = strings.Join(strings.Fields(segment), " ") // Keep one name per line.
+			// Paths in legacy encodings (GBK, Shift-JIS) are not UTF-8; MySQL
+			// would reject the whole row. Keep one name per line.
+			segment = strings.Join(strings.Fields(strings.ToValidUTF8(segment, "")), " ")
 			if segment == "" || seen[segment] {
 				continue
 			}
@@ -590,17 +633,21 @@ func fileNamesText(files []File) *string {
 // backfillFileNames fills file_names for rows written before it existed.
 func backfillFileNames(ctx context.Context, db *gorm.DB) error {
 	started, filled := time.Now(), 0
+	// Walk the primary key, so each batch resumes where the last one stopped
+	// instead of rescanning every already-filled row from the start.
+	last := ""
 	for {
 		var rows []struct {
 			InfoHash string `gorm:"column:infohash"`
 			Files    []File `gorm:"column:files;serializer:json"`
 		}
 		if err := db.Model(&Data{}).Select("`infohash`, `files`").
-			Where("`file_names` IS NULL AND JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0").
-			Limit(backfillBatch).Find(&rows).Error; err != nil {
+			Where("`infohash` > ? AND `file_names` IS NULL AND JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0", last).
+			Order("`infohash`").Limit(backfillBatch).Find(&rows).Error; err != nil {
 			return fmt.Errorf("backfill file names: %w", err)
 		}
 		for _, row := range rows {
+			last = row.InfoHash
 			text := fileNamesText(row.Files)
 			if text == nil {
 				empty := ""
@@ -680,18 +727,10 @@ func (c *searchClause) and(sql string, args ...interface{}) {
 // searchPlan returns the row filter and, when file names are searched, the
 // condition for "matched in the name" used to rank name hits first.
 func searchPlan(name string, mode searchMode) (filter, nameHit searchClause) {
+	// Inputs without indexed words, and searchLike, never get here: Search
+	// starts them names-only and searchWith answers them by substring scan.
 	indexed, short := fulltextTerms(name)
-	if mode == searchLike || len(indexed) == 0 && mode == searchNameOnly {
-		filter.and("name LIKE ? ESCAPE '|'", "%"+escapeLike(name)+"%")
-		return filter, searchClause{}
-	}
 	files := mode == searchNameAndFiles
-	if len(indexed) == 0 { // Only one-character words.
-		like := "%" + escapeLike(name) + "%"
-		filter.and("(name LIKE ? ESCAPE '|' OR `"+fileNamesColumn+"` LIKE ? ESCAPE '|')", like, like)
-		nameHit.and("name LIKE ? ESCAPE '|'", like)
-		return filter, nameHit
-	}
 	phrases := booleanPhrases(indexed)
 	if files {
 		filter.and("MATCH(`name`, `"+fileNamesColumn+"`) AGAINST (? IN BOOLEAN MODE)", phrases)
@@ -717,12 +756,16 @@ func searchPlan(name string, mode searchMode) (filter, nameHit searchClause) {
 // fileSearchBudget bounds each statement that searches file names. Words
 // found in almost every file list ("mkv", "1080p") make ngram phrase search
 // expensive; past the budget, Search answers from names only instead.
-const fileSearchBudget = 1500 * time.Millisecond
+const fileSearchBudget = 3 * time.Second
 
 // nameSearchBudget bounds each statement of a names-only or substring search.
-// The two statements of a page (rows, total) plus a timed-out file-name
-// attempt stay within operationTimeout.
-const nameSearchBudget = 3000 * time.Millisecond
+// Rare words (a single CJK character cannot use the ngram index) may have to
+// scan every name; answering slowly beats not answering.
+const nameSearchBudget = 50 * time.Second
+
+// SearchTimeout bounds a whole search: a timed-out file-name attempt (two
+// statements of fileSearchBudget) plus both names-only statements.
+const SearchTimeout = 110 * time.Second
 
 // SearchTotalMax caps the counted total: counting every match of a very
 // common word costs as much as returning it. Beyond it, totals read "N+".
@@ -766,13 +809,21 @@ func Search(parent context.Context, name string, page int) (SearchResult, error)
 	if page < 1 || page > SearchPageMax {
 		return SearchResult{}, fmt.Errorf("invalid search page")
 	}
-	ctx, cancel := context.WithTimeout(parent, operationTimeout)
+	ctx, cancel := context.WithTimeout(parent, SearchTimeout)
 	defer cancel()
-	db, err := GetDBContext(ctx)
+	initCtx, cancelInit := context.WithTimeout(ctx, operationTimeout) // Initialization keeps the usual budget.
+	db, err := GetDBContext(initCtx)
+	cancelInit()
 	if err != nil {
 		return SearchResult{}, err
 	}
-	for mode := searchNameAndFiles; ; mode++ {
+	first := searchNameAndFiles
+	if indexed, _ := fulltextTerms(name); len(indexed) == 0 {
+		// Only words shorter than an ngram: file names could only be scanned
+		// with LIKE, which never finishes within fileSearchBudget.
+		first = searchNameOnly
+	}
+	for mode := first; ; mode++ {
 		results, total, err := searchWith(db.WithContext(ctx), name, page, mode)
 		if mode == searchLike || !stepDown(err, mode) {
 			if budgetExceeded(err) {
@@ -786,10 +837,17 @@ func Search(parent context.Context, name string, page int) (SearchResult, error)
 }
 
 func searchWith(db *gorm.DB, name string, page int, mode searchMode) ([]Data, int64, error) {
+	if indexed, _ := fulltextTerms(name); mode == searchLike || mode == searchNameOnly && len(indexed) == 0 {
+		results, total, err := searchNameSubstring(db, name, page, true)
+		if missingIndex(err) { // Index not built yet: scan the rows.
+			results, total, err = searchNameSubstring(db, name, page, false)
+		}
+		return results, total, err
+	}
 	results := make([]Data, 0, SearchPageSize)
 	filter, nameHit := searchPlan(name, mode)
 	query := db.Model(&Data{}).Where(filter.sql, filter.args...)
-	columns := "`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files"
+	columns := "`name`, `infohash`, `time`, `length`, `count`, " + hasFilesSQL("") + " AS has_files"
 	order := "`time` DESC, `infohash` DESC"
 	budget := nameSearchBudget
 	if mode == searchNameAndFiles {
@@ -818,8 +876,45 @@ func searchWith(db *gorm.DB, name string, page int, mode searchMode) ([]Data, in
 	return results, total, nil
 }
 
+// missingIndex reports a FORCE INDEX naming an index that does not exist (1176).
+func missingIndex(err error) bool {
+	var mysqlErr *mysqlDriver.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1176
+}
+
+// searchNameSubstring finds names containing the whole input. Matching keys
+// come from a scan of the narrow name index (useIndex), sorted there; only
+// the requested page is read from the wide rows.
+func searchNameSubstring(db *gorm.DB, name string, page int, useIndex bool) ([]Data, int64, error) {
+	table := clause.Table{Name: (Data{}).TableName()}
+	source := "?"
+	if useIndex {
+		source = "? FORCE INDEX (`" + nameTimeIndex + "`)"
+	}
+	hint := fmt.Sprintf("/*+ MAX_EXECUTION_TIME(%d) */ ", nameSearchBudget.Milliseconds())
+	matches := func() *gorm.DB {
+		return db.Session(&gorm.Session{NewDB: true}).Table(source, table).Where("`name` LIKE ? ESCAPE '|'", "%"+escapeLike(name)+"%")
+	}
+	keys := matches().Select("`infohash`").Order("`time` DESC, `infohash` DESC").Limit(SearchPageSize).Offset((page - 1) * SearchPageSize)
+	results := make([]Data, 0, SearchPageSize)
+	if err := db.Session(&gorm.Session{NewDB: true}).Model(&Data{}).Table("? AS resources", table).
+		Select(hint+"resources.name, resources.infohash, resources.time, resources.length, resources.count, "+hasFilesSQL("resources.")+" AS has_files").
+		Joins("JOIN (?) AS page ON page.infohash = resources.infohash", keys).
+		Order("resources.time DESC, resources.infohash DESC").Find(&results).Error; err != nil {
+		return nil, 0, err
+	}
+	total := int64(len(results))
+	if page > 1 || len(results) == SearchPageSize {
+		capped := matches().Select("1").Limit(SearchTotalMax + 1)
+		if err := db.Session(&gorm.Session{NewDB: true}).Table("(?) AS matches", capped).Select(hint + "COUNT(*)").Find(&total).Error; err != nil {
+			return nil, 0, err
+		}
+	}
+	return results, total, nil
+}
+
 func Trending(parent context.Context, window time.Duration, limit int, until time.Time) ([]Data, error) {
-	if !slices.Contains(TrendingWindows, window) || limit < 1 || limit > 100 {
+	if !slices.Contains(TrendingWindows, window) || limit < 1 || limit > TrendingLimitMax {
 		return nil, fmt.Errorf("invalid trending parameters")
 	}
 	ctx, cancel := context.WithTimeout(parent, TrendingTimeout)
@@ -835,17 +930,17 @@ func Trending(parent context.Context, window time.Duration, limit int, until tim
 	items := make([]Data, 0, limit)
 	err = db.WithContext(ctx).Model(&Data{}).
 		Table("? AS resources", clause.Table{Name: (Data{}).TableName()}).
-		Select("resources.name, resources.infohash, resources.time, resources.length, ranked.hits AS count, COALESCE(JSON_TYPE(resources.files) = 'ARRAY' AND JSON_LENGTH(resources.files) > 0, FALSE) AS has_files").
+		Select("resources.name, resources.infohash, resources.time, resources.length, ranked.hits AS count, "+hasFilesSQL("resources.")+" AS has_files").
 		Joins("JOIN (?) AS ranked ON ranked.infohash = resources.infohash", ranked).
 		Order("ranked.hits DESC, resources.infohash ASC").Find(&items).Error
 	return items, err
 }
 
 // TrendingTimeout bounds one ranking query. Aggregating a 24-hour window reads
-// every observation in it, which can exceed the 5s socket read timeout of the
-// main pool, so rankings run on a small pool of their own (analyticsDBContext)
+// every observation in it, so rankings run on a small pool of their own
+// (analyticsDBContext), apart from the request-serving main pool,
 // and callers should cache the result rather than query per request.
-const TrendingTimeout = 2 * time.Minute
+const TrendingTimeout = 5 * time.Minute
 
 var (
 	analyticsMu   sync.Mutex
@@ -911,7 +1006,7 @@ func Recent(parent context.Context, limit int) ([]Data, error) {
 	}
 	items := make([]Data, 0, limit)
 	err = db.WithContext(ctx).Model(&Data{}).
-		Select("`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files").
+		Select("`name`, `infohash`, `time`, `length`, `count`, " + hasFilesSQL("") + " AS has_files").
 		Order("`time` DESC, `infohash` DESC").Limit(limit).Find(&items).Error
 	return items, err
 }
@@ -924,7 +1019,7 @@ type ResourceCounts struct {
 }
 
 // CountTimeout bounds CountResources, a scan of the whole resource table.
-const CountTimeout = time.Minute
+const CountTimeout = 3 * time.Minute
 
 // Ping checks that the database answers, independently of slow queries.
 func Ping(parent context.Context) error {
@@ -955,7 +1050,7 @@ func CountResources(parent context.Context, startedAt time.Time) (ResourceCounts
 	// file_names is set exactly when a row has a non-empty file list (written
 	// with the row, backfilled for older ones); testing it avoids parsing
 	// every row's files JSON.
-	hasFiles := "`" + fileNamesColumn + "` IS NOT NULL"
+	hasFiles := hasFilesSQL("")
 	err = db.WithContext(ctx).Model(&Data{}).Select(
 		"COUNT(*) AS total, COALESCE(SUM("+hasFiles+"), 0) AS with_files, "+
 			"COALESCE(SUM(`time` >= ?), 0) AS this_run_total, "+

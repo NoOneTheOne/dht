@@ -4,7 +4,6 @@ package dht
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"log"
 	"math"
@@ -29,17 +28,13 @@ var (
 	// ErrNotReady is the error when DHT is not initialized.
 	ErrNotReady       = errors.New("dht is not ready")
 	ErrQueryNotQueued = errors.New("no get_peers query was queued")
-	// ErrOnGetPeersResponseNotSet is the error that config
-	// OnGetPeersResponseNotSet is not set when call dht.GetPeers.
-	ErrOnGetPeersResponseNotSet = errors.New("OnGetPeersResponse is not set")
 )
 
 // InitParam represents to configure of dht.
 type InitParam struct {
 	// in mainline dht, k = 8
 	K int
-	// for crawling mode, we put all nodes in one bucket, so KBucketSize may
-	// not be K
+	// the crawler keeps all nodes in one bucket, so KBucketSize is not K
 	KBucketSize int
 	// candidates are udp, udp4, udp6
 	Network string
@@ -51,8 +46,6 @@ type InitParam struct {
 	// the prime nodes through which we can join in dht network
 	PrimeNodes    []string
 	NodeCachePath string
-	// the KBucket expired duration
-	KBucketExpiredAfter time.Duration
 	// the node expired duration
 	NodeExpireAfter time.Duration
 	// how long it checks whether the bucket is expired
@@ -69,15 +62,13 @@ type InitParam struct {
 	OnGetPeersResponse func(string, *Peer)
 	// callback when got announce_peer request
 	OnAnnouncePeer func(string, string, int)
-	// OnSampleInfohashes receives BEP-51 samples. Crawl mode only sends
-	// sample_infohashes queries while it is set.
+	// OnSampleInfohashes receives BEP-51 samples. sample_infohashes queries
+	// are only sent while it is set.
 	OnSampleInfohashes func([]string)
 	// blocked ips
 	BlockedIPs []string
 	// blacklist size
 	BlackListMaxSize int
-	// StandardMode or CrawlMode
-	Mode string
 	// the times it tries when send fails
 	Try int
 	// the size of packet need to be dealt with
@@ -90,33 +81,8 @@ type InitParam struct {
 	QueryTimeout     time.Duration
 }
 
-// NewStandardConfig returns a InitParam pointer with default values.
-func NewStandardConfig() *InitParam {
-	return &InitParam{
-		K:                    8,
-		KBucketSize:          8,
-		Network:              "udp4",
-		Address:              ":6881",
-		PrimeNodes:           config.GetConfig().BootstrapNodes,
-		NodeExpireAfter:      time.Minute * 15,
-		KBucketExpiredAfter:  time.Minute * 15,
-		CheckKBucketPeriod:   time.Second * 30,
-		TokenExpiredAfter:    time.Minute * 10,
-		MaxTransactionCursor: math.MaxUint32,
-		MaxNodes:             5000,
-		BlockedIPs:           make([]string, 0),
-		BlackListMaxSize:     65536,
-		Try:                  2,
-		QueryWorkerLimit:     64,
-		QueryTimeout:         5 * time.Second,
-		Mode:                 "StandardMode",
-		PacketJobLimit:       1024,
-		PacketWorkerLimit:    256,
-		RefreshNodeNum:       8,
-	}
-}
-
-// NewCrawlConfig returns a config in crawling mode.
+// NewCrawlConfig returns the crawler configuration. The node only crawls:
+// it neither stores announced peers nor keeps refreshed contacts.
 func NewCrawlConfig() *InitParam {
 	return &InitParam{
 		K:                    8,
@@ -125,7 +91,6 @@ func NewCrawlConfig() *InitParam {
 		Address:              ":6881",
 		PrimeNodes:           config.GetConfig().BootstrapNodes,
 		NodeExpireAfter:      0,
-		KBucketExpiredAfter:  0,
 		CheckKBucketPeriod:   time.Second * 5,
 		TokenExpiredAfter:    time.Minute * 10,
 		MaxTransactionCursor: math.MaxUint32,
@@ -135,7 +100,6 @@ func NewCrawlConfig() *InitParam {
 		Try:                  2,
 		QueryWorkerLimit:     64,
 		QueryTimeout:         5 * time.Second,
-		Mode:                 "CrawlMode",
 		PacketJobLimit:       1024,
 		PacketWorkerLimit:    256,
 		RefreshNodeNum:       64,
@@ -149,7 +113,6 @@ type DHT struct {
 	conn                *net.UDPConn
 	routingTable        *routingTable
 	transactionManager  *transactionManager
-	peersManager        *peersManager
 	tokenManager        *tokenManager
 	blackList           *blackList
 	bootstrapMgr        *bootstrapManager
@@ -175,8 +138,7 @@ type DHT struct {
 	cancel              context.CancelFunc
 }
 
-// New returns a DHT pointer. If config is nil, then config will be set to
-// the default config.
+// New returns a DHT configured by initParam (see NewCrawlConfig).
 func New(initParam *InitParam) *DHT {
 	// BEP-42 binds the node ID to the IP other nodes see, i.e. the public
 	// one; a private interface address would yield a non-compliant ID.
@@ -224,16 +186,6 @@ func New(initParam *InitParam) *DHT {
 	return d
 }
 
-// IsStandardMode returns whether mode is StandardMode.
-func (dht *DHT) IsStandardMode() bool {
-	return dht.Mode == "StandardMode"
-}
-
-// IsCrawlMode returns whether mode is CrawlMode.
-func (dht *DHT) IsCrawlMode() bool {
-	return dht.Mode == "CrawlMode"
-}
-
 // init initializes global variables.
 func (dht *DHT) init() {
 	listener, err := net.ListenPacket(dht.Network, dht.Address)
@@ -243,8 +195,7 @@ func (dht *DHT) init() {
 
 	dht.conn = listener.(*net.UDPConn)
 	dht.routingTable = newRoutingTable(dht.KBucketSize, dht)
-	dht.peersManager = newPeersManager(dht)
-	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
+	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter)
 	dht.transactionManager = newTransactionManager(dht.MaxTransactionCursor, dht)
 	dht.bootstrapMgr = newBootstrapManager(dht)
 	dht.verifiedNodes = newVerifiedNodeStore(dht.NodeCachePath)
@@ -256,29 +207,6 @@ func (dht *DHT) init() {
 	dht.lookupHints = newBoundedSchedule(maxLookupHints)
 
 	dht.background.Go(dht.transactionManager.run)
-	dht.background.Go(func() { dht.blackList.clear(dht.stop) })
-}
-
-// join makes current node join the dht network.
-func (dht *DHT) join() {
-	if dht.bootstrapMgr != nil {
-		dht.bootstrapMgr.join()
-		return
-	}
-
-	// Fallback to original implementation if bootstrap manager not initialized
-	for _, addr := range dht.PrimeNodes {
-		RealAddress, err := net.ResolveUDPAddr(dht.Network, addr)
-		if err != nil {
-			continue
-		}
-
-		// NOTE: Temporary node has NOT node id.
-		dht.transactionManager.findNode(
-			&node{addr: RealAddress},
-			dht.node.id.RawString(),
-		)
-	}
 }
 
 // listen receives message from udp.
@@ -320,43 +248,29 @@ func (dht *DHT) listen() {
 // id returns id near to target if target is not null, otherwise it returns
 // the dht node id.
 func (dht *DHT) id(target string) string {
-	if dht.IsStandardMode() || target == "" {
+	if target == "" {
 		return dht.node.id.RawString()
 	}
 	return target[:15] + dht.node.id.RawString()[15:]
 }
 
-// GetPeers returns peers who have announced having infoHash.
+// GetPeers starts an asynchronous lookup for the peers of a raw 20-byte
+// infoHash; they are delivered to OnGetPeersResponse.
 func (dht *DHT) GetPeers(infoHash string) error {
 	if !dht.ready.Load() || dht.routingTable.Len() == 0 {
 		return ErrNotReady
 	}
-
-	if dht.OnGetPeersResponse == nil {
-		return ErrOnGetPeersResponseNotSet
-	}
-
-	if len(infoHash) == 40 {
-		data, err := hex.DecodeString(infoHash)
-		if err != nil {
-			return err
-		}
-		infoHash = string(data)
-	}
-
 	if len(infoHash) != 20 {
-		return errors.New("info hash must be 20 bytes or 40 hexadecimal characters")
+		return errors.New("info hash must be 20 bytes")
 	}
 
 	neighbors := dht.routingTable.GetNeighbors(
 		newBitmapFromString(infoHash), dht.K)
-	// A BEP-51 sampler stores this hash's peers; ask it first.
-	if hint := dht.lookupHint(infoHash); hint != nil {
-		neighbors = append([]*node{hint}, neighbors...)
+	hint := dht.lookupHint(infoHash)
+	if hint != nil {
 		RecordProtocolEvent("peer_lookup", "hinted")
 	}
-
-	return dht.startPeerLookup(infoHash, neighbors)
+	return dht.startPeerLookup(infoHash, neighbors, hint)
 }
 
 // Run starts the dht.
@@ -387,7 +301,7 @@ func (dht *DHT) RunContext(ctx context.Context) {
 			dht.transactionManager.findNode(seed, dht.node.id.RawString())
 		}
 	})
-	dht.background.Go(dht.join)
+	dht.background.Go(dht.bootstrapMgr.join)
 
 	for i := 0; i < max(1, dht.PacketWorkerLimit); i++ {
 		dht.packetWorkers.Go(dht.packetWorker)
@@ -418,7 +332,7 @@ func (dht *DHT) RunContext(ctx context.Context) {
 		case <-dht.stop:
 			return
 		case <-kBucketTicker.C:
-			if dht.IsCrawlMode() && dht.OnSampleInfohashes != nil && dht.sampling.CompareAndSwap(false, true) {
+			if dht.OnSampleInfohashes != nil && dht.sampling.CompareAndSwap(false, true) {
 				dht.background.Go(func() {
 					defer dht.sampling.Store(false)
 					dht.sampleRound()
@@ -426,7 +340,7 @@ func (dht *DHT) RunContext(ctx context.Context) {
 			}
 			// Use bootstrap manager to check if re-bootstrap is needed
 			if dht.bootstrapMgr.needsRebootstrap() {
-				dht.background.Go(dht.join)
+				dht.background.Go(dht.bootstrapMgr.join)
 			} else if dht.transactionManager.len() < max(1, dht.QueryWorkerLimit/2) &&
 				len(dht.transactionManager.queryChan) < cap(dht.transactionManager.queryChan)/2 &&
 				dht.refreshing.CompareAndSwap(false, true) {
@@ -500,8 +414,7 @@ func (dht *DHT) GetDHTStats() DHTStats {
 		PacketWorkers:      int(dht.activePacketWorkers.Load()),
 	}
 	if dht.bootstrapMgr != nil {
-		count, _ := dht.bootstrapMgr.getBootstrapStats()
-		stats.BootstrapCount = count
+		stats.BootstrapCount = dht.bootstrapMgr.getBootstrapCount()
 	}
 	return stats
 }

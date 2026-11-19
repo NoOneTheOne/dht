@@ -4,12 +4,11 @@
 *.log
 *.md
 .env
-config/config.yml
 web/node_modules
 web/dist
+build/
 vendor/
 .dockerignore
 .gitignore
 docker-compose.yml
 Makefile
-.golangci.yml

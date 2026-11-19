@@ -330,7 +330,6 @@ type metadataCooldown struct {
 
 // Wire represents the wire protocol.
 type Wire struct {
-	blackList    *blackList
 	queue        *syncedMap
 	infoHashes   map[string]int // Queued and active requests, guarded by queue's lock.
 	requests     chan Request
@@ -353,15 +352,13 @@ type Wire struct {
 }
 
 // NewWire returns a Wire pointer.
-//   - blackListSize: the blacklist size
 //   - requestQueueSize: the max requests it can buffer
 //   - workerQueueSize: the max goroutine downloading workers
-func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
+func NewWire(requestQueueSize, workerQueueSize int) *Wire {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Wire{
 		ctx:          ctx,
 		cancel:       cancel,
-		blackList:    newBlackList(blackListSize),
 		queue:        newSyncedMap(),
 		infoHashes:   make(map[string]int),
 		requests:     make(chan Request, requestQueueSize),
@@ -396,10 +393,6 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) (accepted bool) 
 		return false
 	}
 	ip = parsedIP.String()
-	if wire.blackList.in(ip, port) {
-		reason = "blacklisted"
-		return false
-	}
 	hashKey := string(infoHash)
 	key := hashKey + ":" + genAddress(ip, port)
 	wire.queue.Lock()
@@ -797,11 +790,17 @@ func (wire *Wire) fetchMetadataConnMode(raw net.Conn, r Request, deadline time.T
 			return errMetadataHashMismatch
 		}
 		finishStage(nil)
-		stage = "" // Response delivery is not peer download time.
+		stage = ""      // Response delivery is not peer download time.
+		_ = raw.Close() // The peer is no longer needed while delivery waits.
+		// Verified metadata gets its own wait: bounding delivery by what is
+		// left of the download deadline would discard a late finish and make
+		// the scheduler fetch the same torrent again.
+		delivery := time.NewTimer(metadataDeliveryWait)
+		defer delivery.Stop()
 		select {
 		case wire.responses <- Response{Request: r, MetadataInfo: metadataInfo}:
 			return nil
-		case <-timer.C:
+		case <-delivery.C:
 			RecordMetadataResponseDropped()
 			return errMetadataResponseDropped
 		case <-wire.stop:
@@ -810,6 +809,10 @@ func (wire *Wire) fetchMetadataConnMode(raw net.Conn, r Request, deadline time.T
 		}
 	}
 }
+
+// metadataDeliveryWait bounds handing verified metadata to the consumer. A
+// variable so tests can shorten it.
+var metadataDeliveryWait = time.Minute
 
 func recordMetadataError(err error) {
 	reason := "io_error"
@@ -835,11 +838,6 @@ func recordMetadataError(err error) {
 
 // Run starts the peer wire protocol.
 func (wire *Wire) Run() {
-	maintenanceDone := make(chan struct{})
-	go func() {
-		defer close(maintenanceDone)
-		wire.blackList.clear(wire.stop)
-	}()
 	defer func() {
 		wire.stopOnce.Do(func() { wire.cancel(); close(wire.stop) })
 		wire.workers.Wait()
@@ -862,7 +860,6 @@ func (wire *Wire) Run() {
 		clear(wire.cooldowns)
 		wire.cooldownFIFO.Init()
 		wire.queue.Unlock()
-		<-maintenanceDone
 		close(wire.responses)
 		close(wire.failures)
 		close(wire.stopped)
@@ -899,7 +896,9 @@ func (wire *Wire) Run() {
 				if wire.ctx.Err() != nil {
 					return
 				}
-				if wire.blackList.in(r.IP, r.Port) || wire.inFailureCooldown(r) {
+				// Endpoints in failure cooldown are skipped; the event keeps
+				// its historical "blacklisted" name for existing dashboards.
+				if wire.inFailureCooldown(r) {
 					RecordMetadataRequestDropped()
 					RecordProtocolEvent("metadata_queue", "blacklisted")
 					release()

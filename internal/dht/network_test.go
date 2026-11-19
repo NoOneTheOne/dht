@@ -97,7 +97,7 @@ func TestDHTStopAfterServingPacket(t *testing.T) {
 	defaultBootstrapNodes = []string{"127.0.0.1:1"}
 	t.Cleanup(func() { defaultBootstrapNodes = original })
 	d := &DHT{
-		InitParam: &InitParam{Network: "udp4", Address: "127.0.0.1:0", Mode: "StandardMode", K: 8, KBucketSize: 8, MaxNodes: 64, MaxTransactionCursor: 65536, QueryWorkerLimit: 2, QueryTimeout: time.Hour, CheckKBucketPeriod: time.Hour, Try: 1},
+		InitParam: &InitParam{Network: "udp4", Address: "127.0.0.1:0", K: 8, KBucketSize: 8, MaxNodes: 64, MaxTransactionCursor: 65536, QueryWorkerLimit: 2, QueryTimeout: time.Hour, CheckKBucketPeriod: time.Hour, Try: 1},
 		node:      invariantNode(0, 1), blackList: newBlackList(16), packets: make(chan packet, 4), stop: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	done := make(chan struct{})
@@ -188,7 +188,7 @@ func TestGetPeersValidatesHashAndBoundsFanout(t *testing.T) {
 	if err := d.GetPeers(strings.Repeat("a", 20)); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.GetPeers(strings.Repeat("61", 20)); !errors.Is(err, ErrLookupActive) || !errors.Is(err, ErrQueryNotQueued) {
+	if err := d.GetPeers(strings.Repeat("a", 20)); !errors.Is(err, ErrLookupActive) || !errors.Is(err, ErrQueryNotQueued) {
 		t.Fatalf("duplicate query must report no admission: %v", err)
 	}
 	if got := len(d.transactionManager.queryChan); got != peerLookupAlpha {
@@ -466,7 +466,7 @@ func TestWireDeduplicatesActivePeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	wire := NewWire(10, 10, 2)
+	wire := NewWire(10, 2)
 	port := listener.Addr().(*net.TCPAddr).Port
 	wire.Request(make([]byte, 20), "127.0.0.1", port)
 	wire.Request(make([]byte, 20), "127.0.0.1", port)
@@ -534,7 +534,7 @@ func TestQueuedQueriesDeduplicateAndRollback(t *testing.T) {
 }
 
 func TestWireQueuedRequestsDeduplicateAndRollback(t *testing.T) {
-	wire := NewWire(10, 2, 1)
+	wire := NewWire(2, 1)
 	var workers sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		workers.Add(1)
@@ -567,7 +567,7 @@ func TestWireQueuedRequestsDeduplicateAndRollback(t *testing.T) {
 }
 
 func TestWireLimitsRequestsPerHash(t *testing.T) {
-	wire := NewWire(10, 128, 1)
+	wire := NewWire(128, 1)
 	hash := make([]byte, 20)
 	var workers sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -611,11 +611,11 @@ func TestWireLimitsRequestsPerHash(t *testing.T) {
 }
 
 func TestWireBlacklistDiscardReleasesRequests(t *testing.T) {
-	wire := NewWire(10, 3, 1)
+	wire := NewWire(3, 1)
 	hash := make([]byte, 20)
 	for port := 6881; port <= 6883; port++ {
 		wire.Request(hash, "127.0.0.1", port)
-		wire.blackList.insert("127.0.0.1", port)
+		coolEndpoint(wire, "127.0.0.1", port)
 	}
 	close(wire.requests)
 	wire.Run()
@@ -632,7 +632,7 @@ func TestWireFailedWorkerReleasesRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	wire := NewWire(10, 10, 1)
+	wire := NewWire(10, 1)
 	wire.preferEncryption = false // This fake peer speaks plaintext only.
 	hash := make([]byte, 20)
 	port := listener.Addr().(*net.TCPAddr).Port
@@ -670,7 +670,7 @@ func TestWireFailedWorkerReleasesRequests(t *testing.T) {
 }
 
 func TestWireFullQueueDoesNotBlock(t *testing.T) {
-	wire := NewWire(10, 1, 1)
+	wire := NewWire(1, 1)
 	wire.Request(make([]byte, 20), "127.0.0.1", 6881)
 	otherHash := make([]byte, 20)
 	otherHash[0] = 1

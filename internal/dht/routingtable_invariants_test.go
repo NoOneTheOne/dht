@@ -188,12 +188,12 @@ func TestRoutingFailureChecksContactIdentity(t *testing.T) {
 	rt.Insert(old)
 	updated := invariantNode(128, 2)
 	rt.Insert(updated)
-	rt.removeContact(old, true)
-	if rt.Len() != 1 || rt.dht.blackList.in(old.addr.IP.String(), old.addr.Port) {
+	rt.removeContact(old)
+	if rt.Len() != 1 {
 		t.Fatal("old query evicted updated contact")
 	}
-	rt.removeContact(updated, true)
-	if rt.Len() != 0 || !rt.dht.blackList.in(updated.addr.IP.String(), updated.addr.Port) {
+	rt.removeContact(updated)
+	if rt.Len() != 0 {
 		t.Fatal("current failed contact was not evicted")
 	}
 	assertRoutingIndexes(t, rt)

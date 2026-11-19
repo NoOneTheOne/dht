@@ -24,7 +24,7 @@ func TestBitmapSetBit(t *testing.T) {
 	if bm.Bit(7) != 1 {
 		t.Error("Bit(7) should be 1 after Set(7)")
 	}
-	bm.Unset(0)
+	bm.set(0, 0)
 	if bm.Bit(0) != 0 {
 		t.Error("Bit(0) should be 0 after Unset(0)")
 	}
@@ -134,4 +134,17 @@ func BenchmarkBitmapXor(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = a.Xor(c)
 	}
+}
+
+// Xor returns the XOR distance of two bitmaps. Production code compares
+// distances without materializing them; tests use it as the reference.
+func (bitmap *bitmap) Xor(other *bitmap) *bitmap {
+	if bitmap.Size != other.Size {
+		panic("size not the same")
+	}
+	distance := newBitmap(bitmap.Size)
+	for i := range distance.data {
+		distance.data[i] = bitmap.data[i] ^ other.data[i]
+	}
+	return distance
 }

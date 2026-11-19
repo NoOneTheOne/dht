@@ -102,11 +102,11 @@ func TestBootstrapRetryAndConcurrentJoin(t *testing.T) {
 			defer wg.Done()
 			bm.join()
 			bm.needsRebootstrap()
-			bm.getBootstrapStats()
+			bm.getBootstrapCount()
 		}()
 	}
 	wg.Wait()
-	count, _ := bm.getBootstrapStats()
+	count := bm.getBootstrapCount()
 	if count != 1 || bm.needsRebootstrap() {
 		t.Fatal("concurrent join bypassed retry delay")
 	}

@@ -17,12 +17,8 @@ const (
 	announcePeerType = "announce_peer"
 )
 
-const (
-	generalError = 201 + iota
-	serverError
-	protocolError
-	unknownError
-)
+// protocolError is the BEP-5 error code for a malformed query.
+const protocolError = 203
 
 // packet represents the information receive from udp.
 type packet struct {
@@ -44,7 +40,7 @@ type tokenManager struct {
 }
 
 // newTokenManager returns a new tokenManager.
-func newTokenManager(expiredAfter time.Duration, _ *DHT) *tokenManager {
+func newTokenManager(expiredAfter time.Duration) *tokenManager {
 	tm := &tokenManager{expiredAfter: expiredAfter, now: time.Now}
 	tm.current = []byte(randomString(20))
 	tm.previous = []byte(randomString(20))
@@ -199,15 +195,30 @@ func (tm *transactionManager) newTransaction(id string, q *query) *transaction {
 	}
 }
 
-// genIndexKey generates an indexed key which consists of queryType and
-// address.
-func (tm *transactionManager) genIndexKey(queryType, address string) string {
-	return queryType + ":" + address
+// genIndexKey identifies an in-flight query for deduplication: its type and
+// address, plus the info hash for get_peers. Without the hash, concurrent
+// lookups for different torrents could never query the same node, and a
+// lookup refused that way would lose the node for good.
+func (tm *transactionManager) genIndexKey(queryType, address string, a map[string]interface{}) string {
+	key := queryType + ":" + address
+	if queryType == getPeersType {
+		if hash, ok := a["info_hash"].(string); ok {
+			key += ":" + hash
+		}
+	}
+	return key
+}
+
+// genIndexKeyByQuery generates the indexed key of a query message.
+func (tm *transactionManager) genIndexKeyByQuery(data map[string]interface{}, address string) string {
+	queryType, _ := data["q"].(string)
+	a, _ := data["a"].(map[string]interface{})
+	return tm.genIndexKey(queryType, address, a)
 }
 
 // genIndexKeyByTrans generates an indexed key by a transaction.
 func (tm *transactionManager) genIndexKeyByTrans(trans *transaction) string {
-	return tm.genIndexKey(trans.data["q"].(string), trans.node.addr.String())
+	return tm.genIndexKeyByQuery(trans.data, trans.node.addr.String())
 }
 
 // insert adds a transaction to transactionManager.
@@ -360,7 +371,7 @@ func (tm *transactionManager) query(q *query, try int) {
 		outcome = "reply"
 	}
 	if !trans.completed && q.node.id != nil {
-		tm.dht.routingTable.removeContact(q.node, false)
+		tm.dht.routingTable.removeContact(q.node)
 	}
 	trans.completed = true
 }
@@ -392,7 +403,7 @@ func (tm *transactionManager) run() {
 					tm.query(q, tm.dht.Try)
 				}
 				tm.Lock()
-				delete(tm.pending, tm.genIndexKey(q.data["q"].(string), q.node.addr.String()))
+				delete(tm.pending, tm.genIndexKeyByQuery(q.data, q.node.addr.String()))
 				tm.Unlock()
 				if q.lookup != nil {
 					q.lookup.complete(q)
@@ -427,7 +438,7 @@ func (tm *transactionManager) queueQuery(no *node, queryType string, a map[strin
 
 	// If the target is self, then stop.
 	if no.id != nil && no.id.RawString() == tm.dht.node.id.RawString() ||
-		tm.getByIndex(tm.genIndexKey(queryType, no.addr.String())) != nil ||
+		tm.getByIndex(tm.genIndexKey(queryType, no.addr.String(), a)) != nil ||
 		tm.dht.blackList.in(no.addr.IP.String(), no.addr.Port) {
 		return false
 	}
@@ -439,7 +450,7 @@ func (tm *transactionManager) queueQuery(no *node, queryType string, a map[strin
 		lookup: lookup,
 	}
 
-	key := tm.genIndexKey(queryType, no.addr.String())
+	key := tm.genIndexKey(queryType, no.addr.String(), a)
 	tm.Lock()
 	defer tm.Unlock()
 	select {
@@ -474,14 +485,6 @@ func (tm *transactionManager) findNode(no *node, target string) {
 	tm.sendQuery(no, findNodeType, map[string]interface{}{
 		"id":     tm.dht.id(target),
 		"target": target,
-	})
-}
-
-// getPeers sends get_peers query to the chan.
-func (tm *transactionManager) getPeers(no *node, infoHash string) bool {
-	return tm.sendQuery(no, getPeersType, map[string]interface{}{
-		"id":        tm.dht.id(infoHash),
-		"info_hash": infoHash,
 	})
 }
 
@@ -583,7 +586,7 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 	// than blacklisting the real sender, whose requests carry infohashes.
 	if no, ok := dht.routingTable.GetNodeByAddress(addr.String()); ok &&
 		no.id.RawString() != id {
-		dht.routingTable.removeContact(no, false)
+		dht.routingTable.removeContact(no)
 	}
 
 	switch q {
@@ -601,7 +604,7 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			send(dht, addr, makeError(t, protocolError, "invalid target"))
 			return
 		}
-		// Crawl mode answers too: nodes that reply stay in remote routing
+		// Answer even as a crawler: nodes that reply stay in remote routing
 		// tables, which is what attracts get_peers/announce_peer traffic.
 		var nodes string
 		targetID := newBitmapFromString(target)
@@ -633,28 +636,13 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 
-		// Crawl mode never caches peers, so it always takes the nodes branch.
-		if peers := dht.peersManager.GetPeers(
-			infoHash, dht.K); len(peers) > 0 {
-
-			values := make([]interface{}, len(peers))
-			for i, p := range peers {
-				values[i] = p.CompactIPPortInfo()
-			}
-
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id":     dht.id(infoHash),
-				"values": values,
-				"token":  dht.tokenManager.token(addr),
-			}))
-		} else {
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id":    dht.id(infoHash),
-				"token": dht.tokenManager.token(addr),
-				"nodes": strings.Join(dht.routingTable.GetNeighborCompactInfos(
-					newBitmapFromString(infoHash), dht.K), ""),
-			}))
-		}
+		// The crawler stores no peers, so it always answers with nodes.
+		send(dht, addr, makeResponse(t, map[string]interface{}{
+			"id":    dht.id(infoHash),
+			"token": dht.tokenManager.token(addr),
+			"nodes": strings.Join(dht.routingTable.GetNeighborCompactInfos(
+				newBitmapFromString(infoHash), dht.K), ""),
+		}))
 
 		if dht.OnGetPeers != nil {
 			dht.OnGetPeers(infoHash, addr.IP.String(), addr.Port)
@@ -674,8 +662,7 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		token := a["token"].(string)
 
 		if !dht.tokenManager.check(addr, token) {
-			//			send(dht, addr, makeError(t, protocolError, "invalid token"))
-			return
+			return // Ignored without a reply, like a spoofed announce.
 		}
 
 		if len(infoHash) != 20 {
@@ -698,9 +685,8 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			return
 		}
 
-		// Peers are cached only in standard mode, but both modes must reply:
+		// The announced peer is not stored, but the announce must be answered:
 		// an unanswered announce counts as a timeout and gets us evicted.
-		dht.peersManager.Insert(infoHash, newPeer(addr.IP, port, token))
 		// Reply under the same ID our get_peers answer used for this hash.
 		send(dht, addr, makeResponse(t, map[string]interface{}{
 			"id": dht.id(infoHash),
@@ -729,11 +715,11 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 	return true
 }
 
-// findOn puts nodes in the response to the routingTable, then if target is in
-// the nodes or all nodes are in the routingTable, it stops. Otherwise,
-// it continues to findNode or getPeers.
-func findOn(dht *DHT, r map[string]interface{}, target *bitmap,
-	queryType string) error {
+// findOn puts the nodes of a find_node response into the routing table, then
+// if target is among them or none is new, it stops. Otherwise it continues
+// with find_node to the closest known nodes. (get_peers continues through
+// its peerLookup instead.)
+func findOn(dht *DHT, r map[string]interface{}, target *bitmap) error {
 
 	if err := ParseKey(r, "nodes", "string"); err != nil {
 		return err
@@ -770,14 +756,7 @@ func findOn(dht *DHT, r map[string]interface{}, target *bitmap,
 
 	targetID := target.RawString()
 	for _, no := range dht.routingTable.GetNeighbors(target, dht.K) {
-		switch queryType {
-		case findNodeType:
-			dht.transactionManager.findNode(no, targetID)
-		case getPeersType:
-			dht.transactionManager.getPeers(no, targetID)
-		default:
-			panic("invalid find type")
-		}
+		dht.transactionManager.findNode(no, targetID)
 	}
 	return nil
 }
@@ -826,7 +805,7 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	// removeContact checks pointer identity, so a contact refreshed by
 	// another query is left alone.
 	if trans.node.id != nil && trans.node.id.RawString() != id {
-		dht.routingTable.removeContact(trans.node, false)
+		dht.routingTable.removeContact(trans.node)
 	}
 
 	node, err := newNode(id, addr.Network(), addr.String())
@@ -837,12 +816,8 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	switch q {
 	case pingType:
 	case findNodeType:
-		if trans.data["q"].(string) != findNodeType {
-			return
-		}
-
-		target := trans.data["a"].(map[string]interface{})["target"].(string)
-		if findOn(dht, r, newBitmapFromString(target), findNodeType) != nil {
+		// The target was validated above.
+		if findOn(dht, r, newBitmapFromString(a["target"].(string))) != nil {
 			return
 		}
 	case getPeersType:
@@ -891,7 +866,6 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 				if err != nil || p.Port == 0 {
 					continue
 				}
-				dht.peersManager.Insert(infoHash, p)
 				if trans.lookup != nil {
 					trans.lookup.foundPeer()
 				}
@@ -899,9 +873,6 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 					dht.OnGetPeersResponse(infoHash, p)
 				}
 			}
-		} else if trans.lookup == nil && findOn(
-			dht, r, newBitmapFromString(infoHash), getPeersType) != nil {
-			return
 		}
 	case announcePeerType:
 	case sampleInfohashesType:
@@ -922,7 +893,6 @@ func handleResponse(dht *DHT, addr *net.UDPAddr,
 	if dht.reachability != nil {
 		dht.reachability.recordResponse()
 	}
-	dht.blackList.delete(addr.IP.String(), addr.Port)
 	dht.routingTable.Insert(node)
 
 	return true

@@ -64,7 +64,7 @@ function RateCard({ label, subtitle, rate }: { label: string; subtitle: string; 
 }
 
 function IngestionCard({ label, subtitle, breakdown }: { label: string; subtitle: string; breakdown: Breakdown | null | undefined }) {
-  return <article className="status-card ingestion-card"><span className="metric-label">{label}<span>UNIQUE INFOHASH</span></span>
+  return <article className="status-card"><span className="metric-label">{label}<span>UNIQUE INFOHASH</span></span>
     <strong className="metric-value">{number(breakdown?.total)}<small>个</small></strong>
     <p className="metric-note">{subtitle}</p>
     {breakdown == null && <p className="metric-note">{breakdown === undefined ? '正在获取入库统计' : '入库统计暂时不可用，不代表入库数量为 0'}</p>}
@@ -83,7 +83,7 @@ export default function SystemStatus() {
     const load = async () => {
       controller = new AbortController();
       setLoading(true);
-      const timeout = window.setTimeout(() => controller.abort(), 10000);
+      const timeout = window.setTimeout(() => controller.abort(), 30000); // The server waits up to 20 s for a fresh status.
       try {
         const response = await fetch('/api/status', { signal: controller.signal, cache: 'no-store' });
         if (!response.ok) throw new Error('状态服务暂时无法连接，请稍后重试。');
@@ -126,7 +126,7 @@ export default function SystemStatus() {
         <article className="status-card"><span className="metric-label">总收集条目 <span>ALL TIME</span></span><strong className="metric-value">{number(data?.total_collected)}<small>条</small></strong><p className="metric-note">数据库已收录的去重资源数</p></article>
       </div>
       <div className="status-group-heading"><h2>入库统计</h2><span>INGESTION TOTALS</span></div>
-      <p className="ingestion-description">按 InfoHash 去重精确计数 · 统计缓存 1 分钟，刷新状态不会立即刷新入库统计。</p>
+      <p className="ingestion-description">按 InfoHash 去重精确计数 · 统计缓存 10 分钟，刷新状态不会立即刷新入库统计。</p>
       <div className="status-grid ingestion-grid">
         <IngestionCard label="本次新增入库" subtitle="数据库首次收录时间 ≥ 采集进程本次启动时间；不含重复旧 InfoHash" breakdown={data?.ingestion.this_run} />
         <IngestionCard label="全局已入库" subtitle="全局数据库存量：主表所有唯一 InfoHash，不限采集进程启动时间" breakdown={data?.ingestion.all_time} />
@@ -139,7 +139,7 @@ export default function SystemStatus() {
       </div>
       <div className="status-group-heading"><h2>基础服务</h2><span>INFRASTRUCTURE</span></div>
       <div className="status-grid infrastructure-grid">
-        <article className="status-card worker-card"><span className="metric-label">工作线程数 <span>活动 / 上限</span></span>{(['packet', 'query', 'metadata'] as Pool[]).map(pool => <div className="worker-row" key={pool}><div><span>{{ packet: '数据包处理', query: 'DHT 查询', metadata: '元数据抓取' }[pool]}</span><b>{number(c?.workers[pool])}<span> / {number(c?.worker_limits[pool])}</span></b></div><div className="rate-track" aria-hidden="true"><span style={{ width: `${c && c.worker_limits[pool] ? Math.min(100, c.workers[pool] / c.worker_limits[pool] * 100) : 0}%` }} /></div></div>)}<p className="metric-note">并发任务数，非操作系统线程数</p></article>
+        <article className="status-card"><span className="metric-label">工作线程数 <span>活动 / 上限</span></span>{(['packet', 'query', 'metadata'] as Pool[]).map(pool => <div className="worker-row" key={pool}><div><span>{{ packet: '数据包处理', query: 'DHT 查询', metadata: '元数据抓取' }[pool]}</span><b>{number(c?.workers[pool])}<span> / {number(c?.worker_limits[pool])}</span></b></div><div className="rate-track" aria-hidden="true"><span style={{ width: `${c && c.worker_limits[pool] ? Math.min(100, c.workers[pool] / c.worker_limits[pool] * 100) : 0}%` }} /></div></div>)}<p className="metric-note">并发任务数，非操作系统线程数</p></article>
         <article className="status-card network-card"><div className="service-row"><div><span className="metric-label">NAT 状态</span><strong>{c ? natLabels[c.nat] ?? '未知' : '—'}</strong></div><i className={`status-dot ${c?.nat === 'mapped' ? 'operational' : 'degraded'}`} /></div><div className="service-row"><div><span className="metric-label">公网可达性</span><strong>{c ? reachLabels[c.reachability] ?? '未知' : '—'}</strong></div><i className={`status-dot ${c?.reachability === 'reachable' ? 'operational' : 'degraded'}`} /></div><p className="metric-note">基于公网主动 DHT 入站请求；仅有出站响应不能证明可达，未观测到不等于不可达。</p></article>
         <article className="status-card network-card"><div className="service-row"><div><span className="metric-label">资源数据库</span><strong>{!data ? '等待检查' : data.storage === 'connected' ? '连接正常' : '暂时不可用'}</strong></div><i className={`status-dot ${!data ? 'degraded' : data.storage === 'connected' ? 'operational' : 'outage'}`} /></div><div className="service-row"><div><span className="metric-label">DHT 网络</span><strong>{!c ? '采集进程未连接' : c.ready ? '已加入网络' : '正在初始化'}</strong></div><i className={`status-dot ${!data ? 'degraded' : !c ? 'outage' : c.ready ? 'operational' : 'degraded'}`} /></div><p className="metric-note">绿色正常 · 黄色待确认或需关注 · 红色服务不可用</p></article>
       </div>

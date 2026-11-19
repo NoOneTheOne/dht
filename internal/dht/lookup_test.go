@@ -11,7 +11,7 @@ import (
 )
 
 func lookupTestDHT() *DHT {
-	d := &DHT{InitParam: &InitParam{K: 8, MaxNodes: 1, Mode: "StandardMode", Try: 1, QueryTimeout: time.Second, OnGetPeersResponse: func(string, *Peer) {}}, node: &node{id: newBitmap(160)}, blackList: newBlackList(100), stop: make(chan struct{})}
+	d := &DHT{InitParam: &InitParam{K: 8, MaxNodes: 1, Try: 1, QueryTimeout: time.Second, OnGetPeersResponse: func(string, *Peer) {}}, node: &node{id: newBitmap(160)}, blackList: newBlackList(100), stop: make(chan struct{})}
 	d.routingTable = newRoutingTable(8, d)
 	d.transactionManager = newTransactionManager(math.MaxUint32, d)
 	d.ready.Store(true)
@@ -40,7 +40,7 @@ func TestPeerLookupContinuesWithFullRoutingTable(t *testing.T) {
 	}
 	d.transactionManager.delete(trans.id)
 	d.transactionManager.Lock()
-	delete(d.transactionManager.pending, d.transactionManager.genIndexKey(getPeersType, q.node.addr.String()))
+	delete(d.transactionManager.pending, d.transactionManager.genIndexKeyByQuery(q.data, q.node.addr.String()))
 	d.transactionManager.Unlock()
 	q.lookup.complete(q)
 	if d.routingTable.Len() != 1 {
@@ -63,7 +63,7 @@ func TestPeerLookupBudgetAndCandidateBounds(t *testing.T) {
 		n.addr = &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 10000 + i}
 	}
 	hash := strings.Repeat("h", 20)
-	if err := d.startPeerLookup(hash, nodes); err != nil {
+	if err := d.startPeerLookup(hash, nodes, nil); err != nil {
 		t.Fatal(err)
 	}
 	lookup := d.lookups[hash]
@@ -74,7 +74,7 @@ func TestPeerLookupBudgetAndCandidateBounds(t *testing.T) {
 	for len(d.transactionManager.queryChan) > 0 {
 		q := <-d.transactionManager.queryChan
 		d.transactionManager.Lock()
-		delete(d.transactionManager.pending, d.transactionManager.genIndexKey(getPeersType, q.node.addr.String()))
+		delete(d.transactionManager.pending, d.transactionManager.genIndexKeyByQuery(q.data, q.node.addr.String()))
 		d.transactionManager.Unlock()
 		q.resultNodes = nodes
 		q.lookup.complete(q)
@@ -95,7 +95,7 @@ func TestPeerLookupDeadlineAndCapacity(t *testing.T) {
 		n.addr = &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 10000 + i}
 	}
 	hash := strings.Repeat("h", 20)
-	if err := d.startPeerLookup(hash, nodes); err != nil {
+	if err := d.startPeerLookup(hash, nodes, nil); err != nil {
 		t.Fatal(err)
 	}
 	lookup := d.lookups[hash]
@@ -110,7 +110,7 @@ func TestPeerLookupDeadlineAndCapacity(t *testing.T) {
 	for i := 0; i < maxPeerLookups; i++ {
 		d.lookups[fmt.Sprintf("%020d", i)] = &peerLookup{}
 	}
-	if err := d.startPeerLookup(hash, nodes); !errors.Is(err, ErrLookupCapacity) || !errors.Is(err, ErrQueryNotQueued) {
+	if err := d.startPeerLookup(hash, nodes, nil); !errors.Is(err, ErrLookupCapacity) || !errors.Is(err, ErrQueryNotQueued) {
 		t.Fatalf("active lookup capacity exceeded: %v", err)
 	}
 }
@@ -201,7 +201,7 @@ func TestPeerLookupRejectsPrivateCandidates(t *testing.T) {
 	for i, ip := range []string{"127.0.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1"} {
 		nodes[i].addr = &net.UDPAddr{IP: net.ParseIP(ip), Port: 6881}
 	}
-	if err := d.startPeerLookup(strings.Repeat("h", 20), nodes); err != ErrQueryNotQueued || len(d.transactionManager.queryChan) != 0 {
+	if err := d.startPeerLookup(strings.Repeat("h", 20), nodes, nil); err != ErrQueryNotQueued || len(d.transactionManager.queryChan) != 0 {
 		t.Fatal("private lookup candidates were accepted")
 	}
 }
@@ -252,13 +252,12 @@ func TestPeerLookupFindsPeersAndNodesTogether(t *testing.T) {
 	}
 	received := 0
 	d.OnGetPeersResponse = func(string, *Peer) { received++ }
-	if err := d.startPeerLookup(strings.Repeat("h", 20), nodes[:1]); err != nil {
+	if err := d.startPeerLookup(strings.Repeat("h", 20), nodes[:1], nil); err != nil {
 		t.Fatal(err)
 	}
 	q := <-d.transactionManager.queryChan
 	trans := d.transactionManager.newTransaction(q.data["t"].(string), q)
 	d.transactionManager.insert(trans)
-	d.peersManager = newPeersManager(d)
 	peer := newPeer(net.IPv4(1, 1, 1, 1), 6881, "test")
 	if !handleResponse(d, q.node.addr, map[string]interface{}{"t": trans.id, "r": map[string]interface{}{"id": q.node.id.RawString(), "token": "test", "values": []interface{}{peer.CompactIPPortInfo()}, "nodes": nodes[1].CompactNodeInfo()}}) {
 		t.Fatal("combined response rejected")

@@ -1,31 +1,15 @@
 package dht
 
-import (
-	"time"
-)
-
-// blockedItem represents a blocked node.
-type blockedItem struct {
-	ip         string
-	port       int
-	createTime time.Time
-}
-
-// blackList manages the blocked nodes including which sends bad information
-// and can't ping out.
+// blackList holds addresses the node never talks to: its own interface and
+// public addresses (IP-only entries, port < 0). Entries are permanent.
 type blackList struct {
-	list         *syncedMap
-	maxSize      int
-	expiredAfter time.Duration
+	list    *syncedMap
+	maxSize int
 }
 
 // newBlackList returns a blackList pointer.
 func newBlackList(size int) *blackList {
-	return &blackList{
-		list:         newSyncedMap(),
-		maxSize:      size,
-		expiredAfter: time.Hour * 1,
-	}
+	return &blackList{list: newSyncedMap(), maxSize: size}
 }
 
 // genKey returns a key. If port is less than 0, the key wil be ip. Otherwise,
@@ -43,63 +27,16 @@ func (bl *blackList) insert(ip string, port int) {
 	if bl.list.Len() >= bl.maxSize {
 		return
 	}
-
-	bl.list.Set(bl.genKey(ip, port), &blockedItem{
-		ip:         ip,
-		port:       port,
-		createTime: time.Now(),
-	})
+	bl.list.Set(bl.genKey(ip, port), struct{}{})
 }
 
-// delete removes blocked item form the blackList.
-func (bl *blackList) delete(ip string, port int) {
-	bl.list.Delete(bl.genKey(ip, port))
-}
-
-// validate checks whether ip-port pair is in the block nodes list.
+// in reports whether the ip, or the ip-port pair, is blocked.
 func (bl *blackList) in(ip string, port int) bool {
 	if _, ok := bl.list.Get(ip); ok {
 		return true
 	}
-
-	key := bl.genKey(ip, port)
-
-	v, ok := bl.list.Get(key)
-	if ok {
-		if time.Since(v.(*blockedItem).createTime) < bl.expiredAfter {
-			return true
-		}
-		bl.list.Delete(key)
-	}
-	return false
-}
-
-// clear cleans the expired items every 10 minutes.
-func (bl *blackList) clear(stop <-chan struct{}) {
-	ticker := time.NewTicker(time.Minute * 10)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-		}
-		bl.sweep()
-	}
-}
-
-// sweep removes expired ip:port entries.
-func (bl *blackList) sweep() {
-	keys := make([]interface{}, 0, 100)
-	for item := range bl.list.Iter() {
-		blocked := item.val.(*blockedItem)
-		// IP-only entries (configured BlockedIPs, our own addresses) are
-		// permanent; in() never expires them either.
-		if blocked.port >= 0 && time.Since(blocked.createTime) > bl.expiredAfter {
-			keys = append(keys, item.key)
-		}
-	}
-	bl.list.DeleteMulti(keys)
+	_, ok := bl.list.Get(bl.genKey(ip, port))
+	return ok
 }
 
 // len returns the number of items in the blacklist.

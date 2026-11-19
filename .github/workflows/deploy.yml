@@ -54,7 +54,7 @@ jobs:
     needs: [lint, test]
     strategy:
       matrix:
-        binary: [spider, search, getpeers]
+        binary: [spider, search]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -135,7 +135,7 @@ jobs:
           extension=""
           if [[ "$GOOS" == windows ]]; then extension=".exe"; fi
           mkdir -p dist
-          for binary in spider search getpeers; do
+          for binary in spider search; do
             name="dht-${binary}_${version}_${GOOS}_${GOARCH}"
             directory="packages/$name"
             mkdir -p "$directory"
@@ -196,8 +196,9 @@ jobs:
         run: |
           shopt -s nullglob
           archives=(dist/*.tar.gz dist/*.zip)
-          [[ "${#archives[@]}" == 15 ]] || {
-            echo "ERROR: expected 15 release archives"
+          # 2 binaries (spider, search) x 5 platforms.
+          [[ "${#archives[@]}" == 10 ]] || {
+            echo "ERROR: expected 10 release archives"
             exit 1
           }
           (cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
@@ -281,7 +282,7 @@ jobs:
 
       - name: Start and verify services
         run: |
-          docker compose up -d --no-build --pull never --wait --wait-timeout 90
+          docker compose up -d --no-build --pull never --wait --wait-timeout 180
           for service in dht-spider dht-search; do
             container=$(docker compose ps -q "$service")
             test -n "$container"

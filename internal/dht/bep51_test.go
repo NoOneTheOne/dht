@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -9,7 +10,6 @@ import (
 
 func TestSampleInfohashesResponseFeedsHashesAndHints(t *testing.T) {
 	d, remote := newKRPCTestDHT(t)
-	d.Mode = "CrawlMode"
 	addr := remote.LocalAddr().(*net.UDPAddr)
 	trans := addKRPCTestTransaction(t, d, addr, sampleInfohashesType)
 	var got []string
@@ -77,7 +77,6 @@ func TestSampleIntervalIsClamped(t *testing.T) {
 
 func TestSampleRoundRespectsScheduleAndBusyQueue(t *testing.T) {
 	d, _ := newKRPCTestDHT(t)
-	d.Mode = "CrawlMode"
 	// Crawl mode's single unbounded bucket: no splits, candidates or the
 	// background refresh pings they trigger.
 	d.routingTable = newRoutingTable(1<<30, d)
@@ -127,7 +126,6 @@ func TestSampleRoundRespectsScheduleAndBusyQueue(t *testing.T) {
 
 func TestSampleInfohashesRequestAndUnknownMethod(t *testing.T) {
 	d, remote := newKRPCTestDHT(t)
-	d.Mode = "CrawlMode"
 	addr := remote.LocalAddr().(*net.UDPAddr)
 	target := strings.Repeat("t", 20)
 	if !handleRequest(d, addr, makeQuery("s1", sampleInfohashesType, map[string]interface{}{
@@ -198,5 +196,25 @@ func TestGetPeersStartsAtSampleHint(t *testing.T) {
 	}
 	if !asked["8.8.3.2:6881"] {
 		t.Fatalf("lookup ignored the sampler hint; asked %v", asked)
+	}
+}
+
+func TestGetPeersAsksFarSampleHintFirst(t *testing.T) {
+	d, _ := newKRPCTestDHT(t)
+	d.ready.Store(true)
+	d.OnGetPeersResponse = func(string, *Peer) {}
+	hash := strings.Repeat("\x01", 20)
+	// More nodes closer to the hash than the lookup queries at once.
+	for i := 0; i < 2*peerLookupAlpha; i++ {
+		near, _ := newNode(strings.Repeat("\x01", 19)+string(rune(0x10+i)), "udp4", fmt.Sprintf("8.8.4.%d:6881", i+1))
+		d.routingTable.Insert(near)
+	}
+	hint, _ := newNode(strings.Repeat("\xfe", 20), "udp4", "8.8.3.2:6881") // Far from the hash.
+	d.lookupHints.set(hash, time.Time{}, hint)
+	if err := d.GetPeers(hash); err != nil {
+		t.Fatal(err)
+	}
+	if first := (<-d.transactionManager.queryChan).node.addr.String(); first != "8.8.3.2:6881" {
+		t.Fatalf("first get_peers went to %s, not the sampler hint", first)
 	}
 }

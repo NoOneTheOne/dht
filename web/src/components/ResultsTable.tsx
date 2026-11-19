@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { TorrentItem } from '../types';
+import { formatSize } from '../format';
 
 interface ResultsTableProps {
   items: TorrentItem[];
@@ -22,13 +23,6 @@ const fields: { key: SortField; label: string }[] = [
   { key: 'name', label: '资源名称' }, { key: 'length', label: '文件大小' },
   { key: 'time', label: '收录时间' }, { key: 'count', label: '采集次数' },
 ];
-
-function formatSize(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${Number((bytes / 1024 ** index).toFixed(2))} ${units[index]}`;
-}
 
 export default function ResultsTable({ items, total, totalCapped, query, loading, page, pageSize, onPageChange }: ResultsTableProps) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -80,7 +74,7 @@ export default function ResultsTable({ items, total, totalCapped, query, loading
     <section className="state-panel" aria-busy="true" role="status"><span className="loading-ring" aria-hidden="true" /><h2>正在检索资源</h2><p>正在搜索「{query}」的第 {page} 页，请稍候…</p></section>
   );
   if (!query) return (
-    <section className="state-panel welcome-panel"><span className="state-symbol" aria-hidden="true">⌕</span><h2>让发现从这里开始</h2><p>输入资源名称，快速查看大小与收录信息。<br />找到结果后，可复制磁力链接到支持的客户端。</p><span className="state-caption">KEYWORD → METADATA → MAGNET</span></section>
+    <section className="state-panel"><span className="state-symbol" aria-hidden="true">⌕</span><h2>让发现从这里开始</h2><p>输入资源名称，快速查看大小与收录信息。<br />找到结果后，可复制磁力链接到支持的客户端。</p><span className="state-caption">KEYWORD → METADATA → MAGNET</span></section>
   );
   if (items.length === 0) return (
     <section className="state-panel" role="status"><span className="state-symbol" aria-hidden="true">⌕</span><h2>没有找到「{query}」</h2><p>尝试更短的关键词、其他拼写，或去掉不必要的符号。</p></section>
@@ -103,9 +97,9 @@ export default function ResultsTable({ items, total, totalCapped, query, loading
         <p className="pagination-summary" role="status">第 {numberFormatter.format(page)} / {numberFormatter.format(totalPages)} 页 · 每页 {pageSize} 条</p>
         <div className="pagination-controls">
           <button className="page-button" disabled={page === 1} onClick={() => onPageChange(page - 1)}>上一页</button>
-          {firstPage > 1 && <><button className="page-button page-number" aria-label="第 1 页" onClick={() => onPageChange(1)}>1</button>{firstPage > 2 && <span className="page-ellipsis" aria-hidden="true">…</span>}</>}
-          {visiblePages.map(number => <button key={number} className="page-button page-number" aria-label={`第 ${number} 页`} aria-current={page === number ? 'page' : undefined} disabled={page === number} onClick={() => onPageChange(number)}>{number}</button>)}
-          {visiblePages[visiblePages.length - 1] < totalPages && <>{visiblePages[visiblePages.length - 1] < totalPages - 1 && <span className="page-ellipsis" aria-hidden="true">…</span>}<button className="page-button page-number" aria-label={`第 ${totalPages} 页`} onClick={() => onPageChange(totalPages)}>{totalPages}</button></>}
+          {firstPage > 1 && <><button className="page-button" aria-label="第 1 页" onClick={() => onPageChange(1)}>1</button>{firstPage > 2 && <span className="page-ellipsis" aria-hidden="true">…</span>}</>}
+          {visiblePages.map(number => <button key={number} className="page-button" aria-label={`第 ${number} 页`} aria-current={page === number ? 'page' : undefined} disabled={page === number} onClick={() => onPageChange(number)}>{number}</button>)}
+          {visiblePages[visiblePages.length - 1] < totalPages && <>{visiblePages[visiblePages.length - 1] < totalPages - 1 && <span className="page-ellipsis" aria-hidden="true">…</span>}<button className="page-button" aria-label={`第 ${totalPages} 页`} onClick={() => onPageChange(totalPages)}>{totalPages}</button></>}
           <button className="page-button" disabled={page >= totalPages} onClick={() => onPageChange(page + 1)}>下一页</button>
         </div>
       </nav>

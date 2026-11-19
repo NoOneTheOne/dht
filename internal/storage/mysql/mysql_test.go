@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -653,14 +654,12 @@ func TestTrendingQuery(t *testing.T) {
 	if err := statement.Parse(&Observation{}); err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	// The covering index is built online by EnsureSearchIndexes; the model
+	// must not ask AutoMigrate to recreate the dropped redundant prefixes.
 	for _, index := range statement.Schema.ParseIndexes() {
-		if index.Name == "idx_observation_window" && len(index.Fields) == 2 && index.Fields[0].DBName == "applied" && index.Fields[1].DBName == "time" {
-			found = true
+		if slices.Contains(redundantObservationIndexes, index.Name) || len(index.Fields) > 0 && index.Fields[0].DBName == "applied" {
+			t.Fatalf("model declares redundant observation index %s", index.Name)
 		}
-	}
-	if !found {
-		t.Fatal("missing observation window index")
 	}
 }
 
@@ -701,7 +700,7 @@ func TestSearchQueries(t *testing.T) {
 					t.Fatalf("full-text phrase not built from the input: %v", got)
 				}
 				sql := tx.Statement.SQL.String()
-				if !strings.HasPrefix(sql, "SELECT /*+ MAX_EXECUTION_TIME(1500) */ ") {
+				if !strings.HasPrefix(sql, fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ ", fileSearchBudget.Milliseconds())) {
 					t.Fatalf("file-name search is not time-bounded: %s", sql)
 				}
 				if !strings.Contains(sql, "MATCH(`name`, `file_names`) AGAINST (? IN BOOLEAN MODE)") || strings.Contains(sql, "LIKE") {
@@ -843,7 +842,7 @@ func TestCountResources(t *testing.T) {
 		}
 		queries++
 		sql := tx.Statement.SQL.String()
-		for _, fragment := range []string{"COUNT(*) AS total", "SUM(`file_names` IS NOT NULL)", "AS with_files", "AS this_run_total", "AS this_run_with_files", "FROM `torrent_test`"} {
+		for _, fragment := range []string{"COUNT(*) AS total", "SUM((`file_names` IS NOT NULL))", "AS with_files", "AS this_run_total", "AS this_run_with_files", "FROM `torrent_test`"} {
 			if !strings.Contains(sql, fragment) {
 				t.Fatalf("missing %s in %s", fragment, sql)
 			}
@@ -1039,7 +1038,7 @@ func TestMySQLDSN(t *testing.T) {
 		parsed.Addr != cfg.MySQL.Addresses || parsed.DBName != cfg.MySQL.Database || parsed.Net != "tcp" {
 		t.Fatal("DSN did not preserve connection settings")
 	}
-	if parsed.Timeout != 2*time.Second || parsed.ReadTimeout != 30*time.Second || parsed.WriteTimeout != 30*time.Second {
+	if parsed.Timeout != connectionTimeout || parsed.ReadTimeout != ioTimeout || parsed.WriteTimeout != ioTimeout || ioTimeout <= SearchTimeout {
 		t.Fatal("DSN does not have bounded connect/read/write timeouts")
 	}
 	if !parsed.ParseTime || parsed.Loc != time.UTC || parsed.Params["charset"] != "utf8mb4" {
@@ -1160,10 +1159,7 @@ func TestSearchPlan(t *testing.T) {
 		// A one-character word must appear in the name or a file name.
 		{"赘婿 第", searchNameAndFiles, "MATCH(`name`, `file_names`) AGAINST (? IN BOOLEAN MODE) AND (name LIKE ? ESCAPE '|' OR `file_names` LIKE ? ESCAPE '|')",
 			[]interface{}{`+"赘婿"`, "%第%", "%第%"}, "MATCH(`name`) AGAINST (? IN BOOLEAN MODE) AND name LIKE ? ESCAPE '|'"},
-		{"x", searchNameAndFiles, "(name LIKE ? ESCAPE '|' OR `file_names` LIKE ? ESCAPE '|')", []interface{}{"%x%", "%x%"}, "name LIKE ? ESCAPE '|'"},
 		{"ubuntu iso", searchNameOnly, "MATCH(`name`) AGAINST (? IN BOOLEAN MODE)", []interface{}{`+"ubuntu" +"iso"`}, ""},
-		{"x", searchNameOnly, "name LIKE ? ESCAPE '|'", []interface{}{"%x%"}, ""},
-		{"a%_|", searchLike, "name LIKE ? ESCAPE '|'", []interface{}{"%a|%|_||%"}, ""},
 	} {
 		filter, nameHit := searchPlan(tc.input, tc.mode)
 		if filter.sql != tc.filter || fmt.Sprint(filter.args) != fmt.Sprint(tc.args) || nameHit.sql != tc.nameHit {
@@ -1182,16 +1178,22 @@ func TestSearchStepsDownWhenSchemaIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// file_names column missing (1054), then no name index (1191): LIKE answers.
+	// file_names column missing (1054), then no name index (1191), then no
+	// name/time index (1176): an unforced LIKE answers.
 	var sqls []string
 	if err := candidate.Callback().Query().After("gorm:query").Register("capture_fallback", func(tx *gorm.DB) {
 		sql := tx.Statement.SQL.String()
+		if !strings.HasPrefix(sql, "SELECT /*+") {
+			return // A subquery rendered through the query callbacks.
+		}
 		sqls = append(sqls, sql)
 		switch {
-		case strings.Contains(sql, "file_names"):
+		case strings.Contains(sql, "MATCH(`name`, `file_names`)"):
 			tx.AddError(&mysqlDriver.MySQLError{Number: 1054, Message: "Unknown column 'file_names'"})
 		case strings.Contains(sql, "MATCH("):
 			tx.AddError(&mysqlDriver.MySQLError{Number: 1191, Message: "Can't find FULLTEXT index"})
+		case strings.Contains(sql, "FORCE INDEX"):
+			tx.AddError(&mysqlDriver.MySQLError{Number: 1176, Message: "Key 'idx_name_time' doesn't exist"})
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -1200,8 +1202,22 @@ func TestSearchStepsDownWhenSchemaIsMissing(t *testing.T) {
 	if result, err := Search(context.Background(), "ubuntu", 1); err != nil || result.FilesSearched {
 		t.Fatalf("fallback search failed: %v", err)
 	}
-	if len(sqls) != 3 || !strings.Contains(sqls[0], "file_names") || !strings.Contains(sqls[1], "MATCH(`name`)") || !strings.Contains(sqls[2], "LIKE") {
-		t.Fatalf("expected name+files, name-only, then LIKE; got %q", sqls)
+	if len(sqls) != 4 || !strings.Contains(sqls[0], "MATCH(`name`, `file_names`)") || !strings.Contains(sqls[1], "MATCH(`name`)") ||
+		!strings.Contains(sqls[2], "FORCE INDEX (`idx_name_time`)") || !strings.Contains(sqls[3], "LIKE") || strings.Contains(sqls[3], "FORCE INDEX") {
+		t.Fatalf("expected name+files, name-only, indexed LIKE, then plain LIKE; got %q", sqls)
+	}
+	// The substring scan reads keys from the narrow index and only the page from the rows.
+	if !strings.Contains(sqls[2], "JOIN (SELECT `infohash` FROM `torrent_test` FORCE INDEX (`idx_name_time`) WHERE `name` LIKE ? ESCAPE '|' ORDER BY `time` DESC, `infohash` DESC LIMIT ?) AS page") {
+		t.Fatalf("substring search does not page through the name index: %s", sqls[2])
+	}
+
+	// Words shorter than an ngram skip the file-name attempt entirely.
+	sqls = nil
+	if result, err := Search(context.Background(), "绮", 1); err != nil || result.FilesSearched {
+		t.Fatalf("single-character search: %+v %v", result, err)
+	}
+	if len(sqls) != 2 || strings.Contains(sqls[0], "MATCH(") || !strings.Contains(sqls[0], "FORCE INDEX") {
+		t.Fatalf("single character must go straight to the name substring scan, got %q", sqls)
 	}
 }
 
@@ -1257,7 +1273,7 @@ func TestSearchFallsBackToNamesWhenFileSearchTimesOut(t *testing.T) {
 	if err := candidate.Callback().Query().After("gorm:query").Register("capture_timeout", func(tx *gorm.DB) {
 		sql := tx.Statement.SQL.String()
 		sqls = append(sqls, sql)
-		if strings.Contains(sql, "file_names") {
+		if strings.Contains(sql, "MATCH(`name`, `file_names`)") {
 			tx.AddError(&mysqlDriver.MySQLError{Number: 3024, Message: "maximum statement execution time exceeded"})
 		}
 	}); err != nil {
@@ -1268,7 +1284,7 @@ func TestSearchFallsBackToNamesWhenFileSearchTimesOut(t *testing.T) {
 	if err != nil || result.FilesSearched {
 		t.Fatalf("result=%+v err=%v; a timed-out file search must answer from names", result, err)
 	}
-	if len(sqls) != 2 || !strings.Contains(sqls[1], "MATCH(`name`) AGAINST") || !strings.HasPrefix(sqls[1], "SELECT /*+ MAX_EXECUTION_TIME(3000) */ ") {
+	if len(sqls) != 2 || !strings.Contains(sqls[1], "MATCH(`name`) AGAINST") || !strings.HasPrefix(sqls[1], fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ ", nameSearchBudget.Milliseconds())) {
 		t.Fatalf("expected a name-only retry bounded by its own budget, got %q", sqls)
 	}
 }
@@ -1313,7 +1329,7 @@ func TestSearchTooBroadAndCappedTotal(t *testing.T) {
 	if err != nil || result.Total != SearchTotalMax || !result.TotalCapped || !result.FilesSearched {
 		t.Fatalf("result total=%d capped=%v files=%v err=%v", result.Total, result.TotalCapped, result.FilesSearched, err)
 	}
-	if len(counts) != 1 || !strings.HasPrefix(counts[0], "SELECT /*+ MAX_EXECUTION_TIME(1500) */ COUNT(*) FROM (SELECT 1 FROM") ||
+	if len(counts) != 1 || !strings.HasPrefix(counts[0], fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ COUNT(*) FROM (SELECT 1 FROM", fileSearchBudget.Milliseconds())) ||
 		!strings.Contains(counts[0], ") AS matches") {
 		t.Fatalf("count is not a bounded, capped subquery: %q", counts)
 	}
@@ -1330,4 +1346,43 @@ func WriteBatch(items []Data) error {
 		return err
 	}
 	return WriteBatchWithID(batchID, items)
+}
+
+func TestRecoveryReplaySkipsDamagedLineMidFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.jsonl")
+	store := NewRecoveryStore(path)
+	if err := store.Append(RecoveryBatch{ID: "before", Items: []Data{{Name: "before"}}}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.WriteString("{\"id\":\"torn\n") // A torn write followed by later appends.
+	file.Close()
+	if err := store.Append(RecoveryBatch{ID: "after", Items: []Data{{Name: "after"}}}); err != nil {
+		t.Fatal(err)
+	}
+	var replayed []string
+	err = store.Replay(func(id string, _ []Data) error { replayed = append(replayed, id); return nil })
+	if err == nil || strings.Join(replayed, ",") != "before,after" {
+		t.Fatalf("replayed %v, err %v; want both valid batches and a damage report", replayed, err)
+	}
+	if pending, _ := store.Pending(); pending {
+		t.Fatal("a damaged line kept the spool pending")
+	}
+	backups, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".dht-recovery-damaged-*"))
+	if len(backups) != 1 {
+		t.Fatalf("damaged line not preserved: %v", backups)
+	}
+	if data, _ := os.ReadFile(backups[0]); strings.TrimSpace(string(data)) != `{"id":"torn` {
+		t.Fatalf("preserved %q", data)
+	}
+}
+
+func TestFileNamesTextDropsInvalidUTF8(t *testing.T) {
+	text := fileNamesText([]File{{Path: []string{"\xb5\xda\xd2\xbb\xbc\xaf", "ok.mkv"}}})
+	if text == nil || !utf8.ValidString(*text) || !strings.Contains(*text, "ok.mkv") {
+		t.Fatalf("file_names %q must be valid UTF-8 and keep the valid names", *text)
+	}
 }

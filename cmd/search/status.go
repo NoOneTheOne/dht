@@ -38,25 +38,29 @@ func fetchCrawlerStatus(ctx context.Context, client *http.Client, url string) (*
 	return &status, nil
 }
 
+// Status refresh budgets that tests never change.
+const (
+	statusFetchTimeout = 15 * time.Second
+	statusPingTimeout  = 10 * time.Second
+	statusCountTTL     = 10 * time.Minute
+	statusCountRetry   = time.Minute
+)
+
 // Status refresh budgets. Variables so tests can shorten them.
 var (
-	statusTTL          = 10 * time.Second
-	statusFetchTimeout = 4 * time.Second
-	statusPingTimeout  = 3 * time.Second
+	statusTTL = 10 * time.Second
 	// Counting scans the whole resource table: it runs on its own schedule,
 	// never delays the crawler status, and is cached for long.
 	statusCountTimeout = mysql.CountTimeout
-	statusCountTTL     = 10 * time.Minute
-	statusCountRetry   = time.Minute
 	// statusFirstCountWait is how long the very first status waits for the
 	// first count, so a fast database shows totals on the first visit.
-	statusFirstCountWait = 3 * time.Second
+	statusFirstCountWait = 10 * time.Second
 	// statusStaleGrace is how long past its TTL a cached status may still be
 	// served instantly while it refreshes. Older caches (the first visit after
 	// an idle period) wait up to statusStaleWait for the fresh status instead,
 	// so the page never opens on data that may be hours old.
 	statusStaleGrace = 10 * time.Second
-	statusStaleWait  = 5 * time.Second
+	statusStaleWait  = 20 * time.Second
 )
 
 // statusHandler serves a cached system status. One background refresh runs
@@ -112,7 +116,10 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 			slog.Warn("resource count failed", "component", "mysql", "event", "status_count_failed", "error", err)
 			countExpires = time.Now().Add(countRetry)
 			if !startedAt.Equal(countedStart) {
-				totals = nil // Per-run counts would describe another run.
+				// Per-run counts would describe another run. Recording the new
+				// start keeps the retry delay: a changed start would otherwise
+				// trigger another full-table count on the very next refresh.
+				totals, countedStart = nil, startedAt
 			}
 		} else {
 			totals, countedStart = &value, startedAt
@@ -125,15 +132,21 @@ func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), 
 
 	refresh := func(done chan struct{}) {
 		defer close(done)
+		// Concurrently, so a first visit waits at most fetchTimeout plus
+		// firstCountWait (25 s), below the frontend's 30 s.
+		pinged := make(chan bool, 1)
+		go func() {
+			pingCtx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+			defer cancel()
+			pinged <- ping(pingCtx) == nil
+		}()
 		fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 		nextCrawler, err := fetch(fetchCtx)
 		cancel()
 		if err != nil {
 			nextCrawler = nil
 		}
-		pingCtx, cancel := context.WithTimeout(context.Background(), pingTimeout)
-		up := ping(pingCtx) == nil
-		cancel()
+		up := <-pinged
 
 		mu.Lock()
 		crawler, storageUp = nextCrawler, up
@@ -212,6 +225,6 @@ func crawlerStatusGetter() func(context.Context) (*metrics.CrawlerStatus, error)
 	if url == "" {
 		url = "http://127.0.0.1:30081/status"
 	}
-	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	return func(ctx context.Context) (*metrics.CrawlerStatus, error) { return fetchCrawlerStatus(ctx, client, url) }
 }

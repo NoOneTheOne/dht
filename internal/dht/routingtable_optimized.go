@@ -7,11 +7,9 @@ import (
 
 // BEP-5 Routing Table Optimizations
 
-// OptimizedRefresh performs a smarter refresh of the routing table
-// It prioritizes buckets that are:
-// 1. Older (haven't been refreshed recently)
-// 2. Have fewer nodes (need more coverage)
-// 3. Cover ID ranges we haven't explored much
+// OptimizedRefresh probes contacts of the least recently refreshed buckets
+// with find_node for random IDs, then drops the probed contacts: the crawler
+// keeps cycling through the network instead of keeping a stable table.
 func (rt *routingTable) OptimizedRefresh() {
 	now := time.Now()
 
@@ -49,6 +47,7 @@ func (rt *routingTable) OptimizedRefresh() {
 
 	// Refresh top priority buckets
 	refreshCount := 0
+	var probed []*node
 	maxRefresh := 3 // Refresh at most 3 buckets per cycle
 
 	for _, bp := range priorities {
@@ -75,17 +74,14 @@ func (rt *routingTable) OptimizedRefresh() {
 		for i := 0; i < min(rt.dht.RefreshNodeNum, len(selected)); i++ {
 			no := selected[(offset+i)%len(selected)]
 			rt.dht.transactionManager.findNode(no, bp.bucket.RandomChildID())
-			if rt.dht.IsCrawlMode() {
-				rt.clearQueue.PushBack(no)
-			}
+			probed = append(probed, no)
 		}
 		refreshCount++
 	}
-	if rt.dht.IsCrawlMode() {
-		for e := range rt.clearQueue.Iter() {
-			rt.removeContact(e.Value.(*node), false)
-		}
-		rt.clearQueue.Clear()
+	// Probed contacts are dropped: a crawler cycles through the network
+	// instead of maintaining a stable routing table.
+	for _, no := range probed {
+		rt.removeContact(no)
 	}
 }
 

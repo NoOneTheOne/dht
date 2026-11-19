@@ -1,6 +1,8 @@
 package mysql
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +24,6 @@ type RecoveryStore struct {
 }
 
 func NewRecoveryStore(path string) *RecoveryStore {
-	if path == "" {
-		return nil
-	}
 	return &RecoveryStore{path: path}
 }
 
@@ -76,7 +75,10 @@ func (s *RecoveryStore) Append(batch RecoveryBatch) error {
 // failure, because the database is most likely still unavailable and every
 // further attempt would only add another timeout to the writer's stall. That
 // batch and all later ones are streamed, not buffered, into the replacement
-// spool. A truncated tail is preserved in a backup and reported as an error.
+// spool. The spool holds one JSON batch per line: a line that does not decode
+// (a torn tail, or damage mid-file) is moved to a damaged-lines file and
+// reported, and replay continues with the next line, so one bad line can
+// never block the spool forever.
 func (s *RecoveryStore) Replay(write func(string, []Data) error) (result error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,45 +91,69 @@ func (s *RecoveryStore) Replay(write func(string, []Data) error) (result error) 
 	}
 	defer file.Close()
 
-	var temp *os.File
+	var temp, damagedFile *os.File
 	var encoder *json.Encoder
 	defer func() {
 		if temp != nil {
 			_ = temp.Close()
 			_ = os.Remove(temp.Name())
 		}
+		if damagedFile != nil {
+			_ = damagedFile.Close()
+		}
 	}()
-	var damaged error
-	decoder := json.NewDecoder(file)
+	quarantine := func(line []byte) error {
+		if damagedFile == nil {
+			var err error
+			if damagedFile, err = os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-damaged-*"); err != nil {
+				return fmt.Errorf("create damaged recovery lines file: %w", err)
+			}
+		}
+		if _, err := damagedFile.Write(append(line, '\n')); err != nil {
+			return fmt.Errorf("preserve damaged recovery line: %w", err)
+		}
+		return nil
+	}
+	reader := bufio.NewReader(file)
 	for {
-		var batch RecoveryBatch
-		err := decoder.Decode(&batch)
-		if err == io.EOF {
+		line, readErr := reader.ReadBytes('\n')
+		if readErr != nil && readErr != io.EOF {
+			return fmt.Errorf("read recovery spool: %w", readErr)
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 {
+			var batch RecoveryBatch
+			if err := json.Unmarshal(line, &batch); err != nil {
+				if err := quarantine(line); err != nil {
+					return err
+				}
+			} else {
+				if encoder == nil {
+					if err := write(batch.ID, batch.Items); err == nil {
+						continue
+					}
+					if temp, err = os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-*"); err != nil {
+						return fmt.Errorf("create recovery spool replacement: %w", err)
+					}
+					encoder = json.NewEncoder(temp)
+				}
+				if err := encoder.Encode(batch); err != nil {
+					return fmt.Errorf("write recovery spool replacement: %w", err)
+				}
+			}
+		}
+		if readErr == io.EOF {
 			break
 		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			name, backupErr := s.backupDamaged(file)
-			if backupErr != nil {
-				return backupErr
-			}
-			damaged = fmt.Errorf("incomplete recovery tail preserved in %s", name)
-			break
+	}
+	var damaged error
+	if damagedFile != nil {
+		if err := errors.Join(damagedFile.Sync(), damagedFile.Close()); err != nil {
+			damagedFile = nil
+			return fmt.Errorf("preserve damaged recovery lines: %w", err)
 		}
-		if err != nil {
-			return fmt.Errorf("decode recovery spool: %w", err)
-		}
-		if encoder == nil {
-			if err := write(batch.ID, batch.Items); err == nil {
-				continue
-			}
-			if temp, err = os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-*"); err != nil {
-				return fmt.Errorf("create recovery spool replacement: %w", err)
-			}
-			encoder = json.NewEncoder(temp)
-		}
-		if err := encoder.Encode(batch); err != nil {
-			return fmt.Errorf("write recovery spool replacement: %w", err)
-		}
+		damaged = fmt.Errorf("undecodable recovery lines preserved in %s", damagedFile.Name())
+		damagedFile = nil
 	}
 	if encoder == nil {
 		if err := os.Remove(s.path); err != nil {
@@ -148,19 +174,4 @@ func (s *RecoveryStore) Replay(write func(string, []Data) error) (result error) 
 		return fmt.Errorf("replace recovery spool: %w", err)
 	}
 	return damaged
-}
-
-// backupDamaged copies the whole spool aside before its tail is dropped.
-func (s *RecoveryStore) backupDamaged(file *os.File) (string, error) {
-	backup, err := os.CreateTemp(filepath.Dir(s.path), ".dht-recovery-damaged-*")
-	if err != nil {
-		return "", err
-	}
-	if _, err = file.Seek(0, io.SeekStart); err == nil {
-		_, err = io.Copy(backup, file)
-	}
-	if err = errors.Join(err, backup.Sync(), backup.Close()); err != nil {
-		return "", err
-	}
-	return backup.Name(), nil
 }

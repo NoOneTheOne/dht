@@ -12,7 +12,7 @@ import (
 // trendingLimitMax is the largest ranking a request may ask for. The cache
 // keeps this many entries per window and serves every smaller limit from a
 // prefix, which matches the query's deterministic (hits, infohash) order.
-const trendingLimitMax = 100
+const trendingLimitMax = mysql.TrendingLimitMax
 
 // Ranking a window aggregates every observation in it, so rankings are
 // computed in the background and served from memory. TTLs are the staleness
@@ -43,7 +43,6 @@ type trendingRanking struct {
 // first ranking of a window.
 type trendingCache struct {
 	compute  func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error)
-	timeout  time.Duration
 	ttls     map[time.Duration]time.Duration
 	retry    time.Duration
 	mu       sync.Mutex
@@ -51,16 +50,15 @@ type trendingCache struct {
 }
 
 func newTrendingCache(compute func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error)) *trendingCache {
-	return &trendingCache{compute: compute, timeout: mysql.TrendingTimeout, ttls: trendingTTLs, retry: trendingRetry,
+	return &trendingCache{compute: compute, ttls: trendingTTLs, retry: trendingRetry,
 		rankings: make(map[time.Duration]*trendingRanking)}
 }
 
 func (c *trendingCache) refresh(window time.Duration, ranking *trendingRanking, done chan struct{}) {
 	defer close(done)
 	until := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
-	items, err := c.compute(ctx, window, trendingLimitMax, until)
-	cancel()
+	// compute (mysql.Trending) bounds itself by mysql.TrendingTimeout.
+	items, err := c.compute(context.Background(), window, trendingLimitMax, until)
 	if err != nil {
 		slog.Error("trending computation failed", "component", "mysql", "event", "trending_failed", "window", window.String(), "error", err)
 	}
@@ -90,6 +88,12 @@ func (c *trendingCache) lookup(ctx context.Context, window time.Duration, limit 
 		go c.refresh(window, ranking, ranking.refreshing)
 	}
 	wait := ranking.refreshing
+	if !ranking.ready && wait == nil {
+		// The first computation failed recently and its retry is not due yet.
+		err := ranking.err
+		c.mu.Unlock()
+		return nil, time.Time{}, err
+	}
 	if !ranking.ready {
 		c.mu.Unlock()
 		select {

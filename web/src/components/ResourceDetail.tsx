@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { TorrentDetail } from '../types';
+import { formatSize } from '../format';
 
 function isDetail(value: unknown, infohash: string): value is TorrentDetail {
   if (!value || typeof value !== 'object') return false;
@@ -11,13 +12,6 @@ function isDetail(value: unknown, infohash: string): value is TorrentDetail {
       file && Array.isArray(file.path) && file.path.length > 0 &&
       file.path.every(part => typeof part === 'string' && part.length > 0) &&
       Number.isFinite(file.length) && file.length >= 0);
-}
-
-function formatSize(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${Number((bytes / 1024 ** index).toFixed(2))} ${units[index]}`;
 }
 
 export default function ResourceDetail({ infohash }: { infohash: string }) {
@@ -34,7 +28,7 @@ export default function ResourceDetail({ infohash }: { infohash: string }) {
     setError('');
     setNotFound(false);
     setDetail(null);
-    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 60000);
     const load = async () => {
       try {
         const response = await fetch(`/api/torrents/${infohash}`, { signal: controller.signal });

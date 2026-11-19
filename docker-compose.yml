@@ -59,11 +59,11 @@ services:
       SPIDER_STATUS_URL: "http://dht-spider:30081/status"
       APP_ENV: prod
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:30080/health"]
-      interval: 5s
-      timeout: 5s
+      test: ["CMD", "wget", "-q", "-T", "12", "-O", "/dev/null", "http://127.0.0.1:30080/health"]
+      interval: 10s
+      timeout: 15s
       retries: 12
-      start_period: 15s
+      start_period: 30s
     ports:
       - "${SEARCH_PORT:-30080}:30080"
     restart: unless-stopped

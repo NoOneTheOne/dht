@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/config"
@@ -34,7 +36,8 @@ func main() {
 	gin.DisableConsoleColor()
 	gin.DefaultWriter = logging.Writer(slog.LevelInfo)
 	gin.DefaultErrorWriter = logging.Writer(slog.LevelError)
-	// Fail at startup, not on the first request: GetConfig exits on error.
+	// Fail at startup, not on the first request: RequireMySQL exits when the
+	// MySQL settings are missing.
 	config.RequireMySQL(config.GetConfig())
 	router := gin.New()
 	// Recovery is innermost so access logs and metrics still see the 500
@@ -59,12 +62,10 @@ func main() {
 
 	router.GET("/health", func(c *gin.Context) {
 		health := gin.H{
-			"status":       "ok",
-			"uptime":       time.Since(startTime).String(),
-			"goroutines":   runtime.NumGoroutine(),
-			"memory":       getMemoryUsage(),
-			"config":       "loaded",
-			"storage_type": "mysql",
+			"status":     "ok",
+			"uptime":     time.Since(startTime).String(),
+			"goroutines": runtime.NumGoroutine(),
+			"memory":     getMemoryUsage(),
 		}
 
 		// Check MySQL connection
@@ -103,11 +104,20 @@ func main() {
 	server := &http.Server{
 		Addr:              ":" + port,
 		Handler:           router,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	err = server.ListenAndServe()
-	if err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("HTTP shutdown incomplete", "component", "http", "event", "http_shutdown_incomplete", "error", err)
+		}
+	}()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logging.Fatalln(err)
 	}
 }
@@ -132,6 +142,14 @@ func staticHandler(webDir string) gin.HandlerFunc {
 			c.File(filePath)
 			return
 		}
+		// A missing file (e.g. a hashed bundle an outdated page still asks
+		// for) must not receive HTML, which the browser rejects as a module.
+		if filepath.Ext(path) != "" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		// Revalidate the shell so a deploy's new bundle names are picked up.
+		c.Header("Cache-Control", "no-cache")
 		c.File(index)
 	}
 }
@@ -153,7 +171,9 @@ func buildSearchIndexes() {
 }
 
 func searchHandler(c *gin.Context) {
-	name := c.Query("name")
+	// The frontend trims too; padding would otherwise turn into a full scan
+	// for a substring of spaces.
+	name := strings.TrimSpace(c.Query("name"))
 	if name == "" {
 		metrics.RecordSearchError("missing_parameter")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameter: name"})
@@ -177,6 +197,9 @@ func searchHandler(c *gin.Context) {
 
 	start := time.Now()
 	result, err := mysql.Search(c.Request.Context(), name, int(page))
+	if clientGone(c) {
+		return
+	}
 	metrics.RecordMySQLQuery("search", time.Since(start), err)
 	if errors.Is(err, mysql.ErrSearchTooBroad) {
 		metrics.RecordSearchError("too_broad")
@@ -201,12 +224,30 @@ func searchHandler(c *gin.Context) {
 	})
 }
 
+// trendingWindows maps each supported window parameter to its duration.
+var trendingWindows = func() map[string]time.Duration {
+	windows := make(map[string]time.Duration, len(mysql.TrendingWindows))
+	for _, window := range mysql.TrendingWindows {
+		windows[strconv.Itoa(int(window.Hours()))+"h"] = window
+	}
+	return windows
+}()
+
+// clientGone reports (and records as 499) a request whose client went away,
+// e.g. the frontend aborting a search for a newer one: not a server error.
+func clientGone(c *gin.Context) bool {
+	if c.Request.Context().Err() == nil {
+		return false
+	}
+	c.AbortWithStatus(499)
+	return true
+}
+
 // trendingHandler serves rankings; lookup returns them with their computation time.
 func trendingHandler(lookup func(context.Context, time.Duration, int) ([]mysql.Data, time.Time, error)) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		period := c.DefaultQuery("window", "1h")
-		windows := map[string]time.Duration{"1h": time.Hour, "3h": 3 * time.Hour, "6h": 6 * time.Hour, "12h": 12 * time.Hour, "24h": 24 * time.Hour}
-		window, ok := windows[period]
+		window, ok := trendingWindows[period]
 		limit, err := strconv.Atoi(c.DefaultQuery("limit", "10"))
 		if !ok || err != nil || limit < 1 || limit > trendingLimitMax {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "window must be 1h, 3h, 6h, 12h or 24h; limit must be 1..100"})
@@ -214,6 +255,9 @@ func trendingHandler(lookup func(context.Context, time.Duration, int) ([]mysql.D
 		}
 		start := time.Now()
 		items, until, err := lookup(c.Request.Context(), window, limit)
+		if clientGone(c) {
+			return
+		}
 		metrics.RecordMySQLQuery("trending", time.Since(start), err)
 		if err != nil {
 			slog.ErrorContext(c.Request.Context(), "trending lookup failed", "component", "mysql", "event", "trending_failed", "window", period, "limit", limit, "error", err)
@@ -237,6 +281,9 @@ func recentHandler(lookup func(context.Context, int) ([]mysql.Data, error)) gin.
 		}
 		start := time.Now()
 		items, err := lookup(c.Request.Context(), limit)
+		if clientGone(c) {
+			return
+		}
 		metrics.RecordMySQLQuery("recent", time.Since(start), err)
 		if err != nil {
 			slog.ErrorContext(c.Request.Context(), "recent lookup failed", "component", "mysql", "event", "recent_failed", "limit", limit, "error", err)
@@ -261,7 +308,12 @@ func detailHandler(lookup func(context.Context, string) (*mysql.Data, error)) gi
 		}
 		start := time.Now()
 		result, err := lookup(c.Request.Context(), strings.ToLower(hash))
+		if clientGone(c) {
+			return
+		}
 		metrics.RecordMySQLQuery("detail", time.Since(start), err)
+		// Detail reports a missing file list as ErrRecordNotFound; the empty
+		// check guards that contract.
 		if errors.Is(err, gorm.ErrRecordNotFound) || err == nil && (result == nil || len(result.Files) == 0) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "file list not found"})
 			return
@@ -305,8 +357,21 @@ func accessLog() gin.HandlerFunc {
 	}
 }
 
+// healthCheckTimeout bounds the database ping of /health and the pool stats
+// of /metrics; the container health check waits 12 seconds.
+const healthCheckTimeout = 10 * time.Second
+
+// metricsDBTimeout bounds the pool lookup behind the /metrics gauges, well
+// inside Prometheus' default 10 s scrape timeout.
+const metricsDBTimeout = 2 * time.Second
+
+// shutdownTimeout lets in-flight requests finish on SIGTERM, inside Docker's
+// default 10 s stop grace period.
+const shutdownTimeout = 8 * time.Second
+
 func mysqlStats(getDB func(context.Context) (*gorm.DB, error)) (open, inUse, idle int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// Short: a scrape must not hang on database initialization.
+	ctx, cancel := context.WithTimeout(context.Background(), metricsDBTimeout)
 	defer cancel()
 	db, err := getDB(ctx)
 	if err != nil {
@@ -321,7 +386,7 @@ func mysqlStats(getDB func(context.Context) (*gorm.DB, error)) (open, inUse, idl
 }
 
 func checkMySQLHealth(parent context.Context, health gin.H, getDB func(context.Context) (*gorm.DB, error)) {
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	ctx, cancel := context.WithTimeout(parent, healthCheckTimeout)
 	defer cancel()
 	status := health["status"]
 	health["status"] = "unhealthy"

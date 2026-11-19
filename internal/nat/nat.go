@@ -295,7 +295,6 @@ type AutoMap struct {
 	mappings  map[string]*Mapping
 	mu        sync.RWMutex
 	stopCh    chan struct{}
-	refreshCh chan struct{}
 	startOnce sync.Once
 	stopOnce  sync.Once
 	workers   sync.WaitGroup
@@ -304,10 +303,9 @@ type AutoMap struct {
 // NewAutoMap creates a new AutoMap instance
 func NewAutoMap(nat NAT) *AutoMap {
 	return &AutoMap{
-		nat:       nat,
-		mappings:  make(map[string]*Mapping),
-		stopCh:    make(chan struct{}),
-		refreshCh: make(chan struct{}, 1),
+		nat:      nat,
+		mappings: make(map[string]*Mapping),
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -401,8 +399,6 @@ func (am *AutoMap) refreshLoop() {
 		case <-am.stopCh:
 			return
 		case <-ticker.C:
-			am.refreshMappings()
-		case <-am.refreshCh:
 			am.refreshMappings()
 		}
 	}

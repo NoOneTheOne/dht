@@ -14,7 +14,10 @@ import (
 
 func testTrendingCache(compute func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error), ttl time.Duration) *trendingCache {
 	cache := newTrendingCache(compute)
-	cache.ttls = map[time.Duration]time.Duration{time.Hour: ttl, 12 * time.Hour: ttl}
+	cache.ttls = make(map[time.Duration]time.Duration)
+	for _, window := range mysql.TrendingWindows {
+		cache.ttls[window] = ttl
+	}
 	cache.retry = ttl
 	return cache
 }
@@ -97,5 +100,25 @@ func TestTrendingCacheFirstComputationFailureAndCancellation(t *testing.T) {
 	defer cancel()
 	if _, _, err := slow.lookup(ctx, time.Hour, 10); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waiting request ignored its context: %v", err)
+	}
+}
+
+func TestTrendingCacheFailedFirstComputationDoesNotHang(t *testing.T) {
+	var calls atomic.Int32
+	cache := testTrendingCache(func(context.Context, time.Duration, int, time.Time) ([]mysql.Data, error) {
+		calls.Add(1)
+		return nil, errors.New("unavailable")
+	}, time.Hour) // The retry is not due within this test.
+	if _, _, err := cache.lookup(context.Background(), time.Hour, 10); err == nil {
+		t.Fatal("first failure not reported")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	if _, _, err := cache.lookup(ctx, time.Hour, 10); err == nil || errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("lookup inside the retry window: err %v after %v; want the last error at once", err, time.Since(started))
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("%d computations inside the retry window, want 1", calls.Load())
 	}
 }

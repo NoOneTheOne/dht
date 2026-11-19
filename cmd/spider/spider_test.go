@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/NoOneTheOne/dht/internal/dht"
 	"github.com/NoOneTheOne/dht/internal/storage/mysql"
+	gomysql "github.com/go-sql-driver/mysql"
 )
 
 func TestTorrentFilesSkipsPadding(t *testing.T) {
@@ -101,7 +104,7 @@ func TestFailedBatchRetainsIDAndContents(t *testing.T) {
 	go func() {
 		defer close(done)
 		attempt := 0
-		writeMySQLBatchesToStore(input, ticks, nil, func(id string, items []mysql.Data) error {
+		writeMySQLBatchesToStore(input, ticks, func(id string, items []mysql.Data) error {
 			attempt++
 			calls <- id
 			if len(items) != 100 || items[99].Length != 99 {
@@ -221,11 +224,73 @@ func TestTorrentFiles(t *testing.T) {
 // Test helpers moved from production code: only tests call them.
 
 func writeMySQLBatches(input <-chan mysql.Data, ticks <-chan time.Time, write func([]mysql.Data) error) {
-	writeMySQLBatchesWithRecovery(input, ticks, nil, func(_ string, items []mysql.Data) error {
+	writeMySQLBatchesWithRecovery(input, ticks, func(_ string, items []mysql.Data) error {
 		return write(items)
 	})
 }
 
-func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Time, stop <-chan struct{}, write func(string, []mysql.Data) error) {
-	writeMySQLBatchesToStore(input, ticks, stop, write, recoveryStore())
+func writeMySQLBatchesWithRecovery(input <-chan mysql.Data, ticks <-chan time.Time, write func(string, []mysql.Data) error) {
+	writeMySQLBatchesToStore(input, ticks, write, recoveryStore())
+}
+
+func TestSplitBatchIDsAreDeterministic(t *testing.T) {
+	items := []mysql.Data{{InfoHash: "a"}, {InfoHash: "a"}, {InfoHash: "b"}}
+	var first, second []string
+	for _, ids := range []*[]string{&first, &second} {
+		writeSplit("parent", items, func(id string, _ []mysql.Data) error {
+			*ids = append(*ids, id)
+			return nil
+		}, nil, nil)
+	}
+	if !reflect.DeepEqual(first, second) || len(first) != 3 || first[0] == first[1] || len(first[0]) != 32 {
+		t.Fatalf("split IDs %v then %v; want stable, distinct per item (even for a repeated hash), 32 hex", first, second)
+	}
+	if other := splitBatchID("other", 0, "a"); other == first[0] {
+		t.Fatal("split ID ignores the parent batch")
+	}
+}
+
+func TestReplaySplitRespoolsTransientFailures(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.jsonl")
+	store := mysql.NewRecoveryStore(path)
+	if err := store.Append(mysql.RecoveryBatch{ID: "spooled", Items: []mysql.Data{{InfoHash: "bad"}, {InfoHash: "flaky"}, {InfoHash: "good"}}}); err != nil {
+		t.Fatal(err)
+	}
+	permanent := &gomysql.MySQLError{Number: 1366, Message: "Incorrect string value"}
+	written := map[string]bool{}
+	input := make(chan mysql.Data)
+	close(input)
+	writeMySQLBatchesToStore(input, nil, func(_ string, items []mysql.Data) error {
+		if len(items) > 1 {
+			return permanent // The whole batch is rejected, so it is split.
+		}
+		switch items[0].InfoHash {
+		case "bad":
+			return permanent
+		case "flaky":
+			return errors.New("deadlock") // Transient: must be retried later.
+		}
+		written[items[0].InfoHash] = true
+		return nil
+	}, store)
+	if !written["good"] {
+		t.Fatal("good item not written")
+	}
+	pending, err := store.Pending()
+	if err != nil || !pending {
+		t.Fatalf("transient item not re-spooled: pending=%v err=%v", pending, err)
+	}
+	var respooled []string
+	if err := store.Replay(func(_ string, items []mysql.Data) error {
+		for _, item := range items {
+			respooled = append(respooled, item.InfoHash)
+		}
+		return nil
+	}); err != nil || strings.Join(respooled, ",") != "flaky" {
+		t.Fatalf("spool holds %v (err %v); want only the transiently failed item", respooled, err)
+	}
+	data, err := os.ReadFile(strings.TrimSuffix(path, ".jsonl") + ".rejected.jsonl")
+	if err != nil || !strings.Contains(string(data), `"bad"`) || strings.Contains(string(data), `"flaky"`) {
+		t.Fatalf("rejected file %q (err %v); want only the permanently rejected item", data, err)
+	}
 }

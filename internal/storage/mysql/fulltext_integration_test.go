@@ -129,6 +129,13 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	// Databases from earlier versions carry the now-redundant observation indexes.
+	obsTable := "`" + (Observation{}).TableName() + "`"
+	for _, ddl := range []string{"CREATE INDEX `idx_info_observations_applied` ON " + obsTable + " (`applied`)", "CREATE INDEX `idx_observation_window` ON " + obsTable + " (`applied`, `time`)"} {
+		if err := db.Exec(ddl).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := EnsureSearchIndexes(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +149,27 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 	}
 	if !db.Migrator().HasIndex(&Observation{}, observationRankIndex) {
 		t.Fatal("trending covering index missing")
+	}
+	for _, index := range redundantObservationIndexes {
+		if db.Migrator().HasIndex(&Observation{}, index) {
+			t.Fatalf("redundant observation index %s not dropped", index)
+		}
+	}
+	if !db.Migrator().HasIndex(&Data{}, nameTimeIndex) {
+		t.Fatal("name/time covering index missing")
+	}
+	// A single CJK character cannot use the ngram index: it is answered from
+	// an index-only scan of the name/time index.
+	if got, files := search("赘"); len(got) != 1 || got[0] != "赘婿之吉兴高照 2021 WEB-DL" || files[0] {
+		t.Fatalf("single-character search: %q %v", got, files)
+	}
+	var namePlan []struct {
+		Key   *string `gorm:"column:key"`
+		Extra *string `gorm:"column:Extra"`
+	}
+	if err := db.Raw("EXPLAIN SELECT `infohash` FROM `"+cfg.MySQL.Table+"` FORCE INDEX (`"+nameTimeIndex+"`) WHERE `name` LIKE ? ORDER BY `time` DESC, `infohash` DESC LIMIT 50", "%赘%").Scan(&namePlan).Error; err != nil ||
+		len(namePlan) != 1 || namePlan[0].Key == nil || *namePlan[0].Key != nameTimeIndex || namePlan[0].Extra == nil || !strings.Contains(*namePlan[0].Extra, "Using index") {
+		t.Fatalf("substring scan is not index-only: %+v %v", namePlan, err)
 	}
 	// The ranking must be an index-only range scan of the covering index.
 	var plan []struct {
@@ -257,6 +285,18 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 	db.Raw("SELECT COUNT(*) AS total, SUM(COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE)) AS with_files FROM `" + cfg.MySQL.Table + "`").Scan(&want)
 	if err != nil || counts.Total != want.Total || counts.WithFiles != want.WithFiles || counts.Total == 0 {
 		t.Fatalf("CountResources = %+v, %v; JSON-based counts %+v", counts, err, want)
+	}
+	// List results derive has_files from file_names; it must match the JSON.
+	recent, err := Recent(ctx, RecentLimitMax)
+	if err != nil || len(recent) == 0 {
+		t.Fatalf("Recent: %v %v", recent, err)
+	}
+	for _, item := range recent {
+		var hasFiles bool
+		db.Raw("SELECT COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) FROM `"+cfg.MySQL.Table+"` WHERE infohash = ?", item.InfoHash).Scan(&hasFiles)
+		if item.HasFiles != hasFiles {
+			t.Fatalf("%s: has_files %v, files JSON says %v", item.Name, item.HasFiles, hasFiles)
+		}
 	}
 	if err := Ping(ctx); err != nil {
 		t.Fatalf("Ping: %v", err)

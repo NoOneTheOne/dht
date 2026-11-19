@@ -114,6 +114,11 @@ func (dht *DHT) sampleRound() {
 		}) {
 			sent++
 			RecordProtocolEvent("sample_infohashes", "sent")
+		} else {
+			// Never asked (queue full, query pending): it stays due. The
+			// schedule is set before sending so a fast response is not
+			// overwritten by the unanswered wait.
+			dht.sampleSchedule.set(addr, time.Time{}, nil)
 		}
 	}
 }

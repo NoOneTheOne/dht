@@ -2,7 +2,6 @@
 /spider
 /dht-spider
 /dht-search
-/dht-getpeers
 /build/
 *.exe
 

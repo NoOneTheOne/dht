@@ -291,7 +291,7 @@ func TestFetchMetadataOverMSEAndPlaintextFallback(t *testing.T) {
 					return
 				}
 			}()
-			wire := NewWire(8, 4, 1)
+			wire := NewWire(4, 1)
 			port := listener.Addr().(*net.TCPAddr).Port
 			if err := wire.fetchMetadata(Request{InfoHash: hash[:], IP: "127.0.0.1", Port: port}); err != nil {
 				t.Fatalf("fetch: %v", err)
