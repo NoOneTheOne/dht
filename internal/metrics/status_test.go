@@ -44,11 +44,14 @@ func TestSystemStatus(t *testing.T) {
 		{"mapping failure", &CrawlerStatus{Ready: true, Reachability: "reachable", NAT: "mapping_failed"}, &total, "degraded"},
 		{"query failure", &CrawlerStatus{Ready: true, Reachability: "reachable", NAT: "manual", DHTQuery: SuccessRate{Failed: 20}}, &total, "degraded"},
 		{"crawler down", nil, &total, "outage"},
-		{"storage down", &CrawlerStatus{Ready: true, Reachability: "reachable"}, nil, "outage"},
+		{"storage down", &CrawlerStatus{Ready: true, Reachability: "reachable", NAT: "manual"}, nil, "outage"},
+		{"counts unavailable", &CrawlerStatus{Ready: true, Reachability: "reachable", NAT: "manual"}, nil, "degraded"},
+		{"counts pending", &CrawlerStatus{Ready: true, Reachability: "reachable", NAT: "manual"}, nil, "operational"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewSystemStatus(tc.crawler, tc.total)
-			if s.Status != tc.want || s.Issues == nil {
+			storageUp := tc.name != "storage down"
+			s := NewSystemStatus(tc.crawler, tc.total, storageUp, tc.name == "counts pending")
+			if s.Status != tc.want || s.Issues == nil || (s.Storage == "connected") != storageUp {
 				t.Fatalf("unexpected status: %+v", s)
 			}
 		})

@@ -4,6 +4,8 @@ import { TorrentItem } from '../types';
 interface ResultsTableProps {
   items: TorrentItem[];
   total: number;
+  /** total is a lower bound: more rows match. */
+  totalCapped?: boolean;
   query: string;
   loading: boolean;
   page: number;
@@ -28,7 +30,7 @@ function formatSize(bytes: number): string {
   return `${Number((bytes / 1024 ** index).toFixed(2))} ${units[index]}`;
 }
 
-export default function ResultsTable({ items, total, query, loading, page, pageSize, onPageChange }: ResultsTableProps) {
+export default function ResultsTable({ items, total, totalCapped, query, loading, page, pageSize, onPageChange }: ResultsTableProps) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstPage = Math.max(1, Math.min(page - 2, totalPages - 4));
   const visiblePages = Array.from({ length: Math.min(5, totalPages) }, (_, index) => firstPage + index);
@@ -86,7 +88,7 @@ export default function ResultsTable({ items, total, query, loading, page, pageS
 
   return (
     <section className="results-section" aria-labelledby="results-title">
-      <div className="results-heading"><div><span className="eyebrow">SEARCH RESULTS</span><h2 id="results-title">「{query}」<span className="result-count">{numberFormatter.format(total)} 条匹配</span></h2></div><span className="results-limit">展示 {numberFormatter.format(start)}–{numberFormatter.format(end)} 条 · 排序仅作用于本页</span></div>
+      <div className="results-heading"><div><span className="eyebrow">SEARCH RESULTS</span><h2 id="results-title">「{query}」<span className="result-count">{numberFormatter.format(total)}{totalCapped ? '+' : ''} 条匹配</span></h2></div><span className="results-limit">展示 {numberFormatter.format(start)}–{numberFormatter.format(end)} 条 · 排序仅作用于本页</span></div>
       <div className="mobile-sort"><label htmlFor="result-sort">排序方式</label><select id="result-sort" value={sortField} onChange={event => { setSortField(event.target.value as SortField); setSortOrder('desc'); }}>{fields.map(field => <option key={field.key} value={field.key}>{field.label}</option>)}</select><button className="text-button" onClick={() => setSortOrder(order => order === 'asc' ? 'desc' : 'asc')}>{sortOrder === 'asc' ? '升序 ↑' : '降序 ↓'}</button></div>
       <div className="results-surface"><table className="results-table"><caption className="sr-only">{query} 的搜索结果，第 {page} 页，共 {totalPages} 页，每页 {pageSize} 条</caption><thead><tr>{fields.map(field => <th key={field.key} scope="col" aria-sort={sortField === field.key ? sortOrder === 'asc' ? 'ascending' : 'descending' : 'none'}><button onClick={() => handleSort(field.key)}>{field.label}<span aria-hidden="true" className={sortField === field.key ? 'sort-active' : 'sort-idle'}>{sortField === field.key && sortOrder === 'asc' ? '↑' : '↓'}</span></button></th>)}<th scope="col" className="action-heading">操作</th></tr></thead><tbody>
         {sortedItems.map(item => <tr key={item.infohash}>

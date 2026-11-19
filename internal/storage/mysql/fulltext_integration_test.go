@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -248,6 +249,28 @@ func TestFulltextSearchAgainstMySQL(t *testing.T) {
 	}
 	if got, _ := search("zkqp"); len(got) != 1 {
 		t.Fatalf("rebuild did not recover the lost document: %q", got)
+	}
+
+	// Counting by file_names must agree with the files JSON it replaces.
+	counts, err := CountResources(ctx, base)
+	var want struct{ Total, WithFiles int64 }
+	db.Raw("SELECT COUNT(*) AS total, SUM(COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE)) AS with_files FROM `" + cfg.MySQL.Table + "`").Scan(&want)
+	if err != nil || counts.Total != want.Total || counts.WithFiles != want.WithFiles || counts.Total == 0 {
+		t.Fatalf("CountResources = %+v, %v; JSON-based counts %+v", counts, err, want)
+	}
+	if err := Ping(ctx); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	// More than a page of matches: the capped count subquery runs for real.
+	bulk := make([]Data, 60)
+	for i := range bulk {
+		bulk[i] = Data{Name: fmt.Sprintf("qzbulk item %02d", i), InfoHash: fmt.Sprintf("%040x", 0xb000+i), Time: base}
+	}
+	if err := WriteBatchWithID("bulkbatch000000000000000000000000"[:32], bulk); err != nil {
+		t.Fatal(err)
+	}
+	if page, err := Search(ctx, "qzbulk", 2); err != nil || page.Total != 60 || page.TotalCapped || len(page.Items) != 10 {
+		t.Fatalf("bulk page 2: total=%d capped=%v rows=%d err=%v", page.Total, page.TotalCapped, len(page.Items), err)
 	}
 
 	// Without the indexes, searches step down instead of failing.

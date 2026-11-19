@@ -19,6 +19,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func okPing(context.Context) error { return nil }
+
 func TestStatusHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, unavailable := range []bool{false, true} {
@@ -34,6 +36,11 @@ func TestStatusHandler(t *testing.T) {
 				return mysql.ResourceCounts{}, errors.New("private database details")
 			}
 			return mysql.ResourceCounts{Total: 12, WithFiles: 9, ThisRunTotal: 4, ThisRunWithFiles: 1}, nil
+		}, func(context.Context) error {
+			if unavailable {
+				return errors.New("private database details")
+			}
+			return nil
 		})
 		router := gin.New()
 		router.GET("/api/status", handler)
@@ -63,8 +70,9 @@ func TestStatusHandler(t *testing.T) {
 				}
 			}
 		}
-		if calls != 1 {
-			t.Fatal("status requests must reuse short cache")
+		// Counts are cached; they are not attempted while the database is unreachable.
+		if want := map[bool]int{false: 1, true: 0}[unavailable]; calls != want {
+			t.Fatalf("%d count calls, want %d", calls, want)
 		}
 	}
 }
@@ -79,7 +87,7 @@ func TestStatusCountTimeoutPreservesCrawler(t *testing.T) {
 	}, func(ctx context.Context, _ time.Time) (mysql.ResourceCounts, error) {
 		<-ctx.Done()
 		return mysql.ResourceCounts{}, ctx.Err()
-	})
+	}, okPing)
 	router := gin.New()
 	router.GET("/api/status", handler)
 	recorder := httptest.NewRecorder()
@@ -88,7 +96,7 @@ func TestStatusCountTimeoutPreservesCrawler(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.Crawler == nil || status.TotalCollected != nil || status.Status != "outage" {
+	if status.Crawler == nil || status.TotalCollected != nil || status.Status != "degraded" || status.Storage != "connected" {
 		t.Fatalf("count timeout discarded crawler status: %+v", status)
 	}
 }
@@ -108,7 +116,7 @@ func TestStatusCancellationDoesNotPoisonCache(t *testing.T) {
 		return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual"}, nil
 	}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
 		return mysql.ResourceCounts{Total: 12, WithFiles: 9, ThisRunTotal: 4, ThisRunWithFiles: 1}, nil
-	})
+	}, okPing)
 	router := gin.New()
 	router.GET("/api/status", handler)
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/status", nil).WithContext(ctx))
@@ -134,7 +142,7 @@ func TestStatusConcurrentRequestsShareOneRefresh(t *testing.T) {
 		return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual"}, nil
 	}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
 		return mysql.ResourceCounts{Total: 1}, nil
-	})
+	}, okPing)
 	router := gin.New()
 	router.GET("/api/status", handler)
 	var wg sync.WaitGroup
@@ -170,7 +178,7 @@ func TestStatusLongExpiredCacheWaitsForRefresh(t *testing.T) {
 		return &metrics.CrawlerStatus{StartedAt: time.Now(), Ready: true, Reachability: "reachable", NAT: "manual", Collected: int64(n)}, nil
 	}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
 		return mysql.ResourceCounts{Total: 1}, nil
-	})
+	}, okPing)
 	router := gin.New()
 	router.GET("/api/status", handler)
 	get := func() int64 {
@@ -193,6 +201,55 @@ func TestStatusLongExpiredCacheWaitsForRefresh(t *testing.T) {
 	started := time.Now()
 	if got := get(); got != 2 || time.Since(started) > 800*time.Millisecond {
 		t.Fatalf("slow refresh not bounded by stale wait: collected=%d after %v", got, time.Since(started))
+	}
+}
+
+func TestStatusSlowCountDoesNotDelayCrawler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalTTL, originalWait := statusTTL, statusFirstCountWait
+	statusTTL, statusFirstCountWait = time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { statusTTL, statusFirstCountWait = originalTTL, originalWait })
+	release := make(chan struct{})
+	var counts atomic.Int32
+	handler := statusHandler(func(context.Context) (*metrics.CrawlerStatus, error) {
+		return &metrics.CrawlerStatus{StartedAt: time.Unix(1000, 0), Ready: true, Reachability: "reachable", NAT: "manual"}, nil
+	}, func(context.Context, time.Time) (mysql.ResourceCounts, error) {
+		counts.Add(1)
+		<-release
+		return mysql.ResourceCounts{Total: 7, WithFiles: 7, ThisRunTotal: 1, ThisRunWithFiles: 1}, nil
+	}, okPing)
+	router := gin.New()
+	router.GET("/api/status", handler)
+	get := func() metrics.SystemStatus {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+		var status metrics.SystemStatus
+		if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		return status
+	}
+	started := time.Now()
+	first := get()
+	if time.Since(started) > time.Second || first.Crawler == nil || first.TotalCollected != nil ||
+		first.Status != "operational" || first.Storage != "connected" {
+		t.Fatalf("pending count delayed or degraded the status: %+v after %v", first, time.Since(started))
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status := get()
+		if status.TotalCollected != nil {
+			if *status.TotalCollected != 7 || status.Ingestion.ThisRun == nil || counts.Load() != 1 {
+				t.Fatalf("unexpected counts: %+v, %d count calls", status, counts.Load())
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("finished count never reached the status")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

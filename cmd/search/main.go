@@ -51,7 +51,7 @@ func main() {
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	router.GET("/search", searchHandler)
-	router.GET("/api/status", statusHandler(crawlerStatusGetter(), mysql.CountResources))
+	router.GET("/api/status", statusHandler(crawlerStatusGetter(), mysql.CountResources, mysql.Ping))
 	trending := newTrendingCache(mysql.Trending)
 	router.GET("/api/trending", trendingHandler(trending.lookup))
 	router.GET("/api/recent", recentHandler(mysql.Recent))
@@ -169,7 +169,7 @@ func searchHandler(c *gin.Context) {
 		rawPage = values[0]
 	}
 	page, err := strconv.ParseUint(rawPage, 10, 32)
-	if err != nil || page == 0 || page > uint64(int(^uint(0)>>1)/mysql.SearchPageSize) {
+	if err != nil || page == 0 || page > mysql.SearchPageMax {
 		metrics.RecordSearchError("invalid_page")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid page"})
 		return
@@ -178,6 +178,12 @@ func searchHandler(c *gin.Context) {
 	start := time.Now()
 	result, err := mysql.Search(c.Request.Context(), name, int(page))
 	metrics.RecordMySQLQuery("search", time.Since(start), err)
+	if errors.Is(err, mysql.ErrSearchTooBroad) {
+		metrics.RecordSearchError("too_broad")
+		slog.WarnContext(c.Request.Context(), "search too broad", "component", "mysql", "event", "search_too_broad", "page", page, "error", err)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "search too broad"})
+		return
+	}
 	if err != nil {
 		metrics.RecordSearchError("mysql_error")
 		slog.ErrorContext(c.Request.Context(), "search failed", "component", "mysql", "event", "search_failed", "operation", "search", "page", page, "page_size", mysql.SearchPageSize, "error", err)
@@ -191,7 +197,7 @@ func searchHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"total": result.Total, "items": result.Items,
 		"page": page, "page_size": mysql.SearchPageSize,
-		"files_searched": result.FilesSearched,
+		"files_searched": result.FilesSearched, "total_capped": result.TotalCapped,
 	})
 }
 

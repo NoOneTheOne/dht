@@ -62,7 +62,16 @@ func (Data) TableName() string {
 const (
 	operationTimeout  = 10 * time.Second
 	connectionTimeout = 2 * time.Second
-	ioTimeout         = 5 * time.Second
+	// ioTimeout is only a backstop for a stalled socket: each operation's
+	// context (operationTimeout) and MAX_EXECUTION_TIME hints bound queries.
+	// It must exceed them, or a slow query kills its connection mid-flight
+	// and surfaces as "invalid connection".
+	ioTimeout = 30 * time.Second
+	// migrationTimeout bounds AutoMigrate at startup. Migrations run on a
+	// connection without a socket read timeout: schema changes on large
+	// tables outlive any query budget. Long index builds belong in the
+	// background (EnsureSearchIndexes), not in a struct tag.
+	migrationTimeout = 2 * time.Minute
 )
 
 var (
@@ -100,6 +109,28 @@ func mysqlDSN(c *config.Config) string {
 	dsn.ReadTimeout = ioTimeout
 	dsn.WriteTimeout = ioTimeout
 	return dsn.FormatDSN()
+}
+
+// migrate runs AutoMigrate on a dedicated connection without a socket read
+// timeout, bounded by migrationTimeout rather than the caller's operation
+// budget, so a slow schema change does not fail initialization midway.
+func migrate(ctx context.Context, candidate *gorm.DB) error {
+	dsn, err := mysqlDriver.ParseDSN(mysqlDSN(getCfg()))
+	if err != nil {
+		return err
+	}
+	dsn.ReadTimeout, dsn.WriteTimeout = 0, 0
+	pool, err := sql.Open("mysql", dsn.FormatDSN())
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	pool.SetMaxOpenConns(1)
+	migrateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationTimeout)
+	defer cancel()
+	session := candidate.Session(&gorm.Session{NewDB: true, Context: migrateCtx})
+	session.Statement.ConnPool = pool
+	return session.AutoMigrate(&Data{}, &Observation{})
 }
 
 // Waiting callers can cancel independently of the caller performing initialization.
@@ -188,7 +219,7 @@ func openDB(parent context.Context) (*gorm.DB, error) {
 	dialector.(*mysql.Dialector).Conn = pool
 	candidate.ConnPool = pool
 	candidate.Statement.ConnPool = pool
-	if err := candidate.WithContext(ctx).AutoMigrate(&Data{}, &Observation{}); err != nil {
+	if err := migrate(ctx, candidate); err != nil {
 		return nil, fmt.Errorf("migrate MySQL: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -683,12 +714,36 @@ func searchPlan(name string, mode searchMode) (filter, nameHit searchClause) {
 // expensive; past the budget, Search answers from names only instead.
 const fileSearchBudget = 1500 * time.Millisecond
 
+// nameSearchBudget bounds each statement of a names-only or substring search.
+// The two statements of a page (rows, total) plus a timed-out file-name
+// attempt stay within operationTimeout.
+const nameSearchBudget = 3000 * time.Millisecond
+
+// SearchTotalMax caps the counted total: counting every match of a very
+// common word costs as much as returning it. Beyond it, totals read "N+".
+const SearchTotalMax = 10000
+
+// SearchPageMax is the last page reachable within SearchTotalMax.
+const SearchPageMax = SearchTotalMax / SearchPageSize
+
+// ErrSearchTooBroad reports a search whose matches could not be ranked
+// within its execution budget; a more specific query may succeed.
+var ErrSearchTooBroad = errors.New("search too broad")
+
+func budgetExceeded(err error) bool {
+	var mysqlErr *mysqlDriver.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 3024
+}
+
 // stepDown reports errors after which Search retries in a simpler mode: an
 // absent full-text index (1191) or column (1054), or a file-name search that
 // exceeded its execution budget (3024).
-func stepDown(err error) bool {
+func stepDown(err error, mode searchMode) bool {
 	var mysqlErr *mysqlDriver.MySQLError
-	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1191 || mysqlErr.Number == 1054 || mysqlErr.Number == 3024)
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1191 || mysqlErr.Number == 1054 || mysqlErr.Number == 3024 && mode == searchNameAndFiles
 }
 
 // SearchResult is one page of search results.
@@ -698,10 +753,12 @@ type SearchResult struct {
 	// FilesSearched is false when only names were matched: the file-name
 	// index is not built yet, or the words were too common to search in time.
 	FilesSearched bool
+	// TotalCapped means Total is SearchTotalMax and more rows match.
+	TotalCapped bool
 }
 
 func Search(parent context.Context, name string, page int) (SearchResult, error) {
-	if page < 1 || page > int(^uint(0)>>1)/SearchPageSize {
+	if page < 1 || page > SearchPageMax {
 		return SearchResult{}, fmt.Errorf("invalid search page")
 	}
 	ctx, cancel := context.WithTimeout(parent, operationTimeout)
@@ -712,8 +769,13 @@ func Search(parent context.Context, name string, page int) (SearchResult, error)
 	}
 	for mode := searchNameAndFiles; ; mode++ {
 		results, total, err := searchWith(db.WithContext(ctx), name, page, mode)
-		if mode == searchLike || !stepDown(err) {
-			return SearchResult{Items: results, Total: total, FilesSearched: err == nil && mode == searchNameAndFiles}, err
+		if mode == searchLike || !stepDown(err, mode) {
+			if budgetExceeded(err) {
+				err = fmt.Errorf("%w: %w", ErrSearchTooBroad, err)
+			}
+			capped := total > SearchTotalMax
+			total = min(total, SearchTotalMax)
+			return SearchResult{Items: results, Total: total, FilesSearched: err == nil && mode == searchNameAndFiles, TotalCapped: capped}, err
 		}
 	}
 }
@@ -724,10 +786,11 @@ func searchWith(db *gorm.DB, name string, page int, mode searchMode) ([]Data, in
 	query := db.Model(&Data{}).Where(filter.sql, filter.args...)
 	columns := "`name`, `infohash`, `time`, `length`, `count`, COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE) AS has_files"
 	order := "`time` DESC, `infohash` DESC"
-	hint := ""
+	budget := nameSearchBudget
 	if mode == searchNameAndFiles {
-		hint = fmt.Sprintf("/*+ MAX_EXECUTION_TIME(%d) */ ", fileSearchBudget.Milliseconds())
+		budget = fileSearchBudget
 	}
+	hint := fmt.Sprintf("/*+ MAX_EXECUTION_TIME(%d) */ ", budget.Milliseconds())
 	selection := query.Session(&gorm.Session{})
 	if nameHit.sql != "" {
 		// Name hits first; within each group, newest first.
@@ -741,7 +804,9 @@ func searchWith(db *gorm.DB, name string, page int, mode searchMode) ([]Data, in
 	}
 	total := int64(len(results))
 	if page > 1 || len(results) == SearchPageSize {
-		if err := query.Session(&gorm.Session{}).Select(hint + "COUNT(*)").Find(&total).Error; err != nil {
+		// Count at most SearchTotalMax+1 matches; the hint must be on the outer SELECT.
+		matches := query.Session(&gorm.Session{}).Select("1").Limit(SearchTotalMax + 1)
+		if err := db.Table("(?) AS matches", matches).Select(hint + "COUNT(*)").Find(&total).Error; err != nil {
 			return nil, 0, err
 		}
 	}
@@ -853,15 +918,39 @@ type ResourceCounts struct {
 	ThisRunWithFiles int64
 }
 
-func CountResources(parent context.Context, startedAt time.Time) (ResourceCounts, error) {
-	var counts ResourceCounts
+// CountTimeout bounds CountResources, a scan of the whole resource table.
+const CountTimeout = time.Minute
+
+// Ping checks that the database answers, independently of slow queries.
+func Ping(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(parent, operationTimeout)
 	defer cancel()
 	db, err := GetDBContext(ctx)
 	if err != nil {
+		return err
+	}
+	pool, err := db.DB()
+	if err != nil {
+		return err
+	}
+	return pool.PingContext(ctx)
+}
+
+// CountResources counts all resources, and those first seen since startedAt,
+// with and without file lists. It scans the whole table on the analytics
+// pool; cache the result.
+func CountResources(parent context.Context, startedAt time.Time) (ResourceCounts, error) {
+	var counts ResourceCounts
+	ctx, cancel := context.WithTimeout(parent, CountTimeout)
+	defer cancel()
+	db, err := analyticsDBContext(ctx)
+	if err != nil {
 		return counts, err
 	}
-	hasFiles := "COALESCE(JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0, FALSE)"
+	// file_names is set exactly when a row has a non-empty file list (written
+	// with the row, backfilled for older ones); testing it avoids parsing
+	// every row's files JSON.
+	hasFiles := "`" + fileNamesColumn + "` IS NOT NULL"
 	err = db.WithContext(ctx).Model(&Data{}).Select(
 		"COUNT(*) AS total, COALESCE(SUM("+hasFiles+"), 0) AS with_files, "+
 			"COALESCE(SUM(`time` >= ?), 0) AS this_run_total, "+

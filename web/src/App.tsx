@@ -12,6 +12,7 @@ function isSearchResponse(value: unknown): value is SearchResponse {
   const data = value as SearchResponse;
   return Number.isSafeInteger(data.total) && data.total >= 0 &&
     Number.isSafeInteger(data.page) && data.page > 0 && data.page_size === 50 && typeof data.files_searched === 'boolean' &&
+    (data.total_capped === undefined || typeof data.total_capped === 'boolean') &&
     Array.isArray(data.items) && data.items.length <= data.page_size &&
     data.items.every(item => item && typeof item.name === 'string' &&
       typeof item.infohash === 'string' && /^[a-f\d]{40}$/i.test(item.infohash) &&
@@ -30,6 +31,7 @@ function App() {
   const [items, setItems] = useState<TorrentItem[]>([]);
   const [total, setTotal] = useState(0);
   const [filesSearched, setFilesSearched] = useState(true);
+  const [totalCapped, setTotalCapped] = useState(false);
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
@@ -56,6 +58,7 @@ function App() {
     setError('');
     setItems([]);
     setTotal(0);
+    setTotalCapped(false);
     let timedOut = false;
     const timeout = window.setTimeout(() => {
       timedOut = true;
@@ -65,7 +68,7 @@ function App() {
     try {
       const response = await fetch(`/search?name=${encodeURIComponent(searchQuery)}&page=${requestedPage}`, { signal: controller.signal });
       if (!response.ok) {
-        throw new Error(response.status === 400 ? '关键词不符合要求，请缩短后重试。' : '搜索服务暂时不可用，请稍后重试。');
+        throw new Error(response.status === 400 ? '关键词不符合要求，请缩短后重试。' : response.status === 422 ? '关键词过于宽泛，匹配结果太多，请补充更具体的关键词后重试。' : '搜索服务暂时不可用，请稍后重试。');
       }
       const data: unknown = await response.json();
       if (!isSearchResponse(data) || data.page !== requestedPage) throw new Error('服务返回的数据格式不正确，请稍后重试。');
@@ -78,6 +81,7 @@ function App() {
       setItems(data.items);
       setTotal(data.total);
       setFilesSearched(data.files_searched);
+      setTotalCapped(data.total_capped === true);
       setPageSize(data.page_size);
     } catch (err) {
       if (activeRequest.current !== controller) return;
@@ -118,7 +122,7 @@ function App() {
             <h2>这次搜索没有完成</h2><p>{error}</p>
             <button className="secondary-button" onClick={() => void handleSearch(query, page)}>重试第 {page} 页</button>
           </section>
-        ) : <>{query && !loading && !filesSearched && <p className="search-scope-note" role="status">本次仅匹配资源名称：关键词过于常见，或文件名索引尚未就绪。</p>}<ResultsTable items={items} total={total} query={query} loading={loading} page={page} pageSize={pageSize} onPageChange={nextPage => void handleSearch(query, nextPage)} /></>}
+        ) : <>{query && !loading && !filesSearched && <p className="search-scope-note" role="status">本次仅匹配资源名称：关键词过于常见，或文件名索引尚未就绪。</p>}<ResultsTable items={items} total={total} totalCapped={totalCapped} query={query} loading={loading} page={page} pageSize={pageSize} onPageChange={nextPage => void handleSearch(query, nextPage)} /></>}
         </>}
       </main>
       <footer className="site-footer"><span>DHT SEARCH <span className="footer-divider">/</span> 基于分布式网络</span><span>仅展示公开采集的元数据，不提供资源内容。请遵守当地法律法规。</span></footer>

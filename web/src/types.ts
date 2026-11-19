@@ -20,4 +20,6 @@ export interface SearchResponse {
   page_size: number;
   /** False when only names were searched (file index not ready, or words too common). */
   files_searched: boolean;
+  /** True when more rows match than were counted; total is then a lower bound. */
+  total_capped?: boolean;
 }

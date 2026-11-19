@@ -77,7 +77,11 @@ type SystemStatus struct {
 	Ingestion      IngestionStatus `json:"ingestion"`
 }
 
-func NewSystemStatus(crawler *CrawlerStatus, total *int64) SystemStatus {
+// NewSystemStatus rolls up the crawler status and resource total. storageUp
+// reports whether the database answers; a missing total with a reachable
+// database means only the (slow) counting failed. countsPending suppresses
+// that issue while the first count is still running.
+func NewSystemStatus(crawler *CrawlerStatus, total *int64, storageUp, countsPending bool) SystemStatus {
 	s := SystemStatus{Status: "operational", Issues: []string{}, UpdatedAt: time.Now().UTC(), Crawler: crawler, TotalCollected: total, Storage: "connected"}
 	if crawler == nil {
 		s.Issues = append(s.Issues, "采集进程暂时无法连接")
@@ -98,14 +102,16 @@ func NewSystemStatus(crawler *CrawlerStatus, total *int64) SystemStatus {
 			s.Issues = append(s.Issues, "元数据抓取尚无成功结果")
 		}
 	}
-	if total == nil {
+	if !storageUp {
 		s.Storage = "unavailable"
 		s.Issues = append(s.Issues, "资源数据库暂时不可用")
+	} else if total == nil && !countsPending {
+		s.Issues = append(s.Issues, "入库统计暂时不可用")
 	}
 	if len(s.Issues) > 0 {
 		s.Status = "degraded"
 	}
-	if total == nil || crawler == nil {
+	if !storageUp || crawler == nil {
 		s.Status = "outage"
 	}
 	return s

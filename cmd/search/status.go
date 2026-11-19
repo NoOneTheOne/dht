@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"sync"
@@ -41,7 +42,15 @@ func fetchCrawlerStatus(ctx context.Context, client *http.Client, url string) (*
 var (
 	statusTTL          = 10 * time.Second
 	statusFetchTimeout = 4 * time.Second
-	statusCountTimeout = 10 * time.Second
+	statusPingTimeout  = 3 * time.Second
+	// Counting scans the whole resource table: it runs on its own schedule,
+	// never delays the crawler status, and is cached for long.
+	statusCountTimeout = mysql.CountTimeout
+	statusCountTTL     = 10 * time.Minute
+	statusCountRetry   = time.Minute
+	// statusFirstCountWait is how long the very first status waits for the
+	// first count, so a fast database shows totals on the first visit.
+	statusFirstCountWait = 3 * time.Second
 	// statusStaleGrace is how long past its TTL a cached status may still be
 	// served instantly while it refreshes. Older caches (the first visit after
 	// an idle period) wait up to statusStaleWait for the fresh status instead,
@@ -54,68 +63,100 @@ var (
 // at a time on its own timeouts, so slow backends never hold a lock across
 // requests and a disconnecting client cannot abort or poison the refresh.
 // Requests wait (bounded) only when the cache is missing or long expired.
-func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), count func(context.Context, time.Time) (mysql.ResourceCounts, error)) gin.HandlerFunc {
+// Resource counts refresh separately (see statusCountTTL); ping decides
+// whether the database is reachable, so a slow count is not reported as an
+// outage.
+func statusHandler(fetch func(context.Context) (*metrics.CrawlerStatus, error), count func(context.Context, time.Time) (mysql.ResourceCounts, error), ping func(context.Context) error) gin.HandlerFunc {
 	var mu sync.Mutex
 	var cached metrics.SystemStatus
 	var hasCache bool
-	var expires, countExpires, countedStart time.Time
-	var totals *mysql.ResourceCounts
+	var expires time.Time
 	var refreshing chan struct{}
+	var crawler *metrics.CrawlerStatus
+	var storageUp bool
+	// Counts and the crawler start time they were computed for.
+	var totals *mysql.ResourceCounts
+	var countedStart, countExpires time.Time
+	var counting chan struct{}
 	// Read the budgets once: refreshes outlive requests, so tests may restore
 	// the package variables while one is still running.
-	ttl, fetchTimeout, countTimeout := statusTTL, statusFetchTimeout, statusCountTimeout
+	ttl, fetchTimeout, pingTimeout := statusTTL, statusFetchTimeout, statusPingTimeout
+	countTimeout, countTTL, countRetry, firstCountWait := statusCountTimeout, statusCountTTL, statusCountRetry, statusFirstCountWait
 	staleGrace, staleWait := statusStaleGrace, statusStaleWait
+
+	// build assembles the status from the latest parts; mu must be held.
+	build := func() metrics.SystemStatus {
+		var total *int64
+		if totals != nil {
+			total = &totals.Total
+		}
+		next := metrics.NewSystemStatus(crawler, total, storageUp, totals == nil && counting != nil)
+		if totals != nil {
+			next.Ingestion.AllTime = metrics.NewFileCoverage(totals.Total, totals.WithFiles)
+			if crawler != nil && crawler.StartedAt.Equal(countedStart) {
+				next.Ingestion.ThisRun = metrics.NewFileCoverage(totals.ThisRunTotal, totals.ThisRunWithFiles)
+			}
+		}
+		return next
+	}
+
+	recount := func(startedAt time.Time, done chan struct{}) {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(context.Background(), countTimeout)
+		value, err := count(ctx, startedAt)
+		cancel()
+		mu.Lock()
+		defer mu.Unlock()
+		counting = nil
+		if err != nil {
+			slog.Warn("resource count failed", "component", "mysql", "event", "status_count_failed", "error", err)
+			countExpires = time.Now().Add(countRetry)
+			if !startedAt.Equal(countedStart) {
+				totals = nil // Per-run counts would describe another run.
+			}
+		} else {
+			totals, countedStart = &value, startedAt
+			countExpires = time.Now().Add(countTTL)
+		}
+		if hasCache {
+			cached = build()
+		}
+	}
 
 	refresh := func(done chan struct{}) {
 		defer close(done)
 		fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-		crawler, err := fetch(fetchCtx)
+		nextCrawler, err := fetch(fetchCtx)
 		cancel()
 		if err != nil {
-			crawler = nil
+			nextCrawler = nil
 		}
+		pingCtx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+		up := ping(pingCtx) == nil
+		cancel()
 
 		mu.Lock()
+		crawler, storageUp = nextCrawler, up
 		startedAt := countedStart
 		if crawler != nil {
 			startedAt = crawler.StartedAt
 		}
-		refreshCount := time.Now().After(countExpires) || !startedAt.Equal(countedStart)
-		nextTotals := totals
+		if counting == nil && up && (time.Now().After(countExpires) || !startedAt.Equal(countedStart)) {
+			counting = make(chan struct{})
+			go recount(startedAt, counting)
+		}
+		first, wait := !hasCache && totals == nil, counting
 		mu.Unlock()
-
-		if refreshCount {
-			countCtx, cancel := context.WithTimeout(context.Background(), countTimeout)
-			value, err := count(countCtx, startedAt)
-			cancel()
-			nextTotals = nil
-			if err == nil {
-				nextTotals = &value
+		if first && wait != nil {
+			select {
+			case <-wait:
+			case <-time.After(firstCountWait):
 			}
 		}
 
 		mu.Lock()
 		defer mu.Unlock()
-		if refreshCount {
-			totals = nextTotals
-			countedStart = startedAt
-			countExpires = time.Now().Add(time.Minute)
-			if totals == nil {
-				countExpires = time.Now().Add(10 * time.Second)
-			}
-		}
-		var total *int64
-		if totals != nil {
-			total = &totals.Total
-		}
-		next := metrics.NewSystemStatus(crawler, total)
-		if totals != nil {
-			next.Ingestion.AllTime = metrics.NewFileCoverage(totals.Total, totals.WithFiles)
-			if crawler != nil {
-				next.Ingestion.ThisRun = metrics.NewFileCoverage(totals.ThisRunTotal, totals.ThisRunWithFiles)
-			}
-		}
-		cached, hasCache = next, true
+		cached, hasCache = build(), true
 		expires = time.Now().Add(ttl)
 		refreshing = nil
 	}

@@ -686,6 +686,9 @@ func TestSearchQueries(t *testing.T) {
 			parent := context.WithValue(context.Background(), contextKey{}, "request")
 			queries := 0
 			if err := candidate.Callback().Query().After("gorm:query").Register("capture_search", func(tx *gorm.DB) {
+				if strings.HasPrefix(tx.Statement.SQL.String(), "SELECT 1 FROM") {
+					return // GORM renders the capped-count subquery through the query callbacks.
+				}
 				queries++
 				if tx.Statement.Context.Value(contextKey{}) != "request" {
 					t.Fatal("request context was lost")
@@ -729,7 +732,9 @@ func TestSearchQueries(t *testing.T) {
 					}
 					*dest = make([]Data, n)
 				case *int64:
-					if strings.Contains(sql, "LIMIT") || strings.Contains(sql, "OFFSET") || strings.Contains(sql, "ORDER BY") {
+					// Only the cap's LIMIT, inside the subquery; no page clauses.
+					if !strings.HasSuffix(sql, "LIMIT ?) AS matches") || strings.Count(sql, "LIMIT") != 1 ||
+						strings.Contains(sql, "OFFSET") || strings.Contains(sql, "ORDER BY") {
 						t.Fatalf("count inherited page clauses: %s", sql)
 					}
 					*dest = 123
@@ -838,7 +843,7 @@ func TestCountResources(t *testing.T) {
 		}
 		queries++
 		sql := tx.Statement.SQL.String()
-		for _, fragment := range []string{"COUNT(*) AS total", "JSON_TYPE(`files`) = 'ARRAY' AND JSON_LENGTH(`files`) > 0", "AS with_files", "AS this_run_total", "AS this_run_with_files", "FROM `torrent_test`"} {
+		for _, fragment := range []string{"COUNT(*) AS total", "SUM(`file_names` IS NOT NULL)", "AS with_files", "AS this_run_total", "AS this_run_with_files", "FROM `torrent_test`"} {
 			if !strings.Contains(sql, fragment) {
 				t.Fatalf("missing %s in %s", fragment, sql)
 			}
@@ -1034,7 +1039,7 @@ func TestMySQLDSN(t *testing.T) {
 		parsed.Addr != cfg.MySQL.Addresses || parsed.DBName != cfg.MySQL.Database || parsed.Net != "tcp" {
 		t.Fatal("DSN did not preserve connection settings")
 	}
-	if parsed.Timeout != 2*time.Second || parsed.ReadTimeout != 5*time.Second || parsed.WriteTimeout != 5*time.Second {
+	if parsed.Timeout != 2*time.Second || parsed.ReadTimeout != 30*time.Second || parsed.WriteTimeout != 30*time.Second {
 		t.Fatal("DSN does not have bounded connect/read/write timeouts")
 	}
 	if !parsed.ParseTime || parsed.Loc != time.UTC || parsed.Params["charset"] != "utf8mb4" {
@@ -1263,8 +1268,57 @@ func TestSearchFallsBackToNamesWhenFileSearchTimesOut(t *testing.T) {
 	if err != nil || result.FilesSearched {
 		t.Fatalf("result=%+v err=%v; a timed-out file search must answer from names", result, err)
 	}
-	if len(sqls) != 2 || !strings.Contains(sqls[1], "MATCH(`name`) AGAINST") || strings.Contains(sqls[1], "MAX_EXECUTION_TIME") {
-		t.Fatalf("expected an unbounded name-only retry, got %q", sqls)
+	if len(sqls) != 2 || !strings.Contains(sqls[1], "MATCH(`name`) AGAINST") || !strings.HasPrefix(sqls[1], "SELECT /*+ MAX_EXECUTION_TIME(3000) */ ") {
+		t.Fatalf("expected a name-only retry bounded by its own budget, got %q", sqls)
+	}
+}
+
+func TestSearchTooBroadAndCappedTotal(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MySQL.Table = "torrent_test"
+	original := getCfg
+	getCfg = func() *config.Config { return cfg }
+	t.Cleanup(func() { getCfg = original })
+	candidate, err := gorm.Open(gormMySQL.New(gormMySQL.Config{SkipInitializeWithVersion: true}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mode string
+	var counts []string
+	if err := candidate.Callback().Query().After("gorm:query").Register("capture_budget", func(tx *gorm.DB) {
+		sql := tx.Statement.SQL.String()
+		switch dest := tx.Statement.Dest.(type) {
+		case *[]Data:
+			if mode == "timeout" {
+				tx.AddError(&mysqlDriver.MySQLError{Number: 3024, Message: "maximum statement execution time exceeded"})
+				return
+			}
+			*dest = make([]Data, SearchPageSize)
+		case *int64:
+			counts = append(counts, sql)
+			*dest = SearchTotalMax + 1
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stubInitialization(t, func(context.Context) (*gorm.DB, error) { return candidate, nil })
+
+	mode = "timeout" // Every mode exceeds its budget: names-only must not fall through to LIKE.
+	if _, err := Search(context.Background(), "mkv", 1); !errors.Is(err, ErrSearchTooBroad) {
+		t.Fatalf("err = %v, want ErrSearchTooBroad", err)
+	}
+
+	mode = "capped"
+	result, err := Search(context.Background(), "mkv", 1)
+	if err != nil || result.Total != SearchTotalMax || !result.TotalCapped || !result.FilesSearched {
+		t.Fatalf("result total=%d capped=%v files=%v err=%v", result.Total, result.TotalCapped, result.FilesSearched, err)
+	}
+	if len(counts) != 1 || !strings.HasPrefix(counts[0], "SELECT /*+ MAX_EXECUTION_TIME(1500) */ COUNT(*) FROM (SELECT 1 FROM") ||
+		!strings.Contains(counts[0], ") AS matches") {
+		t.Fatalf("count is not a bounded, capped subquery: %q", counts)
+	}
+	if _, err := Search(context.Background(), "mkv", SearchPageMax+1); err == nil {
+		t.Fatal("page beyond the counted total accepted")
 	}
 }
 

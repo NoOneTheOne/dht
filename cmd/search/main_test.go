@@ -33,7 +33,7 @@ func TestSearchHandlerInvalidParameters(t *testing.T) {
 		"name=test&page=abc", "name=test&page=1.5", "name=test&page=%2B1",
 		"name=test&page=%201", "name=test&page=4294967296",
 		"name=test&page=18446744073709551616",
-		"name=test&page=" + strconv.FormatUint(uint64(int(^uint(0)>>1)/50)+1, 10),
+		"name=test&page=" + strconv.Itoa(mysql.SearchPageMax+1),
 	}
 	for _, query := range queries {
 		t.Run(query, func(t *testing.T) {
